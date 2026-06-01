@@ -328,6 +328,10 @@ class TrainerUtils:
         return np.linalg.norm(predicted - ground_truth)
 
     @staticmethod
+    def mean_squared_error(predicted: np.ndarray, ground_truth: np.ndarray) -> float:
+        return np.mean((predicted - ground_truth) ** 2)
+
+    @staticmethod
     def _reset_dataloader(dataloader, epoch_counter):
         """safe reset dataloader iterator"""
         # 1. update epoch counter

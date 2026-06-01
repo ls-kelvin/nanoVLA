@@ -348,9 +348,7 @@ class VLATrainer(TrainerUtils):
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
             actions = np.array(actions)
-            num_pots = np.prod(actions.shape)
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            step_metrics["mse_score"] = score / num_pots
+            step_metrics["mse_score"] = TrainerUtils.mean_squared_error(normalized_actions, actions)
 
         del examples
         dist.barrier()
