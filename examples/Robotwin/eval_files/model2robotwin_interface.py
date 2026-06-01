@@ -23,7 +23,7 @@ class ModelClient:
         action_ensemble_horizon: Optional[int] = 3,
         image_size: list[int] = [224, 224],
         use_ddim: bool = True,
-        num_ddim_steps: int = 10,
+        num_ddim_steps: int = 20,
         adaptive_ensemble_alpha=0.1,
         host="127.0.0.1",
         port=5694,

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ROBOTWIN_PATH=/inspire/hdd/project/qproject-fundationmodel/public/ethan/repos/RoboTwin
+export ROBOTWIN_PYTHON=/inspire/hdd/project/qproject-fundationmodel/public/ethan/repos/RoboTwin/.venv/bin/python
+export STARVLA_PYTHON=.venv/bin/python
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROBOTWIN_ALL_TASKS=(
