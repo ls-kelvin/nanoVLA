@@ -185,6 +185,10 @@ import torch.distributed as dist
 
 class TrainerUtils:
     @staticmethod
+    def _is_main_process() -> bool:
+        return not dist.is_initialized() or dist.get_rank() == 0
+
+    @staticmethod
     def freeze_backbones(model, freeze_modules=""):
         """
         directly freeze the specified submodules based on the relative module path list (patterns), no longer recursively find all submodule names:
@@ -225,7 +229,7 @@ class TrainerUtils:
                     continue
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if TrainerUtils._is_main_process():
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -235,7 +239,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if not TrainerUtils._is_main_process():
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -244,6 +248,119 @@ class TrainerUtils:
             f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
         )
         return num_params, num_trainable_params
+
+    @staticmethod
+    def dump_parameter_status(model, output_dir, dump_name="parameter_status"):
+        """
+        Persist trainable/frozen parameter lists to disk.
+
+        Writes:
+          - <output_dir>/<dump_name>/model_parameters.txt
+          - <output_dir>/<dump_name>/trainable_parameters.txt
+          - <output_dir>/<dump_name>/frozen_parameters.txt
+          - <output_dir>/<dump_name>/summary.json
+        """
+        if not TrainerUtils._is_main_process():
+            return None
+
+        dump_dir = os.path.join(output_dir, dump_name)
+        os.makedirs(dump_dir, exist_ok=True)
+
+        trainable_lines = []
+        frozen_lines = []
+        all_lines = []
+        trainable_count = 0
+        frozen_count = 0
+        trainable_numel = 0
+        frozen_numel = 0
+
+        for name, param in model.named_parameters():
+            status = "Trainable" if param.requires_grad else "Frozen"
+            line = (
+                f"{name}\t"
+                f"shape={tuple(param.shape)}\t"
+                f"dtype={param.dtype}\t"
+                f"numel={param.numel()}\t"
+                f"status={status}"
+            )
+            all_lines.append(line)
+            if param.requires_grad:
+                trainable_lines.append(line)
+                trainable_count += 1
+                trainable_numel += param.numel()
+            else:
+                frozen_lines.append(line)
+                frozen_count += 1
+                frozen_numel += param.numel()
+
+        all_path = os.path.join(dump_dir, "model_parameters.txt")
+        trainable_path = os.path.join(dump_dir, "trainable_parameters.txt")
+        frozen_path = os.path.join(dump_dir, "frozen_parameters.txt")
+        summary_path = os.path.join(dump_dir, "summary.json")
+
+        with open(all_path, "w", encoding="utf-8") as f:
+            f.write(
+                "\n".join(
+                    [
+                        f"Total parameters: {trainable_count + frozen_count}",
+                        f"Trainable parameters: {trainable_count} ({trainable_numel} elements)",
+                        f"Frozen parameters: {frozen_count} ({frozen_numel} elements)",
+                        "",
+                        *all_lines,
+                    ]
+                )
+            )
+
+        with open(trainable_path, "w", encoding="utf-8") as f:
+            f.write(
+                "\n".join(
+                    [
+                        f"Trainable parameters: {trainable_count} ({trainable_numel} elements)",
+                        "",
+                        *trainable_lines,
+                    ]
+                )
+            )
+
+        with open(frozen_path, "w", encoding="utf-8") as f:
+            f.write(
+                "\n".join(
+                    [
+                        f"Frozen parameters: {frozen_count} ({frozen_numel} elements)",
+                        "",
+                        *frozen_lines,
+                    ]
+                )
+            )
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "total_parameters": trainable_count + frozen_count,
+                    "trainable_parameters": trainable_count,
+                    "frozen_parameters": frozen_count,
+                    "trainable_numel": trainable_numel,
+                    "frozen_numel": frozen_numel,
+                    "all_parameters_file": all_path,
+                    "trainable_parameters_file": trainable_path,
+                    "frozen_parameters_file": frozen_path,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        print(f"📝 parameter status dumped to: {dump_dir}")
+        print(f"   - {all_path}")
+        print(f"   - {trainable_path}")
+        print(f"   - {frozen_path}")
+        return {
+            "dump_dir": dump_dir,
+            "all_path": all_path,
+            "trainable_path": trainable_path,
+            "frozen_path": frozen_path,
+            "summary_path": summary_path,
+        }
 
     @staticmethod
     def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):

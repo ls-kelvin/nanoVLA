@@ -143,6 +143,7 @@ class VLATrainer(TrainerUtils):
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
+        self.dump_parameter_status(self.model, self.config.output_dir)
 
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
             self.accelerator,
@@ -168,7 +169,7 @@ class VLATrainer(TrainerUtils):
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
+                # entity=self.config.wandb_entity,
                 group="vla-train",
             )
 

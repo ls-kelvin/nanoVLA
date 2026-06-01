@@ -103,6 +103,7 @@ class VLAMTrainer(TrainerUtils):
         freeze_modules = self.config.trainer.freeze_modules if hasattr(self.config.trainer, "freeze_modules") else None
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
+        self.dump_parameter_status(self.model, self.config.output_dir)
 
         self.model, self.optimizer, self.vlm_train_dataloader = self.setup_distributed_training(
             self.accelerator,

@@ -26,6 +26,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 from starVLA.training.trainer_utils.monkey_patch import replace_qwen2_vl_attention_class
+from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -228,6 +229,8 @@ def train(attn_implementation="flash_attention_2"):
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             model.visual.print_trainable_parameters()
             model.model.print_trainable_parameters()
+
+    TrainerUtils.dump_parameter_status(model, training_args.output_dir)
     
     data_module = make_supervised_data_module(processor, data_args=data_args)
     trainer = Trainer(

@@ -19,7 +19,7 @@ run_id=0129_${data_mix}_qwen3OFT_all
 ###########################################################################################
 
 
-# export WANDB_MODE=disabled
+export WANDB_MODE=offline
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p ${output_dir}
