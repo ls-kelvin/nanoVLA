@@ -2,7 +2,7 @@ import json
 import os
 from accelerate.logging import get_logger
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 import torch.distributed as dist
 from pathlib import Path
@@ -65,3 +65,70 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vlm_train_dataloader = vlm_data_module["train_dataloader"]
         
         return vlm_train_dataloader
+
+
+def build_fixed_subset_indices(dataset_length: int, num_samples: int | None, seed: int) -> list[int]:
+    """
+    Build a deterministic subset of indices for validation.
+
+    The same dataset length + seed will always produce the same index set.
+    """
+    if dataset_length <= 0:
+        return []
+
+    if num_samples is None or num_samples <= 0 or num_samples >= dataset_length:
+        return list(range(dataset_length))
+
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(dataset_length, size=int(num_samples), replace=False)
+    return sorted(int(i) for i in indices.tolist())
+
+
+def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: int | None = None, seed: int | None = None):
+    """
+    Build a deterministic validation dataloader for VLA training.
+
+    Validation samples are drawn once from the `mode="val"` dataset and then
+    frozen via a deterministic subset so repeated evaluations always use the
+    same examples when the seed is fixed.
+    """
+    from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
+
+    vla_dataset_cfg = cfg.datasets.vla_data
+    vla_dataset = get_vla_dataset(
+        data_cfg=vla_dataset_cfg,
+        mode="val",
+        balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
+        balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
+        seed=cfg.seed if seed is None else seed,
+    )
+
+    eval_num_samples = num_samples
+    if eval_num_samples is None:
+        eval_num_samples = getattr(cfg.trainer, "eval_num_samples", None)
+
+    eval_batch_size = batch_size
+    if eval_batch_size is None:
+        eval_batch_size = getattr(vla_dataset_cfg, "eval_per_device_batch_size", None)
+    if eval_batch_size is None:
+        eval_batch_size = int(vla_dataset_cfg.per_device_batch_size)
+
+    subset_indices = build_fixed_subset_indices(len(vla_dataset), eval_num_samples, cfg.seed if seed is None else seed)
+    logger.info(
+        "Building VLA validation dataloader with %d/%d samples, batch_size=%d, seed=%d",
+        len(subset_indices),
+        len(vla_dataset),
+        int(eval_batch_size),
+        cfg.seed if seed is None else seed,
+    )
+    eval_dataset = Subset(vla_dataset, subset_indices)
+
+    return DataLoader(
+        eval_dataset,
+        batch_size=int(eval_batch_size),
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        shuffle=False,
+    )

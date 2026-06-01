@@ -32,7 +32,7 @@ from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
 
 # Local Modules
-from starVLA.dataloader import build_dataloader
+from starVLA.dataloader import build_dataloader, build_vla_eval_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
@@ -65,23 +65,40 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
+def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Prepare co-training data."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
     vlm_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vlm_data.dataset_py)
+    vla_eval_dataloader = build_vla_eval_dataloader(
+        cfg=cfg,
+        num_samples=getattr(cfg.trainer, "eval_num_samples", None),
+        batch_size=getattr(cfg.trainer, "eval_batch_size", None),
+        seed=cfg.seed,
+    )
 
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader, vlm_train_dataloader
+    return vla_train_dataloader, vlm_train_dataloader, vla_eval_dataloader
 
 
 class VLAMTrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, vlm_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        vlm_train_dataloader,
+        vla_eval_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
         self.vlm_train_dataloader = vlm_train_dataloader
+        self.vla_eval_dataloader = vla_eval_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -297,16 +314,34 @@ class VLAMTrainer(TrainerUtils):
         self._finalize_training()
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
-        """Evaluate action prediction with current model."""
+        """Evaluate action prediction on a fixed validation subset."""
+        step_metrics = step_metrics or {}
         if self.accelerator.is_main_process:
-            examples, _ = self._get_next_batch()
-            actions = [example["action"] for example in examples]
+            was_training = self.model.training
+            self.model.eval()
+            model = self.accelerator.unwrap_model(self.model)
 
-            output_dict = self.accelerator.unwrap_model(self.model).predict_action(examples=examples)
-            normalized_actions = output_dict["normalized_actions"]
+            total_squared_error = 0.0
+            total_elements = 0
+            total_samples = 0
 
-            actions = np.array(actions)
-            step_metrics["mse_score"] = TrainerUtils.mean_squared_error(normalized_actions, actions)
+            with torch.inference_mode():
+                for examples in self.vla_eval_dataloader:
+                    actions = np.asarray([example["action"] for example in examples])
+                    output_dict = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+                    normalized_actions = np.asarray(output_dict["normalized_actions"])
+
+                    diff = normalized_actions - actions
+                    total_squared_error += float(np.sum(diff**2))
+                    total_elements += int(diff.size)
+                    total_samples += int(actions.shape[0])
+
+            if was_training:
+                self.model.train()
+
+            step_metrics["mse_score"] = total_squared_error / max(total_elements, 1)
+            step_metrics["validation/num_samples"] = total_samples
+            step_metrics["validation/num_batches"] = len(self.vla_eval_dataloader)
 
         dist.barrier()
         return step_metrics
@@ -387,7 +422,9 @@ def main(cfg) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader, vlm_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vlm_train_dataloader, vla_eval_dataloader = prepare_data(
+        cfg=cfg, accelerator=accelerator, output_dir=output_dir
+    )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLAMTrainer(
@@ -395,6 +432,7 @@ def main(cfg) -> None:
         model=vla,
         vla_train_dataloader=vla_train_dataloader,
         vlm_train_dataloader=vlm_train_dataloader,
+        vla_eval_dataloader=vla_eval_dataloader,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
