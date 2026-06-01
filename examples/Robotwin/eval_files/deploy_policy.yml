@@ -10,4 +10,5 @@ host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
-normalization_mode: "min_max"  # options: min_max, q99
+
+normalization_mode: "q99"  # options: min_max, q99

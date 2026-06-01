@@ -35,7 +35,7 @@ class AgilexDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.left_joints": "min_max", "state.right_joints": "min_max",
+                    "state.left_joints": "q99", "state.right_joints": "q99",
                     "state.left_gripper": "binary", "state.right_gripper": "binary",
                 },
             ),
@@ -43,7 +43,7 @@ class AgilexDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.left_joints": "min_max", "action.right_joints": "min_max",
+                    "action.left_joints": "q99", "action.right_joints": "q99",
                     "action.left_gripper": "binary", "action.right_gripper": "binary",
                 },
             ),
@@ -63,7 +63,7 @@ class AgilexData50Config(AgilexDataConfig):
                 apply_to=self.state_keys,
                 binary_threshold=0.49,
                 normalization_modes={
-                    "state.left_joints": "min_max", "state.right_joints": "min_max",
+                    "state.left_joints": "q99", "state.right_joints": "q99",
                     "state.left_gripper": "binary", "state.right_gripper": "binary",
                 },
             ),
@@ -72,7 +72,7 @@ class AgilexData50Config(AgilexDataConfig):
                 apply_to=self.action_keys,
                 binary_threshold=0.49,
                 normalization_modes={
-                    "action.left_joints": "min_max", "action.right_joints": "min_max",
+                    "action.left_joints": "q99", "action.right_joints": "q99",
                     "action.left_gripper": "binary", "action.right_gripper": "binary",
                 },
             ),
@@ -105,7 +105,7 @@ class ArxX5DataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.left_joints": "min_max", "state.right_joints": "min_max",
+                    "state.left_joints": "q99", "state.right_joints": "q99",
                     "state.left_gripper": "binary", "state.right_gripper": "binary",
                 },
             ),
@@ -113,7 +113,7 @@ class ArxX5DataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.left_joints": "min_max", "action.right_joints": "min_max",
+                    "action.left_joints": "q99", "action.right_joints": "q99",
                     "action.left_gripper": "binary", "action.right_gripper": "binary",
                 },
             ),
