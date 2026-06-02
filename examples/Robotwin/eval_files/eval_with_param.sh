@@ -13,12 +13,12 @@ export CUDA_VISIBLE_DEVICES=0
 
 
 TASKS=(
-    adjust_bottle
+    # adjust_bottle
     # beat_block_hammer
     # blocks_ranking_rgb
     # blocks_ranking_size
     # click_alarmclock
-    # click_bell
+    click_bell
     # dump_bin_bigbin
     # grab_roller
     # handover_block
@@ -67,5 +67,5 @@ TASKS=(
 
 bash examples/Robotwin/eval_files/start_eval.sh \
     -m demo_clean -n 0601_robotwin_all_50_qwen3piv3_all -p 5543 -j 1 \
-    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0601_robotwin_all_50_qwen3piv3_all/checkpoints/steps_20000_pytorch_model.pt \
+    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0601_robotwin_all_50_qwen3piv3_all/checkpoints/steps_90000_pytorch_model.pt \
     "${TASKS[@]}"

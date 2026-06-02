@@ -283,7 +283,45 @@ class VLATrainer(TrainerUtils):
 
     def _create_data_iterators(self):
         """Create data iterators."""
-        self.vla_iter = iter(self.vla_train_dataloader)
+        self.vla_epoch_count = 0
+
+        if self.completed_steps <= 0:
+            self.vla_iter = iter(self.vla_train_dataloader)
+            return
+
+        consumed_batches = self.completed_steps * self.accelerator.gradient_accumulation_steps
+        try:
+            dataloader_length = len(self.vla_train_dataloader)
+        except TypeError:
+            dataloader_length = 0
+
+        if dataloader_length <= 0:
+            self.accelerator.print(
+                "Unable to determine VLA dataloader length; skipping consumed batches in the current iterator only."
+            )
+            self.vla_iter = iter(
+                self.accelerator.skip_first_batches(self.vla_train_dataloader, num_batches=consumed_batches)
+            )
+            return
+
+        self.vla_epoch_count = consumed_batches // dataloader_length
+        batches_to_skip = consumed_batches % dataloader_length
+        if hasattr(self.vla_train_dataloader, "sampler") and callable(
+            getattr(self.vla_train_dataloader.sampler, "set_epoch", None)
+        ):
+            self.vla_train_dataloader.sampler.set_epoch(self.vla_epoch_count)
+
+        resumed_dataloader = self.vla_train_dataloader
+        if batches_to_skip > 0:
+            resumed_dataloader = self.accelerator.skip_first_batches(
+                self.vla_train_dataloader,
+                num_batches=batches_to_skip,
+            )
+
+        self.accelerator.print(
+            f"Resumed VLA dataloader at epoch {self.vla_epoch_count}, batch offset {batches_to_skip}"
+        )
+        self.vla_iter = iter(resumed_dataloader)
 
     def _get_next_batch(self):
         """Get next batch (automatically handle data loop)."""

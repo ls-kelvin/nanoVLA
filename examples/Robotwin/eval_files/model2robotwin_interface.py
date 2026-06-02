@@ -115,7 +115,8 @@ class ModelClient:
         images = [self._resize_image(image) for image in images]
         example["image"] = images
         example_copy = example.copy()
-        example_copy.pop("state")
+        if state is not None:
+            example_copy["state"] = np.asarray(state).reshape(1, -1)
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,
