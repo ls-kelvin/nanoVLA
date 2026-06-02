@@ -21,7 +21,6 @@ from typing import Tuple
 import torch
 import torch.distributed as dist
 import wandb
-from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -33,11 +32,12 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
-
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+from starVLA.training.trainer_utils.trainer_tools import (
+    TrainerUtils,
+    create_accelerator_from_config,
+    normalize_dotlist_args,
+    setup_optimizer_and_scheduler,
+)
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -238,9 +238,13 @@ class VLAMTrainer(TrainerUtils):
             batch_vlm = self._get_next_batch()
             step_metrics = self._train_step(batch_vlm)
 
+            did_optimizer_step = self.accelerator.sync_gradients
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
                 self.completed_steps += 1
+
+            if not did_optimizer_step:
+                continue
 
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
@@ -274,14 +278,13 @@ class VLAMTrainer(TrainerUtils):
         """Execute single training step."""
         log_dict = {}
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 unwrapped = self.accelerator.unwrap_model(self.model)
                 vlm_output = unwrapped.qwen_vl_interface(**batch_vlm)
                 vlm_loss = vlm_output.loss * self.config.trainer.loss_scale.vlm
             self.accelerator.backward(vlm_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
@@ -289,6 +292,7 @@ class VLAMTrainer(TrainerUtils):
             # See train_starvla.py for full explanation.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+            self.optimizer.zero_grad()
             log_dict["vlm_loss"] = vlm_loss.item()
 
         return log_dict
@@ -321,6 +325,7 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+    accelerator = create_accelerator_from_config(cfg)
 
     output_dir = setup_directories(cfg=cfg)
     vlm = build_framework(cfg)

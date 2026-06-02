@@ -57,9 +57,9 @@ export NCCL_TIMEOUT=10000
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # === Generate accelerate + DeepSpeed config ===
-# Note: starVLA's trainer.gradient_accumulation_steps is not wired to the
-# Accelerator at construction time (see issue #41). Real grad-accum must come
-# from the DeepSpeed JSON, generated here.
+# The trainer now wires --trainer.gradient_accumulation_steps into Accelerate
+# and DeepSpeed; this helper keeps the DeepSpeed launch config explicit for
+# cluster jobs and older checkouts.
 ACCEL_CONFIG=$(python3 examples/Gemma4/_make_accelerate_config.py \
     --grad-accum "${GRAD_ACCUM}" \
     --num-processes 8 \

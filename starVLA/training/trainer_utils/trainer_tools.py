@@ -6,12 +6,15 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
 from typing import Tuple
+import os
 import re
 import json
 import numpy as np
 import torch
 import torch.distributed as dist
+from accelerate import Accelerator, DeepSpeedPlugin
 from transformers import get_scheduler
+from omegaconf import OmegaConf
 
 from accelerate.logging import get_logger
 
@@ -48,6 +51,65 @@ def normalize_dotlist_args(args):
         else:
             pass  # skip orphaned values
     return normalized
+
+
+def _load_deepspeed_config_from_env():
+    """Load the DeepSpeed JSON/YAML config selected by accelerate launch, if any."""
+    ds_config_path = os.environ.get("ACCELERATE_DEEPSPEED_CONFIG_FILE")
+    if not ds_config_path or ds_config_path == "none":
+        return None
+
+    path = os.path.abspath(os.path.expanduser(ds_config_path))
+    if not os.path.exists(path):
+        logger.warning(f"DeepSpeed config file from ACCELERATE_DEEPSPEED_CONFIG_FILE not found: {ds_config_path}")
+        return None
+
+    loaded = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+    if isinstance(loaded, dict) and "zero_optimization" in loaded:
+        return loaded
+
+    nested_path = None
+    if isinstance(loaded, dict):
+        nested_path = loaded.get("deepspeed_config", {}).get("deepspeed_config_file")
+    if not nested_path:
+        return None
+
+    nested_candidates = [
+        os.path.abspath(os.path.expanduser(nested_path)),
+        os.path.abspath(os.path.join(os.path.dirname(path), os.path.expanduser(nested_path))),
+    ]
+    for candidate in nested_candidates:
+        if os.path.exists(candidate):
+            nested = OmegaConf.to_container(OmegaConf.load(candidate), resolve=True)
+            if isinstance(nested, dict) and "zero_optimization" in nested:
+                return nested
+
+    logger.warning(f"Nested DeepSpeed config file not found or invalid: {nested_path}")
+    return None
+
+
+def create_accelerator_from_config(cfg):
+    """Create Accelerator with trainer.gradient_accumulation_steps wired into Accelerate and DeepSpeed."""
+    gradient_accumulation_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
+    if gradient_accumulation_steps < 1:
+        raise ValueError("trainer.gradient_accumulation_steps must be >= 1")
+
+    gradient_clipping = getattr(cfg.trainer, "gradient_clipping", None)
+    ds_config = _load_deepspeed_config_from_env()
+    if ds_config is not None:
+        ds_config["gradient_accumulation_steps"] = gradient_accumulation_steps
+
+    deepspeed_plugin = DeepSpeedPlugin(
+        hf_ds_config=ds_config,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_clipping=gradient_clipping,
+    )
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        deepspeed_plugin=deepspeed_plugin,
+    )
+    accelerator.print(accelerator.state)
+    return accelerator
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:

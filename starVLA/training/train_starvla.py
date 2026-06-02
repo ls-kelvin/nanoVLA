@@ -23,7 +23,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -36,11 +35,12 @@ from starVLA.dataloader import build_dataloader, build_vla_eval_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
-
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+from starVLA.training.trainer_utils.trainer_tools import (
+    TrainerUtils,
+    build_param_lr_groups,
+    create_accelerator_from_config,
+    normalize_dotlist_args,
+)
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -356,6 +356,7 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
+            did_optimizer_step = self.accelerator.sync_gradients
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
                 self.completed_steps += 1
@@ -367,6 +368,9 @@ class VLATrainer(TrainerUtils):
                         "model_times": f"{t_end_model - t_start_model:.3f}",
                     }
                 )
+
+            if not did_optimizer_step:
+                continue
 
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
@@ -428,8 +432,6 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
@@ -437,7 +439,7 @@ class VLATrainer(TrainerUtils):
 
             self.accelerator.backward(total_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
@@ -448,6 +450,7 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
         return {
             "action_dit_loss": action_loss.item(),
@@ -481,6 +484,7 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+    accelerator = create_accelerator_from_config(cfg)
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
