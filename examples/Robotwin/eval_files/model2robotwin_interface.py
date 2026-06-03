@@ -29,6 +29,7 @@ class ModelClient:
         port=5694,
         action_mode: str = "abs",
         normalization_mode: str = "min_max",
+        infer_every_steps: Optional[int] = None,
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
@@ -65,13 +66,16 @@ class ModelClient:
         self.action_chunk_size = None
         self.state_norm_stats = None
         self.raw_actions = None
+        self.last_infer_step = None
+        self.infer_count = 0
 
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
+        self.infer_every_steps = self._resolve_infer_every_steps(infer_every_steps)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
-            f"server_meta: {server_meta} ***"
+            f"infer_every_steps: {self.infer_every_steps}, server_meta: {server_meta} ***"
         )
 
     def reset(self, task_description: str) -> None:
@@ -81,9 +85,25 @@ class ModelClient:
             self.action_ensembler.reset()
         self.num_image_history = 0
         self.raw_actions = None
+        self.last_infer_step = None
+        self.infer_count = 0
         # Reset state tracking for delta/rel modes
         self.initial_state = None
         self.prev_action = None
+
+    def _resolve_infer_every_steps(self, infer_every_steps: Optional[int]) -> int:
+        action_chunk_size = int(self.action_chunk_size)
+        if infer_every_steps is None:
+            return action_chunk_size
+
+        infer_every_steps = int(infer_every_steps)
+        if infer_every_steps < 1:
+            raise ValueError("infer_every_steps must be >= 1")
+        if infer_every_steps > action_chunk_size:
+            raise ValueError(
+                f"infer_every_steps ({infer_every_steps}) cannot exceed action_chunk_size ({action_chunk_size})"
+            )
+        return infer_every_steps
 
     def step(
         self,
@@ -125,12 +145,28 @@ class ModelClient:
         }
         vla_input["unnorm_key"] = self.unnorm_key
 
-        action_chunk_size = self.action_chunk_size
+        needs_infer = (
+            self.raw_actions is None
+            or self.last_infer_step is None
+            or step - self.last_infer_step >= self.infer_every_steps
+        )
 
-        if step % action_chunk_size == 0 or self.raw_actions is None:
+        if needs_infer:
+            self.infer_count += 1
+            print(
+                f"[RobotwinEval] policy inference #{self.infer_count}: "
+                f"env_step={step}, infer_every_steps={self.infer_every_steps}, "
+                f"action_chunk_size={self.action_chunk_size}, task={task_description!r}",
+                flush=True,
+            )
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
+
+            if len(raw_actions) < self.infer_every_steps:
+                raise ValueError(
+                    f"Policy returned {len(raw_actions)} actions, fewer than infer_every_steps={self.infer_every_steps}"
+                )
 
             # Convert delta/rel to absolute actions
             if self.action_mode == "delta":
@@ -139,10 +175,13 @@ class ModelClient:
                 self.raw_actions = self._rel_to_absolute(raw_actions)
             else:
                 self.raw_actions = raw_actions
+            self.last_infer_step = step
 
-        action_idx = step % action_chunk_size
+        action_idx = step - self.last_infer_step
         if action_idx >= len(self.raw_actions):
-            pass
+            raise IndexError(
+                f"Action index {action_idx} is out of range for cached action chunk of length {len(self.raw_actions)}"
+            )
 
         current_action = self.raw_actions[action_idx]
 
@@ -181,6 +220,7 @@ def get_model(usr_args):
         "action_normalization_mode",
         usr_args.get("normalization_mode", "min_max"),
     )
+    infer_every_steps = usr_args.get("infer_every_steps", None)
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -192,6 +232,7 @@ def get_model(usr_args):
         unnorm_key=unnorm_key,
         action_mode=action_mode,
         normalization_mode=normalization_mode,
+        infer_every_steps=infer_every_steps,
     )
 
 

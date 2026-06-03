@@ -132,6 +132,7 @@ Optional flags:
   -s, --seed              Eval seed (default: 0, env: ROBOTWIN_SEED)
   -j, --jobs-per-gpu      Concurrent jobs per GPU (default: 1, env: ROBOTWIN_JOBS_PER_GPU)
   -p, --base-port         First port to allocate (default: 5694, env: ROBOTWIN_BASE_PORT)
+      --infer-every       Execute this many env steps per policy inference (default: model action_chunk_size)
       --server-timeout    Seconds to wait for server (default: 600, env: ROBOTWIN_SERVER_TIMEOUT)
       --install-deps      Run pip install bootstrap steps once
   -h, --help              Show this help message
@@ -144,6 +145,7 @@ Examples:
 
 Environment variables (lower priority than flags):
   ROBOTWIN_PATH              Path to the RoboTwin repository
+  ROBOTWIN_INFER_EVERY_STEPS Inference refresh interval in env execution steps
   ROBOTWIN_STARVLA_ENV       Conda env name for the policy server (default: starvla)
   ROBOTWIN_ENV               Conda env name for RoboTwin eval (default: robotwin)
   STARVLA_PYTHON             Explicit python path for starvla (skips conda env lookup)
@@ -394,6 +396,8 @@ launch_task_in_slot() {
             "${gpu_id}" \
             "${CKPT_PATH}" \
             "${port}" \
+            "${ROBOTWIN_POLICY_HOST:-127.0.0.1}" \
+            "${ROBOTWIN_INFER_EVERY_STEPS:-}" \
             > >(tee "${eval_log}" | grep --line-buffered "Success rate" | sed -u "s/^/[RESULT] ${task_name}: /") 2>&1
     ) &
 
@@ -413,6 +417,7 @@ opt_seed=""
 opt_jobs=""
 opt_port=""
 opt_timeout=""
+opt_infer_every=""
 opt_install=false
 
 while (( $# > 0 )); do
@@ -423,6 +428,7 @@ while (( $# > 0 )); do
         -s|--seed)          opt_seed="$2"; shift 2 ;;
         -j|--jobs-per-gpu)  opt_jobs="$2"; shift 2 ;;
         -p|--base-port)     opt_port="$2"; shift 2 ;;
+        --infer-every)      opt_infer_every="$2"; shift 2 ;;
         --server-timeout)   opt_timeout="$2"; shift 2 ;;
         --install-deps)     opt_install=true; shift ;;
         -h|--help)          usage; exit 0 ;;
@@ -457,6 +463,7 @@ ROBOTWIN_SEED="${opt_seed:-${ROBOTWIN_SEED:-0}}"
 ROBOTWIN_JOBS_PER_GPU="${opt_jobs:-${ROBOTWIN_JOBS_PER_GPU:-1}}"
 ROBOTWIN_BASE_PORT="${opt_port:-${ROBOTWIN_BASE_PORT:-5694}}"
 ROBOTWIN_SERVER_TIMEOUT="${opt_timeout:-${ROBOTWIN_SERVER_TIMEOUT:-600}}"
+ROBOTWIN_INFER_EVERY_STEPS="${opt_infer_every:-${ROBOTWIN_INFER_EVERY_STEPS:-}}"
 if ${opt_install}; then
     ROBOTWIN_AUTO_INSTALL_DEPS=1
 fi
@@ -506,6 +513,9 @@ echo "[INFO] mode=${TASK_CONFIG}  name=${POLICY_NAME}  seed=${ROBOTWIN_SEED}"
 echo "[INFO] ckpt=${CKPT_PATH}"
 echo "[INFO] logs=${LOG_DIR}"
 echo "[INFO] gpus=$(join_arr ',' "${CUDA_DEVICES[@]}")  jobs_per_gpu=${JOBS_PER_GPU}  slots=${TOTAL_SLOTS}"
+if [[ -n "${ROBOTWIN_INFER_EVERY_STEPS}" ]]; then
+    echo "[INFO] infer_every_steps=${ROBOTWIN_INFER_EVERY_STEPS}"
+fi
 echo "[INFO] tasks (${TOTAL_TASKS}): $(join_arr ', ' "${TASKS[@]}")"
 
 next_task_idx=0

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 6 ]]; then
-    echo "Usage: bash examples/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host]" >&2
+    echo "Usage: bash examples/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host] [infer_every_steps]" >&2
     exit 1
 fi
 
@@ -49,6 +49,7 @@ gpu_id="${5:-0}"
 policy_ckpt_path="$6"
 policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
 policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
+infer_every_steps="${9:-${ROBOTWIN_INFER_EVERY_STEPS:-}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
@@ -85,13 +86,23 @@ echo "task_name: ${task_name}"
 echo "task_config: ${task_config}"
 echo "ckpt_setting: ${ckpt_setting}"
 echo "policy_port: ${policy_port}"
+if [[ -n "${infer_every_steps}" ]]; then
+    echo "infer_every_steps: ${infer_every_steps}"
+fi
+
+robotwin_overrides=(
+    --task_name "${task_name}"
+    --task_config "${task_config}"
+    --ckpt_setting "${ckpt_setting}"
+    --seed "${seed}"
+    --policy_name "${policy_name}"
+)
+if [[ -n "${infer_every_steps}" ]]; then
+    robotwin_overrides+=(--infer_every_steps "${infer_every_steps}")
+fi
 
 PYTHONWARNINGS=ignore::UserWarning \
 "${robotwin_python}" script/eval_policy.py --config "${runtime_deploy_policy}" \
     --policy_ckpt_path "${policy_ckpt_path}" \
     --overrides \
-    --task_name "${task_name}" \
-    --task_config "${task_config}" \
-    --ckpt_setting "${ckpt_setting}" \
-    --seed "${seed}" \
-    --policy_name "${policy_name}"
+    "${robotwin_overrides[@]}"

@@ -10,5 +10,7 @@ host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
+# null keeps the legacy behavior: refresh inference every action_chunk_size steps.
+infer_every_steps: 32
 
 normalization_mode: "q99"  # options: min_max, q99
