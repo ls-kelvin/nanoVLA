@@ -55,6 +55,8 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             "latent_loss_weight": 1.0,
             "action_loss_weight": 1.0,
             "condition_action_on_latent": True,
+            "la_mask": True,
+            "action_train_robot_types": None,
             "codebook_size": 16,
             "num_codes_per_pair": 4,
             "token_format": "<robot_action_{i}>",
@@ -99,6 +101,72 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         self.latent_action_id_to_token = {idx: tok for idx, tok in zip(token_ids, tokens)}
         self.qwen_vl_interface._ACTION_TOKEN_MIN = sorted_ids[0]
         self.qwen_vl_interface._ACTION_TOKEN_MAX = sorted_ids[-1]
+
+    def _mask_latent_action_attention(
+        self,
+        attention_mask: torch.Tensor | None,
+        input_ids: torch.LongTensor | None,
+    ) -> torch.Tensor | None:
+        if attention_mask is None or input_ids is None:
+            return attention_mask
+        if not bool(self.latent_action_cfg.get("la_mask", True)):
+            return attention_mask
+        if not self.latent_action_token_ids:
+            return attention_mask
+
+        action_token_min = min(self.latent_action_token_ids)
+        action_token_max = max(self.latent_action_token_ids)
+        latent_token_mask = (input_ids >= action_token_min) & (input_ids <= action_token_max)
+        if not latent_token_mask.any():
+            return attention_mask
+
+        masked_attention = attention_mask.clone()
+        return masked_attention.masked_fill(latent_token_mask, 0)
+
+    def _get_action_train_robot_types(self) -> set[str] | None:
+        robot_types = self.latent_action_cfg.get("action_train_robot_types", None)
+        if robot_types is None:
+            return None
+        if isinstance(robot_types, str):
+            robot_types = robot_types.strip()
+            if robot_types == "" or robot_types.lower() in {"none", "null", "all"}:
+                return None
+            if robot_types.startswith("[") and robot_types.endswith("]"):
+                robot_types = robot_types[1:-1]
+            robot_types = [item.strip().strip("'\"") for item in robot_types.split(",")]
+
+        allowed = {str(robot_type) for robot_type in robot_types if str(robot_type)}
+        return allowed if allowed else None
+
+    def _select_action_training_batch(
+        self,
+        examples: List[dict],
+        vl_embs_list: list[torch.Tensor],
+        backbone_attention_mask: torch.Tensor | None,
+    ) -> tuple[List[dict], list[torch.Tensor], torch.Tensor | None]:
+        action_train_robot_types = self._get_action_train_robot_types()
+        if action_train_robot_types is None:
+            return examples, vl_embs_list, backbone_attention_mask
+
+        selected_indices = [
+            idx
+            for idx, example in enumerate(examples)
+            if str(example.get("robot_type", "")) in action_train_robot_types
+        ]
+        if len(selected_indices) == len(examples):
+            return examples, vl_embs_list, backbone_attention_mask
+        if not selected_indices:
+            return [], [], None
+
+        index_tensor = torch.tensor(selected_indices, device=vl_embs_list[-1].device, dtype=torch.long)
+        selected_examples = [examples[idx] for idx in selected_indices]
+        selected_vl_embs_list = [hidden.index_select(0, index_tensor) for hidden in vl_embs_list]
+        selected_attention_mask = (
+            backbone_attention_mask.index_select(0, index_tensor)
+            if backbone_attention_mask is not None
+            else None
+        )
+        return selected_examples, selected_vl_embs_list, selected_attention_mask
 
     def _build_latent_frame_pairs(self, examples: List[dict]):
         flat_pairs = []
@@ -206,6 +274,8 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         if not labels and "labels" in qwen_inputs:
             qwen_inputs.pop("labels")
         attention_mask = qwen_inputs.get("attention_mask", None)
+        if project_for_action:
+            attention_mask = self._mask_latent_action_attention(attention_mask, qwen_inputs.get("input_ids", None))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.qwen_vl_interface(
                 **qwen_inputs,
@@ -257,6 +327,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         vl_embs_list = None
         backbone_attention_mask = None
         condition_on_latent = bool(self.latent_action_cfg.get("condition_action_on_latent", True))
+        action_train_batch_size = 0
 
         if self.latent_action_enabled and self.train_latent_action:
             latent_solutions = self._make_latent_action_solutions(examples, instructions)
@@ -285,7 +356,32 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                     labels=False,
                     project_for_action=True,
                 )
-            continuous_action_loss = self._continuous_action_loss(examples, vl_embs_list, backbone_attention_mask)
+            action_examples, action_vl_embs_list, action_attention_mask = self._select_action_training_batch(
+                examples,
+                vl_embs_list,
+                backbone_attention_mask,
+            )
+            action_train_batch_size = len(action_examples)
+            if action_examples:
+                continuous_action_loss = self._continuous_action_loss(
+                    action_examples,
+                    action_vl_embs_list,
+                    action_attention_mask,
+                )
+            else:
+                # Keep the action head in every rank's graph even when this local
+                # batch has no target robot_type.  Otherwise DDP/ZeRO can hang
+                # when different ranks use different parameter subsets.
+                dummy_attention_mask = (
+                    backbone_attention_mask[:1]
+                    if backbone_attention_mask is not None
+                    else None
+                )
+                continuous_action_loss = self._continuous_action_loss(
+                    examples[:1],
+                    [hidden[:1] for hidden in vl_embs_list],
+                    dummy_attention_mask,
+                ) * 0.0
 
         total_loss = None
         if continuous_action_loss is not None:
@@ -298,7 +394,9 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
 
         out = {"total_loss": total_loss, "action_loss": total_loss}
         if continuous_action_loss is not None:
+            out["action_dit_loss"] = continuous_action_loss
             out["action_dis_loss"] = continuous_action_loss
+            out["action_train_batch_size"] = action_train_batch_size
         if latent_action_loss is not None:
             out["latent_action_loss"] = latent_action_loss
         return out

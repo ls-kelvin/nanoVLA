@@ -325,4 +325,18 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
     "robotwin2_non_franka_all": _discover_robotwin2_non_franka_mixture("robotwin50"),
+    "robotwin_place_phone_stand": [
+        ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin50"), 
+        ("place_phone_stand/aloha-agilex/randomized", 1.0, "robotwin50")
+    ],
+    "robotwin_cross_place_phone_stand": [
+        ("place_phone_stand/aloha-agilex/clean", 3.0, "robotwin50"), 
+        ("place_phone_stand/aloha-agilex/randomized", 3.0, "robotwin50"),
+        ("place_phone_stand/arx-x5/clean", 1.0, "robotwin50"), 
+        ("place_phone_stand/arx-x5/randomized", 1.0, "robotwin50"),
+        ("place_phone_stand/piper/clean", 1.0, "robotwin50"), 
+        ("place_phone_stand/piper/randomized", 1.0, "robotwin50"),
+        ("place_phone_stand/ur5/clean", 1.0, "robotwin50"), 
+        ("place_phone_stand/ur5/randomized", 1.0, "robotwin50"),
+    ],
 }

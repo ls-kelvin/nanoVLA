@@ -322,39 +322,72 @@ class VLAMTrainer(TrainerUtils):
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Evaluate action prediction on a fixed validation subset."""
         step_metrics = step_metrics or {}
-        if self.accelerator.is_main_process:
-            model = self.accelerator.unwrap_model(self.model)
-            if not getattr(model, "train_continuous_action", True) or getattr(model, "action_model", True) is None:
+        model = self.accelerator.unwrap_model(self.model)
+        if not getattr(model, "train_continuous_action", True) or getattr(model, "action_model", True) is None:
+            if self.accelerator.is_main_process:
                 step_metrics["validation/skipped_action_mse"] = 1
+            if dist.is_initialized():
                 dist.barrier()
-                return step_metrics
+            return step_metrics
 
-            was_training = self.model.training
-            self.model.eval()
+        was_training = self.model.training
+        self.model.eval()
 
-            total_squared_error = 0.0
-            total_elements = 0
-            total_samples = 0
+        total_squared_error = 0.0
+        total_elements = 0
+        total_samples = 0
+        total_batches = 0
+        action_eval_robot_types = (
+            model._get_action_train_robot_types()
+            if hasattr(model, "_get_action_train_robot_types")
+            else None
+        )
 
-            with torch.inference_mode():
-                for examples in self.vla_eval_dataloader:
-                    actions = np.asarray([example["action"] for example in examples])
-                    output_dict = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
-                    normalized_actions = np.asarray(output_dict["normalized_actions"])
+        with torch.inference_mode():
+            for examples in self.vla_eval_dataloader:
+                if action_eval_robot_types is not None:
+                    examples = [
+                        example
+                        for example in examples
+                        if str(example.get("robot_type", "")) in action_eval_robot_types
+                    ]
+                    if not examples:
+                        continue
 
-                    diff = normalized_actions - actions
-                    total_squared_error += float(np.sum(diff**2))
-                    total_elements += int(diff.size)
-                    total_samples += int(actions.shape[0])
+                actions = np.asarray([example["action"] for example in examples])
+                output_dict = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+                normalized_actions = np.asarray(output_dict["normalized_actions"])
 
-            if was_training:
-                self.model.train()
+                diff = normalized_actions - actions
+                total_squared_error += float(np.sum(diff**2))
+                total_elements += int(diff.size)
+                total_samples += int(actions.shape[0])
+                total_batches += 1
 
-            step_metrics["mse_score"] = total_squared_error / max(total_elements, 1)
-            step_metrics["validation/num_samples"] = total_samples
-            step_metrics["validation/num_batches"] = len(self.vla_eval_dataloader)
+        if was_training:
+            self.model.train()
 
-        dist.barrier()
+        eval_totals = torch.tensor(
+            [total_squared_error, total_elements, total_samples, total_batches],
+            dtype=torch.float64,
+            device=self.accelerator.device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(eval_totals, op=dist.ReduceOp.SUM)
+
+        if self.accelerator.is_main_process:
+            global_squared_error, global_elements, global_samples, global_batches = eval_totals.tolist()
+            if global_elements > 0:
+                step_metrics["mse_score"] = global_squared_error / global_elements
+            else:
+                step_metrics["validation/skipped_action_mse"] = 1
+            step_metrics["validation/num_samples"] = int(global_samples)
+            step_metrics["validation/num_batches"] = int(global_batches)
+            if action_eval_robot_types is not None:
+                step_metrics["validation/action_eval_robot_types"] = ",".join(sorted(action_eval_robot_types))
+
+        if dist.is_initialized():
+            dist.barrier()
         return step_metrics
 
     def _log_training_config(self):
@@ -406,6 +439,8 @@ class VLAMTrainer(TrainerUtils):
             )
             if "latent_action_loss" in output_dict:
                 log_dict["latent_action_loss"] = output_dict["latent_action_loss"].item()
+            if "action_train_batch_size" in output_dict:
+                log_dict["action_train_batch_size"] = output_dict["action_train_batch_size"]
 
         return log_dict
 

@@ -1398,7 +1398,8 @@ class LeRobotSingleDataset(Dataset):
             "action": action,
             "image": step_images,
             "lang": language,
-            "robot_tag": self.tag
+            "robot_tag": self.tag,
+            "robot_type": self.lerobot_info_meta.get("robot_type", None),
         }
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:

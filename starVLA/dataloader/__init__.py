@@ -87,6 +87,16 @@ def build_fixed_subset_indices(dataset_length: int, num_samples: int | None, see
     return sorted(int(i) for i in indices.tolist())
 
 
+def shard_indices_by_rank(indices: list[int]) -> list[int]:
+    """Shard fixed eval indices across distributed ranks without padding duplicates."""
+    if not dist.is_initialized():
+        return indices
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    return indices[rank::world_size]
+
+
 def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: int | None = None, seed: int | None = None):
     """
     Build a deterministic validation dataloader for VLA training.
@@ -121,10 +131,17 @@ def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: i
         eval_batch_size = int(vla_dataset_cfg.per_device_batch_size)
 
     subset_indices = build_fixed_subset_indices(len(vla_dataset), eval_num_samples, cfg.seed if seed is None else seed)
+    global_num_samples = len(subset_indices)
+    subset_indices = shard_indices_by_rank(subset_indices)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     logger.info(
-        "Building VLA validation dataloader with %d/%d samples, batch_size=%d, seed=%d",
+        "Building VLA validation dataloader with %d/%d local samples (%d global, rank=%d/%d), batch_size=%d, seed=%d",
         len(subset_indices),
         len(vla_dataset),
+        global_num_samples,
+        rank,
+        world_size,
         int(eval_batch_size),
         cfg.seed if seed is None else seed,
     )
