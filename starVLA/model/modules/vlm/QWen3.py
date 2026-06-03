@@ -141,13 +141,18 @@ class _QWen3_VL_Interface(nn.Module):
         # Preparation for inference
 
         batch_inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, padding=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+            messages,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=(solutions is None),
+            return_dict=True,
+            return_tensors="pt",
         )
 
         # if solutions, mask out the solution tokens in labels
         if solutions is not None:  #  here only for fast_tokenizer now.
-            action_token_min = _ACTION_TOKEN_MIN  # how can we know this range? --> we has other way for this, but is slower see qwenhelix branch
-            action_token_max = _ACTION_TOKEN_MAX  # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
+            action_token_min = getattr(self, "_ACTION_TOKEN_MIN", _ACTION_TOKEN_MIN)
+            action_token_max = getattr(self, "_ACTION_TOKEN_MAX", _ACTION_TOKEN_MAX)
             labels = batch_inputs["input_ids"].clone()
             # For each sequence in the batch, find the first occurrence of an action token.
             for i in range(labels.size(0)):

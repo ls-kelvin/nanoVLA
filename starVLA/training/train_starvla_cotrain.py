@@ -130,6 +130,7 @@ class VLAMTrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
         self.dump_parameter_status(self.model, self.config.output_dir)
+        self.optimizer, self.lr_scheduler = setup_optimizer_and_scheduler(model=self.model, cfg=self.config)
 
         self.model, self.optimizer, self.vla_train_dataloader, self.vlm_train_dataloader = (
             self.setup_distributed_training(
@@ -322,9 +323,14 @@ class VLAMTrainer(TrainerUtils):
         """Evaluate action prediction on a fixed validation subset."""
         step_metrics = step_metrics or {}
         if self.accelerator.is_main_process:
+            model = self.accelerator.unwrap_model(self.model)
+            if not getattr(model, "train_continuous_action", True) or getattr(model, "action_model", True) is None:
+                step_metrics["validation/skipped_action_mse"] = 1
+                dist.barrier()
+                return step_metrics
+
             was_training = self.model.training
             self.model.eval()
-            model = self.accelerator.unwrap_model(self.model)
 
             total_squared_error = 0.0
             total_elements = 0
@@ -366,9 +372,14 @@ class VLAMTrainer(TrainerUtils):
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
-            self.accelerator.backward(total_loss)
+                vla_total_loss = output_dict["total_loss"] if "total_loss" in output_dict else output_dict["action_loss"]
+                if "action_dis_loss" in output_dict:
+                    action_dis_loss = output_dict["action_dis_loss"]
+                elif "continuous_action_loss" in output_dict:
+                    action_dis_loss = output_dict["continuous_action_loss"]
+                else:
+                    action_dis_loss = output_dict["action_loss"]
+            self.accelerator.backward(vla_total_loss)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 unwrapped = self.accelerator.unwrap_model(self.model)
@@ -388,10 +399,13 @@ class VLAMTrainer(TrainerUtils):
 
             log_dict.update(
                 {
-                    "action_dit_loss": action_loss.item(),
+                    "total_loss": (vla_total_loss.detach() + vlm_loss.detach()).item(),
+                    "action_dis_loss": action_dis_loss.item(),
                     "vlm_loss": vlm_loss.item(),
                 }
             )
+            if "latent_action_loss" in output_dict:
+                log_dict["latent_action_loss"] = output_dict["latent_action_loss"].item()
 
         return log_dict
 

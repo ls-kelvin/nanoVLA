@@ -28,6 +28,7 @@ wandb
 rich
 diffusers
 timm
+rotary_embedding_torch==0.8.4
 tyro
 websockets
 tdigest==0.5.2.2

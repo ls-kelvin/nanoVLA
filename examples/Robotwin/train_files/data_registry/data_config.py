@@ -1,5 +1,8 @@
 """RobotWin benchmark — data config, embodiment tags, and mixtures."""
 
+import os
+from pathlib import Path
+
 from starVLA.dataloader.gr00t_lerobot.datasets import ModalityConfig
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
@@ -118,6 +121,32 @@ class ArxX5DataConfig:
                 },
             ),
         ])
+
+
+_ROBOTWIN2_LEROBOT_ROOT = Path(
+    os.environ.get(
+        "ROBOTWIN2_LEROBOT_ROOT",
+        "/inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot",
+    )
+)
+
+
+def _discover_robotwin2_non_franka_mixture(robot_type: str = "robotwin") -> list[tuple[str, float, str]]:
+    """Discover all non-Franka dataset subdirs that already have modality metadata.
+
+    The scan is intentional: it keeps the registry in sync with the on-disk
+    conversion output without hard-coding hundreds of paths.
+    """
+    if not _ROBOTWIN2_LEROBOT_ROOT.is_dir():
+        return []
+
+    mixture: list[tuple[str, float, str]] = []
+    for modality_file in sorted(_ROBOTWIN2_LEROBOT_ROOT.glob("**/meta/modality.json")):
+        dataset_dir = modality_file.parent.parent
+        if "franka" in dataset_dir.parts:
+            continue
+        mixture.append((dataset_dir.relative_to(_ROBOTWIN2_LEROBOT_ROOT).as_posix(), 1.0, robot_type))
+    return mixture
 
 
 ROBOT_TYPE_CONFIG_MAP = {
@@ -295,4 +324,5 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task1": [("adjust_bottle", 1.0, "robotwin")],
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
+    "robotwin2_non_franka_all": _discover_robotwin2_non_franka_mixture("robotwin50"),
 }

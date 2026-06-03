@@ -184,6 +184,8 @@ class Qwen_PI_v3(baseframework):
         llm_hidden_size = int(vlm_hf_cfg.hidden_size)
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
+        latent_action_cfg = self.config.framework.get("latent_action", {})
+        self.train_continuous_action = bool(latent_action_cfg.get("train_action", True))
 
         # Resolve the Action DiT hidden dim BEFORE building the action head,
         # so that LayerwiseFlowmatchingActionHead constructs DiT at the right size.
@@ -209,8 +211,12 @@ class Qwen_PI_v3(baseframework):
             num_dit_layers=num_vl_layers,
         )
 
-        self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)
-        self.num_action_dit_layers = len(self.action_model.model.transformer_blocks)
+        self.action_model: Optional[LayerwiseFlowmatchingActionHead] = None
+        if self.train_continuous_action:
+            self.action_model = get_action_model(config=self.config)
+            self.num_action_dit_layers = len(self.action_model.model.transformer_blocks)
+        else:
+            self.num_action_dit_layers = 0
 
         # Layer-wise projector: map each selected VL hidden to Action DiT hidden space.
         # This explicitly decouples VL representation size from action DiT latent size.

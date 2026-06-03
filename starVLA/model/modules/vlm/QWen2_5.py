@@ -198,7 +198,7 @@ class _QWen_VL_Interface(nn.Module):
                           {"type": "image", "image": <PIL.Image>}, ...,
                           {"type": "text", "text": <final_prompt>}
                       ]}]
-                - Applies processor.apply_chat_template(..., add_generation_prompt=True)
+                - Applies processor.apply_chat_template(..., add_generation_prompt=(solutions is None))
                 - Extracts vision inputs via process_vision_info
                 - Calls processor(...) to produce a BatchFeature with token + vision tensors.
 
@@ -267,7 +267,14 @@ class _QWen_VL_Interface(nn.Module):
 
         # Prepare text prompts using processor
         # default process is json --> message --> texts --> input_ids
-        texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+        texts = [
+            self.processor.apply_chat_template(
+                m,
+                tokenize=False,
+                add_generation_prompt=(solutions is None),
+            )
+            for m in messages
+        ]
 
         # image_inputs = list of PIL
         image_inputs, video_inputs = process_vision_info(messages)
@@ -277,8 +284,8 @@ class _QWen_VL_Interface(nn.Module):
 
         # if solutions, mask out the non solution tokens in labels --> @JinhuiYE can we mask out system prompt?
         if solutions is not None:
-            action_token_min = _ACTION_TOKEN_MIN  # how can we know this range? --> we has other way for this, but is slower see qwenhelix branch
-            action_token_max = _ACTION_TOKEN_MAX  # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
+            action_token_min = getattr(self, "_ACTION_TOKEN_MIN", _ACTION_TOKEN_MIN)
+            action_token_max = getattr(self, "_ACTION_TOKEN_MAX", _ACTION_TOKEN_MAX)
             labels = batch_input["input_ids"].clone()
             # For each sequence in the batch, find the first occurrence of an action token.
             for i in range(labels.size(0)):

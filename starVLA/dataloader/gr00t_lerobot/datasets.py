@@ -1374,7 +1374,11 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        sample = self._pack_sample(data)
+        sample["episode_index"] = int(trajectory_id)
+        sample["step_index"] = int(base_index)
+        sample["episode_path"] = self.get_episode_data_path(trajectory_id).as_posix()
+        return sample
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
@@ -1488,6 +1492,23 @@ class LeRobotSingleDataset(Dataset):
             # filter by trajectory_id
             episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
             return episode_data
+
+    def get_episode_data_path(self, trajectory_id: int) -> Path:
+        """Get the on-disk parquet path that stores the episode rows."""
+        if self._lerobot_version == "v2.0":
+            chunk_index = self.get_episode_chunk(trajectory_id)
+            return self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=chunk_index,
+                episode_index=trajectory_id,
+            )
+
+        episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+        chunk_index = episode_meta["data/chunk_index"]
+        file_index = self.get_episode_file_index(trajectory_id)
+        return self.dataset_path / self.data_path_pattern.format(
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -2384,6 +2405,9 @@ class LeRobotMixtureDataset(Dataset):
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
                 sample = dataset._pack_sample(data)
+                sample["episode_index"] = int(trajectory_id)
+                sample["step_index"] = int(step)
+                sample["episode_path"] = dataset.get_episode_data_path(trajectory_id).as_posix()
                 
                 return sample
                 

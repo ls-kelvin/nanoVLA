@@ -35,8 +35,11 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
-    if dataset_py == "lerobot_datasets":
-        from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
+    if dataset_py in {"lerobot_datasets", "lerobot_la_datasets"}:
+        if dataset_py == "lerobot_la_datasets":
+            from starVLA.dataloader.lerobot_la_datasets import collate_fn, get_vla_dataset
+        else:
+            from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
         vla_dataset_cfg = cfg.datasets.vla_data
 
         vla_dataset = get_vla_dataset(
@@ -92,7 +95,11 @@ def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: i
     frozen via a deterministic subset so repeated evaluations always use the
     same examples when the seed is fixed.
     """
-    from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
+    dataset_py = getattr(cfg.datasets.vla_data, "dataset_py", "lerobot_datasets")
+    if dataset_py == "lerobot_la_datasets":
+        from starVLA.dataloader.lerobot_la_datasets import collate_fn, get_vla_dataset
+    else:
+        from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
 
     vla_dataset_cfg = cfg.datasets.vla_data
     vla_dataset = get_vla_dataset(
