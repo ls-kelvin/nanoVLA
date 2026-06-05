@@ -356,7 +356,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                 instructions,
                 solutions=latent_solutions,
                 labels=True,
-                project_for_action=self.train_continuous_action and condition_on_latent,
+                project_for_action=self.train_continuous_action,
             )
             latent_action_loss = outputs.loss
             if latent_action_loss is None or torch.isnan(latent_action_loss):
@@ -364,7 +364,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
 
         continuous_action_loss = None
         if self.train_continuous_action:
-            if vl_embs_list is None or not condition_on_latent:
+            if vl_embs_list is None:
                 solutions = latent_solutions if condition_on_latent else None
                 vl_embs_list, backbone_attention_mask, _ = self._encode_vl_hidden_states_with_solutions(
                     batch_images,
