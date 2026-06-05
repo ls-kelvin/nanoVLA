@@ -121,6 +121,7 @@ class PolicyServerWrapper:
             proc = self._get_processor(self._default_unnorm_key)
             base["action_keys"] = proc.action_keys
             base["state_keys"] = proc.state_keys
+            base["state_input_keys"] = proc.state_input_keys
         return base
 
     def predict_action(
@@ -152,7 +153,14 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
-        out = self._framework.predict_action(examples=examples, **kwargs)
+        processed_examples = []
+        for example in examples:
+            processed = dict(example)
+            if "state" in processed and processed["state"] is not None:
+                processed["state"] = proc.apply_state(processed["state"])
+            processed_examples.append(processed)
+
+        out = self._framework.predict_action(examples=processed_examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
         unnorm = np.stack(

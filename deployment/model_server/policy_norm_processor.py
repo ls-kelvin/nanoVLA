@@ -281,6 +281,9 @@ class PolicyNormProcessor:
         self._data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
         self._action_keys: List[str] = list(self._data_config.action_keys)
         self._state_keys: List[str] = list(getattr(self._data_config, "state_keys", []))
+        self._state_input_keys: List[str] = list(
+            getattr(self._data_config, "state_input_keys", self._state_keys)
+        )
 
         # 2) Build training-time transform pipeline.
         transform = self._data_config.transform()
@@ -319,12 +322,13 @@ class PolicyNormProcessor:
 
         logger.info(
             "PolicyNormProcessor ready: robot_type=%s, unnorm_key=%s, "
-            "action_keys=%s (dims=%s), state_keys=%s",
+            "action_keys=%s (dims=%s), state_keys=%s, state_input_keys=%s",
             robot_type,
             unnorm_key,
             self._action_keys,
             [self._action_key_dims[k] for k in self._action_keys],
             self._state_keys,
+            self._state_input_keys,
         )
 
     # ------------------------------------------------------------------
@@ -337,6 +341,10 @@ class PolicyNormProcessor:
     @property
     def state_keys(self) -> List[str]:
         return list(self._state_keys)
+
+    @property
+    def state_input_keys(self) -> List[str]:
+        return list(self._state_input_keys)
 
     @property
     def unnorm_key(self) -> str:
@@ -389,6 +397,52 @@ class PolicyNormProcessor:
 
         parts: List[np.ndarray] = []
         for full_key in self._action_keys:
+            v = out[full_key]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            parts.append(np.asarray(v))
+        return np.concatenate(parts, axis=-1)
+
+    # ------------------------------------------------------------------
+    # Forward path (env state → model input)
+    # ------------------------------------------------------------------
+    def apply_state(self, raw_state: np.ndarray) -> np.ndarray:
+        """Apply training-time state normalization before model inference.
+
+        ``raw_state`` is split in ``state_input_keys`` order, normalized by the
+        same transform pipeline used in training, then concatenated in
+        ``state_keys`` order because that is what the framework consumes.
+        """
+        if not self._state_keys:
+            raise ValueError("Checkpoint DataConfig has no state_keys, but a state was provided.")
+
+        raw_state = np.asarray(raw_state)
+        if raw_state.ndim == 1:
+            raw_state = raw_state[None, :]
+        if raw_state.ndim != 2:
+            raise ValueError(f"Expected state shape (D,) or (T, D); got {raw_state.shape}")
+
+        cursor = 0
+        data: Dict[str, Any] = {}
+        for full_key in self._state_input_keys:
+            dim_k = self._state_key_dims.get(full_key)
+            if dim_k is None:
+                raise KeyError(
+                    f"state_input_keys contains {full_key!r}, but it is missing from state_key_dims."
+                )
+            data[full_key] = raw_state[..., cursor : cursor + dim_k].astype(np.float32, copy=False)
+            cursor += dim_k
+
+        if cursor != raw_state.shape[-1]:
+            raise ValueError(
+                f"Sum of state_input_key dims ({cursor}) != state_dim ({raw_state.shape[-1]}). "
+                f"state_input_keys={self._state_input_keys}, state_key_dims={self._state_key_dims}"
+            )
+
+        out = self._transform.apply(data)
+
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
             v = out[full_key]
             if isinstance(v, torch.Tensor):
                 v = v.detach().cpu().numpy()
