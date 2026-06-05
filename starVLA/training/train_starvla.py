@@ -412,41 +412,75 @@ class VLATrainer(TrainerUtils):
             else None
         )
 
-        with torch.inference_mode():
-            for examples in self.vla_eval_dataloader:
-                if action_eval_robot_types is not None:
-                    examples = [
-                        example
-                        for example in examples
-                        if str(example.get("robot_type", "")) in action_eval_robot_types
-                    ]
-                    if not examples:
-                        continue
+        eval_error = None
+        try:
+            with torch.inference_mode():
+                for examples in self.vla_eval_dataloader:
+                    if action_eval_robot_types is not None:
+                        examples = [
+                            example
+                            for example in examples
+                            if str(example.get("robot_type", "")) in action_eval_robot_types
+                        ]
+                        if not examples:
+                            continue
 
-                actions = np.asarray([example["action"] for example in examples])
-                output_dict = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
-                normalized_actions = np.asarray(output_dict["normalized_actions"])
+                    actions = np.asarray([example["action"] for example in examples])
+                    output_dict = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+                    normalized_actions = np.asarray(output_dict["normalized_actions"])
+                    if actions.shape != normalized_actions.shape:
+                        if (
+                            actions.ndim == 3
+                            and normalized_actions.ndim == 3
+                            and actions.shape[0] == normalized_actions.shape[0]
+                            and actions.shape[2] == normalized_actions.shape[2]
+                            and actions.shape[1] >= normalized_actions.shape[1]
+                        ):
+                            actions = actions[:, -normalized_actions.shape[1] :, :]
+                        else:
+                            raise ValueError(
+                                f"Validation action shape mismatch: pred={normalized_actions.shape}, "
+                                f"target={actions.shape}"
+                            )
 
-                diff = normalized_actions - actions
-                total_squared_error += float(np.sum(diff**2))
-                total_elements += int(diff.size)
-                total_samples += int(actions.shape[0])
-                total_batches += 1
-
-        if was_training:
-            self.model.train()
+                    diff = normalized_actions - actions
+                    total_squared_error += float(np.sum(diff**2))
+                    total_elements += int(diff.size)
+                    total_samples += int(actions.shape[0])
+                    total_batches += 1
+        except Exception as exc:
+            eval_error = exc
+            logger.exception("Action validation failed; skipping this validation pass.")
+            total_squared_error = 0.0
+            total_elements = 0
+            total_samples = 0
+            total_batches = 0
+        finally:
+            if was_training:
+                self.model.train()
 
         eval_totals = torch.tensor(
             [total_squared_error, total_elements, total_samples, total_batches],
             dtype=torch.float64,
             device=self.accelerator.device,
         )
+        eval_error_flag = torch.tensor(
+            1 if eval_error is not None else 0,
+            dtype=torch.int64,
+            device=self.accelerator.device,
+        )
         if dist.is_initialized():
             dist.all_reduce(eval_totals, op=dist.ReduceOp.SUM)
+            dist.all_reduce(eval_error_flag, op=dist.ReduceOp.MAX)
 
         if self.accelerator.is_main_process:
             global_squared_error, global_elements, global_samples, global_batches = eval_totals.tolist()
-            if global_elements > 0:
+            if int(eval_error_flag.item()) > 0:
+                step_metrics["validation/skipped_action_mse"] = 1
+                step_metrics["validation/error"] = (
+                    str(eval_error) if eval_error is not None else "validation failed on another rank"
+                )
+            elif global_elements > 0:
                 step_metrics["mse_score"] = global_squared_error / global_elements
             else:
                 step_metrics["validation/skipped_action_mse"] = 1

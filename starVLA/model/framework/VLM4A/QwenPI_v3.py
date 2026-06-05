@@ -289,6 +289,8 @@ class Qwen_PI_v3(baseframework):
         state = (
             [example["state"] for example in examples] if "state" in examples[0] else None
         )  # List[ndarray (1, state_dim)] or None
+        for s, a in zip(state, actions):
+            print(f"state:\n{s[0]}\nactions:\n{a}")
 
         # Prepend discretised proprioceptive state to each instruction string.
         instructions = (

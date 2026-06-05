@@ -17,6 +17,7 @@ class AgilexDataConfig:
     video_keys = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
     state_keys = ["state.left_joints", "state.right_joints", "state.left_gripper", "state.right_gripper"]
     action_keys = ["action.left_joints", "action.right_joints", "action.left_gripper", "action.right_gripper"]
+    state_input_keys = ["state.left_joints", "state.left_gripper", "state.right_joints", "state.right_gripper"]
     # Per-key dims for PolicyNormProcessor (Agilex 6-DOF arms + binary gripper = 14-D total)
     action_key_dims = {"action.left_joints": 6, "action.right_joints": 6, "action.left_gripper": 1, "action.right_gripper": 1}
     state_key_dims  = {"state.left_joints": 6, "state.right_joints": 6, "state.left_gripper": 1, "state.right_gripper": 1}

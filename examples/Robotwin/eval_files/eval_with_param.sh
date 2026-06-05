@@ -1,3 +1,5 @@
+set -e
+
 export CUDA_VISIBLE_DEVICES=0
 
 # Subgoal codes are auto-dumped to {LOG_DIR}/dumped_codes/{task_name}/ep{NN}/
@@ -18,7 +20,7 @@ TASKS=(
     # blocks_ranking_rgb
     # blocks_ranking_size
     # click_alarmclock
-    click_bell
+    # click_bell
     # dump_bin_bigbin
     # grab_roller
     # handover_block
@@ -48,7 +50,7 @@ TASKS=(
     # place_object_basket
     # place_object_scale
     # place_object_stand
-    # place_phone_stand
+    place_phone_stand
     # place_shoe
     # press_stapler
     # put_bottles_dustbin
@@ -66,6 +68,11 @@ TASKS=(
 )
 
 bash examples/Robotwin/eval_files/start_eval.sh \
-    -m demo_clean -n 0601_robotwin_all_50_qwen3piv3_all -p 5543 -j 1 \
-    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0601_robotwin_all_50_qwen3piv3_all/checkpoints/steps_90000_pytorch_model.pt \
+    -m demo_clean -n 0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand_la-joint -p 5542 -j 1 \
+    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin_cross_place_phone_stand_qwen3piv3_place-phone-stand_la-joint/checkpoints/steps_15000_pytorch_model.pt \
     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand -p 5543 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand/checkpoints/steps_30000_pytorch_model.pt \
+#     "${TASKS[@]}"

@@ -17,7 +17,8 @@ framework:
       ckpt_path: ./playground/Pretrained_models/UniVLA/lam-stage-2.ckpt
     latent_loss_weight: 0.1
     action_loss_weight: 1.0
-    latent_generation_max_extra_tokens: 20
+    latent_generation_max_extra_tokens: 30
+    la_mask: True
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
     attn_implementation: flash_attention_2
@@ -39,7 +40,7 @@ framework:
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
-    num_inference_timesteps: 10
+    num_inference_timesteps: 20
     num_target_vision_tokens: 32
     diffusion_model_cfg:
       dropout: 0.2

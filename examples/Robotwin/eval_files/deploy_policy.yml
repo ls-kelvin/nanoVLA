@@ -11,6 +11,6 @@ port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
 # null keeps the legacy behavior: refresh inference every action_chunk_size steps.
-infer_every_steps: 32
+infer_every_steps: null
 
 normalization_mode: "q99"  # options: min_max, q99

@@ -47,7 +47,7 @@ class UncontrolledDINOLatentActionModel(nn.Module):
         patch_token_dim = in_dim * patch_size ** 2
 
         self.dino_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
-        self.dino_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+        self.dino_encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg', skip_validation=True)
         self.dino_encoder.requires_grad_(False)
 
         dino_dim = 768

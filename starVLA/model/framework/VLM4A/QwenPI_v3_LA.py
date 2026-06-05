@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenPI_v3 import Qwen_PI_v3
@@ -54,7 +55,6 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             "train_action": True,
             "latent_loss_weight": 1.0,
             "action_loss_weight": 1.0,
-            "condition_action_on_latent": True,
             "la_mask": True,
             "action_train_robot_types": None,
             "codebook_size": 16,
@@ -258,6 +258,9 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         )
         self._printed_training_sample = True
 
+    def _should_use_latent_for_action(self) -> bool:
+        return self.latent_action_enabled and not bool(self.latent_action_cfg.get("la_mask", True))
+
     def _encode_vl_hidden_states_with_solutions(
         self,
         batch_images: list,
@@ -316,6 +319,20 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                 encoder_attention_mask=backbone_attention_mask,
             )
 
+    def _scale_action_loss_for_global_mean(
+        self,
+        loss: torch.Tensor,
+        local_count: int,
+    ) -> torch.Tensor:
+        if not dist.is_available() or not dist.is_initialized():
+            return loss
+
+        count = torch.tensor(float(local_count), device=loss.device, dtype=loss.dtype)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        if count.item() <= 0:
+            return loss * 0.0
+        return loss * (dist.get_world_size() * float(local_count) / count)
+
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
@@ -326,7 +343,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         latent_action_loss = None
         vl_embs_list = None
         backbone_attention_mask = None
-        condition_on_latent = bool(self.latent_action_cfg.get("condition_action_on_latent", True))
+        condition_on_latent = self._should_use_latent_for_action()
         action_train_batch_size = 0
 
         if self.latent_action_enabled and self.train_latent_action:
@@ -382,6 +399,10 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                     [hidden[:1] for hidden in vl_embs_list],
                     dummy_attention_mask,
                 ) * 0.0
+            continuous_action_loss = self._scale_action_loss_for_global_mean(
+                continuous_action_loss,
+                action_train_batch_size,
+            )
 
         total_loss = None
         if continuous_action_loss is not None:
@@ -405,6 +426,9 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
     def predict_action(self, examples: List[dict] = None, **kwargs: str) -> dict:
         if not self.train_continuous_action or self.action_model is None:
             raise RuntimeError("Cannot predict continuous actions when latent_action.train_action=false.")
+        if not self._should_use_latent_for_action():
+            return super().predict_action(examples=examples, **kwargs)
+
         if type(examples) is not list:
             examples = [examples]
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
@@ -417,16 +441,15 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
         latent_solutions = None
-        if self.latent_action_enabled and bool(self.latent_action_cfg.get("condition_action_on_latent", True)):
-            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-            max_new_tokens = self.latent_action_cfg.get("latent_generation_max_extra_tokens", None)
-            if max_new_tokens is None:
-                max_new_tokens = int(self.latent_action_cfg.num_codes_per_pair) * 4
-            generated_ids = self.qwen_vl_interface.model.generate(
-                **qwen_inputs,
-                max_new_tokens=int(max_new_tokens),
-            )
-            latent_solutions = self._extract_latent_action_solutions(generated_ids)
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        max_new_tokens = self.latent_action_cfg.get("latent_generation_max_extra_tokens", None)
+        if max_new_tokens is None:
+            max_new_tokens = int(self.latent_action_cfg.num_codes_per_pair) * 4
+        generated_ids = self.qwen_vl_interface.model.generate(
+            **qwen_inputs,
+            max_new_tokens=int(max_new_tokens),
+        )
+        latent_solutions = self._extract_latent_action_solutions(generated_ids)
 
         vl_embs_list, backbone_attention_mask, _ = self._encode_vl_hidden_states_with_solutions(
             batch_images,
