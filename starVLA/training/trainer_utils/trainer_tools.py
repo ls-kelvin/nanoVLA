@@ -5,6 +5,7 @@ Utility classes defining a Metrics container and multiple Trackers to enable mod
 endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
+from collections.abc import Mapping
 from typing import Tuple
 import os
 import re
@@ -475,13 +476,65 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                incompatible = model.load_state_dict(checkpoint, strict=False)
                 if dist.get_rank() == 0:
                     print("✅ loaded <full_model> model parameters")
+                    TrainerUtils._print_incompatible_keys(incompatible, checkpoint_path)
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")
         return model
+
+    @staticmethod
+    def load_extra_weights(model, checkpoint_path=None):
+        """Load an additional weight file with strict=False after the main model load."""
+        if not checkpoint_path:
+            return model
+        if is_main_process():
+            print(f"📦 loading extra weights: {checkpoint_path}")
+
+        try:
+            checkpoint = TrainerUtils._load_checkpoint_state_dict(checkpoint_path)
+        except Exception as e:
+            raise RuntimeError(f"❌ loading extra weights failed: {e}")
+
+        try:
+            incompatible = model.load_state_dict(checkpoint, strict=False)
+        except Exception as e:
+            raise RuntimeError(f"❌ applying extra weights failed: {e}")
+
+        if is_main_process():
+            print("✅ loaded extra weights with strict=False")
+            TrainerUtils._print_incompatible_keys(incompatible, checkpoint_path)
+        return model
+
+    @staticmethod
+    def _load_checkpoint_state_dict(checkpoint_path):
+        if _is_safetensors_path(checkpoint_path):
+            from safetensors.torch import load_file
+
+            checkpoint = load_file(checkpoint_path)
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError(f"checkpoint must be a state_dict-like mapping, got {type(checkpoint).__name__}")
+
+        for key in ("state_dict", "model_state_dict", "model"):
+            nested = checkpoint.get(key)
+            if isinstance(nested, Mapping):
+                checkpoint = nested
+                break
+
+        return dict(checkpoint)
+
+    @staticmethod
+    def _print_incompatible_keys(incompatible, checkpoint_path):
+        missing_keys = list(getattr(incompatible, "missing_keys", []))
+        unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
+        print(f"🔎 load_state_dict report for {checkpoint_path}")
+        print(f"missing_keys ({len(missing_keys)}): {missing_keys}")
+        print(f"unexpected_keys ({len(unexpected_keys)}): {unexpected_keys}")
 
     @staticmethod
     def print_freeze_status(model):

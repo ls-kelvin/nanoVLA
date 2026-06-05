@@ -227,6 +227,11 @@ class VLATrainer(TrainerUtils):
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
 
+        extra_weight_checkpoint = getattr(self.config.trainer, "extra_weight_checkpoint", None)
+        if extra_weight_checkpoint:
+            self.model = self.load_extra_weights(self.model, extra_weight_checkpoint)
+            logger.info(f"Loaded extra weight checkpoint: {extra_weight_checkpoint}")
+
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps."""
         if self.completed_steps > 0:

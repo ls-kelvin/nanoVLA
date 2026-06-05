@@ -100,6 +100,11 @@ class VLAMTrainer(TrainerUtils):
             )
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
 
+        extra_weight_checkpoint = getattr(self.config.trainer, "extra_weight_checkpoint", None)
+        if extra_weight_checkpoint:
+            self.model = self.load_extra_weights(self.model, extra_weight_checkpoint)
+            logger.info(f"Loaded extra weight checkpoint: {extra_weight_checkpoint}")
+
         freeze_modules = self.config.trainer.freeze_modules if hasattr(self.config.trainer, "freeze_modules") else None
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)

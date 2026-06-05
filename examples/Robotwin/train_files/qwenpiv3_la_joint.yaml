@@ -34,8 +34,6 @@ framework:
     action_dim: 14
     state_dim: 14
     action_horizon: 50
-
-    repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
     noise_s: 0.999
@@ -86,6 +84,7 @@ trainer:
   loss_scale:
     vla: 1.0
     vlm: 0.1
+  repeated_diffusion_steps: 8
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 10
