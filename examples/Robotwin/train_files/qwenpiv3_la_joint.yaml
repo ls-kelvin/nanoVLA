@@ -15,7 +15,7 @@ framework:
     action_train_robot_types: ["aloha-agilex"]
     univla:
       ckpt_path: ./playground/Pretrained_models/UniVLA/lam-stage-2.ckpt
-    latent_loss_weight: 0.1
+    latent_loss_weight: 0.05
     action_loss_weight: 1.0
     latent_generation_max_extra_tokens: 30
     la_mask: True
@@ -84,7 +84,7 @@ trainer:
   loss_scale:
     vla: 1.0
     vlm: 0.1
-  repeated_diffusion_steps: 8
+  repeated_diffusion_steps: 16
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 10

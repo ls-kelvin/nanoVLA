@@ -29,6 +29,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
         self.latent_action_enabled = bool(self.latent_action_cfg.get("enabled", True))
+        self.latent_action_mode = self._get_latent_action_mode()
         self.train_latent_action = bool(self.latent_action_cfg.get("train_latent", True))
         self.train_continuous_action = bool(self.latent_action_cfg.get("train_action", True))
         if not self.train_latent_action and not self.train_continuous_action:
@@ -36,6 +37,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
 
         self.latent_action_token_ids: list[int] = []
         self.latent_action_id_to_token: dict[int, str] = {}
+        self.latent_action_query_token_ids: list[int] = []
         if self.latent_action_enabled:
             self._expand_latent_action_tokens()
 
@@ -57,9 +59,11 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             "action_loss_weight": 1.0,
             "la_mask": True,
             "action_train_robot_types": None,
+            "mode": "ar",
             "codebook_size": 16,
             "num_codes_per_pair": 4,
             "token_format": "<robot_action_{i}>",
+            "query_token_format": "<robot_action_query_{i}>",
             "latent_generation_max_extra_tokens": None,
             "univla": {
                 "ckpt_path": None,
@@ -77,13 +81,27 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         current = self.config.framework.get("latent_action", {})
         self.config.framework.latent_action = OmegaConf.merge(OmegaConf.create(defaults), current)
 
+    def _get_latent_action_mode(self) -> str:
+        mode = str(self.latent_action_cfg.get("mode", "ar")).lower()
+        if mode not in {"ar", "query"}:
+            raise ValueError(f"latent_action.mode must be 'ar' or 'query', got {mode!r}.")
+        return mode
+
     def _expand_latent_action_tokens(self) -> None:
         tokenizer = self.qwen_vl_interface.processor.tokenizer
         codebook_size = int(self.latent_action_cfg.codebook_size)
+        num_codes_per_pair = int(self.latent_action_cfg.num_codes_per_pair)
         token_format = str(self.latent_action_cfg.token_format)
+        query_token_format = str(self.latent_action_cfg.query_token_format)
         tokens = [token_format.format(i=i) for i in range(codebook_size)]
+        query_tokens = []
+        if self.latent_action_mode == "query":
+            query_tokens = [query_token_format.format(i=i) for i in range(num_codes_per_pair)]
+            duplicates = set(tokens) & set(query_tokens)
+            if duplicates:
+                raise ValueError(f"Latent-action query tokens overlap with action tokens: {sorted(duplicates)}")
 
-        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens + query_tokens})
         self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
 
         token_ids = []
@@ -102,6 +120,20 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         self.qwen_vl_interface._ACTION_TOKEN_MIN = sorted_ids[0]
         self.qwen_vl_interface._ACTION_TOKEN_MAX = sorted_ids[-1]
 
+        query_token_ids = []
+        for token in query_tokens:
+            ids = tokenizer(token, add_special_tokens=False)["input_ids"]
+            if len(ids) != 1:
+                raise ValueError(f"Latent-action query token `{token}` must map to exactly one token id, got {ids}.")
+            query_token_ids.append(int(ids[0]))
+        self.latent_action_query_token_ids = query_token_ids
+
+    def _token_id_mask(self, input_ids: torch.LongTensor, token_ids: list[int]) -> torch.Tensor:
+        mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in token_ids:
+            mask |= input_ids == int(token_id)
+        return mask
+
     def _mask_latent_action_attention(
         self,
         attention_mask: torch.Tensor | None,
@@ -114,9 +146,12 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         if not self.latent_action_token_ids:
             return attention_mask
 
-        action_token_min = min(self.latent_action_token_ids)
-        action_token_max = max(self.latent_action_token_ids)
-        latent_token_mask = (input_ids >= action_token_min) & (input_ids <= action_token_max)
+        if self.latent_action_mode == "query":
+            latent_token_mask = self._token_id_mask(input_ids, self.latent_action_query_token_ids)
+        else:
+            action_token_min = min(self.latent_action_token_ids)
+            action_token_max = max(self.latent_action_token_ids)
+            latent_token_mask = (input_ids >= action_token_min) & (input_ids <= action_token_max)
         if not latent_token_mask.any():
             return attention_mask
 
@@ -197,7 +232,11 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             solutions.append("".join(token_format.format(i=int(idx)) for idx in chunk))
         return solutions
 
-    def _make_latent_action_solutions(self, examples: List[dict], instructions: list[str]) -> list[str]:
+    def _make_latent_action_targets(
+        self,
+        examples: List[dict],
+        instructions: list[str],
+    ) -> tuple[torch.LongTensor, list[int], list[str]]:
         if self.latent_action_encoder is None:
             raise ValueError("Latent-action encoder is not initialized.")
         frame_pairs, counts = self._build_latent_frame_pairs(examples)
@@ -205,7 +244,103 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         for instruction, count in zip(instructions, counts):
             pair_instructions.extend([instruction] * count)
         indices = self.latent_action_encoder.encode(frame_pairs, pair_instructions)
-        return self._latent_indices_to_solutions(indices, counts)
+        return indices, counts, self._latent_indices_to_solutions(indices, counts)
+
+    def _make_latent_action_solutions(self, examples: List[dict], instructions: list[str]) -> list[str]:
+        _, _, solutions = self._make_latent_action_targets(examples, instructions)
+        return solutions
+
+    def _make_latent_action_query_solutions(self, counts: list[int]) -> list[str]:
+        query_token_format = str(self.latent_action_cfg.query_token_format)
+        num_codes_per_pair = int(self.latent_action_cfg.num_codes_per_pair)
+        query_block = "".join(query_token_format.format(i=i) for i in range(num_codes_per_pair))
+        return [query_block * count for count in counts]
+
+    def _infer_query_pair_count_from_config(self) -> int:
+        data_la_cfg = self.config.datasets.vla_data.get("latent_action", {})
+        stride = int(data_la_cfg.get("stride", 4))
+        if stride <= 0:
+            raise ValueError(f"datasets.vla_data.latent_action.stride must be positive, got {stride}.")
+
+        offsets = list(range(0, self.action_horizon, stride))
+        if not offsets:
+            raise ValueError(f"action_horizon must be positive, got {self.action_horizon}.")
+        if bool(data_la_cfg.get("include_terminal_frame", True)) and offsets[-1] != self.action_horizon - 1:
+            offsets.append(self.action_horizon - 1)
+        return len(offsets) - 1
+
+    def _get_query_pair_counts(self, examples: List[dict]) -> list[int]:
+        inferred_count = self._infer_query_pair_count_from_config()
+        return [inferred_count] * len(examples)
+
+    def _latent_indices_to_token_ids(self, indices: torch.LongTensor, counts: list[int]) -> list[list[int]]:
+        if indices.ndim == 1:
+            indices = indices[:, None]
+
+        token_ids_by_sample = []
+        cursor = 0
+        for count in counts:
+            chunk = indices[cursor : cursor + count].reshape(-1).detach().cpu().tolist()
+            cursor += count
+            token_ids = []
+            for idx in chunk:
+                idx = int(idx)
+                if idx < 0 or idx >= len(self.latent_action_token_ids):
+                    raise ValueError(
+                        f"Latent-action code index {idx} is outside codebook size {len(self.latent_action_token_ids)}."
+                    )
+                token_ids.append(self.latent_action_token_ids[idx])
+            token_ids_by_sample.append(token_ids)
+        return token_ids_by_sample
+
+    def _build_query_labels(
+        self,
+        input_ids: torch.LongTensor,
+        target_token_ids: list[list[int]],
+    ) -> torch.LongTensor:
+        labels = torch.full_like(input_ids, -100)
+        query_token_mask = self._token_id_mask(input_ids, self.latent_action_query_token_ids)
+
+        for batch_idx, targets in enumerate(target_token_ids):
+            query_positions = torch.nonzero(query_token_mask[batch_idx], as_tuple=False).flatten()
+            if query_positions.numel() != len(targets):
+                raise ValueError(
+                    f"Query token count mismatch for sample {batch_idx}: "
+                    f"got {query_positions.numel()}, expected {len(targets)}."
+                )
+            if query_positions.numel() == 0:
+                continue
+
+            label_positions = query_positions + 1
+            if int(label_positions[-1].item()) >= labels.size(1):
+                raise ValueError("Query tokens must be followed by at least one token for shifted causal-LM loss.")
+            labels[batch_idx, label_positions] = torch.tensor(
+                targets,
+                device=labels.device,
+                dtype=labels.dtype,
+            )
+
+        return labels
+
+    def _extract_query_latent_action_solutions(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.LongTensor,
+    ) -> list[str]:
+        query_token_mask = self._token_id_mask(input_ids, self.latent_action_query_token_ids)
+        action_token_ids = torch.tensor(self.latent_action_token_ids, device=logits.device, dtype=torch.long)
+        solutions = []
+
+        for batch_idx in range(input_ids.size(0)):
+            query_positions = torch.nonzero(query_token_mask[batch_idx], as_tuple=False).flatten()
+            if query_positions.numel() == 0:
+                solutions.append("")
+                continue
+            query_logits = logits[batch_idx, query_positions].float().index_select(-1, action_token_ids)
+            predicted_offsets = query_logits.argmax(dim=-1)
+            predicted_ids = action_token_ids.index_select(0, predicted_offsets).detach().cpu().tolist()
+            solutions.append("".join(self.latent_action_id_to_token[int(idx)] for idx in predicted_ids))
+        return solutions
 
     def _build_training_messages(self, example: dict, instruction: str, latent_action: str | None) -> list[dict]:
         content = [{"type": "image", "image": img} for img in example["image"]]
@@ -266,14 +401,20 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         batch_images: list,
         instructions: list[str],
         solutions: list[str] | None = None,
+        latent_target_token_ids: list[list[int]] | None = None,
         labels: bool = False,
         project_for_action: bool = True,
+        return_qwen_inputs: bool = False,
     ):
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images,
             instructions=instructions,
             solutions=solutions,
         )
+        if labels and self.latent_action_mode == "query":
+            if latent_target_token_ids is None:
+                raise ValueError("latent_target_token_ids is required when latent_action.mode='query'.")
+            qwen_inputs["labels"] = self._build_query_labels(qwen_inputs["input_ids"], latent_target_token_ids)
         if not labels and "labels" in qwen_inputs:
             qwen_inputs.pop("labels")
         attention_mask = qwen_inputs.get("attention_mask", None)
@@ -293,6 +434,8 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                 vl_embs_list = self._project_vl_hidden_for_action(vl_embs_list)
             else:
                 vl_embs_list = [outputs.hidden_states[-1]]
+        if return_qwen_inputs:
+            return vl_embs_list, attention_mask, outputs, qwen_inputs
         return vl_embs_list, attention_mask, outputs
 
     def _continuous_action_loss(self, examples: List[dict], vl_embs_list: list, backbone_attention_mask):
@@ -310,7 +453,9 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
             if backbone_attention_mask is not None:
-                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(dtype=torch.bool)
+                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
+                    dtype=torch.bool
+                )
 
             return self.action_model(
                 vl_embs_list_repeated,
@@ -337,7 +482,9 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
-        instructions = self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+        instructions = (
+            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+        )
 
         latent_solutions = None
         latent_action_loss = None
@@ -345,9 +492,15 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         backbone_attention_mask = None
         condition_on_latent = self._should_use_latent_for_action()
         action_train_batch_size = 0
+        latent_target_token_ids = None
 
         if self.latent_action_enabled and self.train_latent_action:
-            latent_solutions = self._make_latent_action_solutions(examples, instructions)
+            latent_indices, latent_counts, latent_ar_solutions = self._make_latent_action_targets(examples, instructions)
+            if self.latent_action_mode == "query":
+                latent_solutions = self._make_latent_action_query_solutions(latent_counts)
+                latent_target_token_ids = self._latent_indices_to_token_ids(latent_indices, latent_counts)
+            else:
+                latent_solutions = latent_ar_solutions
         self._print_training_sample_once(examples, instructions, latent_solutions)
 
         if self.latent_action_enabled and self.train_latent_action:
@@ -355,6 +508,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                 batch_images,
                 instructions,
                 solutions=latent_solutions,
+                latent_target_token_ids=latent_target_token_ids,
                 labels=True,
                 project_for_action=self.train_continuous_action,
             )
@@ -365,6 +519,8 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         continuous_action_loss = None
         if self.train_continuous_action:
             if vl_embs_list is None:
+                if latent_solutions is None and condition_on_latent and self.latent_action_mode == "query":
+                    latent_solutions = self._make_latent_action_query_solutions(self._get_query_pair_counts(examples))
                 solutions = latent_solutions if condition_on_latent else None
                 vl_embs_list, backbone_attention_mask, _ = self._encode_vl_hidden_states_with_solutions(
                     batch_images,
@@ -434,30 +590,42 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
-        instructions = self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+        instructions = (
+            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+        )
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        latent_solutions = None
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        max_new_tokens = self.latent_action_cfg.get("latent_generation_max_extra_tokens", None)
-        if max_new_tokens is None:
-            max_new_tokens = int(self.latent_action_cfg.num_codes_per_pair) * 4
-        generated_ids = self.qwen_vl_interface.model.generate(
-            **qwen_inputs,
-            max_new_tokens=int(max_new_tokens),
-        )
-        latent_solutions = self._extract_latent_action_solutions(generated_ids)
-
-        vl_embs_list, backbone_attention_mask, _ = self._encode_vl_hidden_states_with_solutions(
-            batch_images,
-            instructions,
-            solutions=latent_solutions,
-            labels=False,
-            project_for_action=True,
-        )
+        if self.latent_action_mode == "query":
+            query_solutions = self._make_latent_action_query_solutions(self._get_query_pair_counts(examples))
+            vl_embs_list, backbone_attention_mask, outputs, qwen_inputs = self._encode_vl_hidden_states_with_solutions(
+                batch_images,
+                instructions,
+                solutions=query_solutions,
+                labels=False,
+                project_for_action=True,
+                return_qwen_inputs=True,
+            )
+            latent_solutions = self._extract_query_latent_action_solutions(outputs.logits, qwen_inputs["input_ids"])
+        else:
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+            max_new_tokens = self.latent_action_cfg.get("latent_generation_max_extra_tokens", None)
+            if max_new_tokens is None:
+                max_new_tokens = int(self.latent_action_cfg.num_codes_per_pair) * 4
+            generated_ids = self.qwen_vl_interface.model.generate(
+                **qwen_inputs,
+                max_new_tokens=int(max_new_tokens),
+            )
+            latent_solutions = self._extract_latent_action_solutions(generated_ids)
+            vl_embs_list, backbone_attention_mask, _ = self._encode_vl_hidden_states_with_solutions(
+                batch_images,
+                instructions,
+                solutions=latent_solutions,
+                labels=False,
+                project_for_action=True,
+            )
         if backbone_attention_mask is not None:
             backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
         with torch.autocast("cuda", dtype=torch.float32):
