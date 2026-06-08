@@ -267,8 +267,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             hidden_dim=1024,
             output_dim=self.action_dim,
         )
-        self.future_tokens = nn.Embedding(action_config.num_target_vision_tokens, self.input_embedding_dim)
-        nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+        # num_target_vision_tokens == 0 means no future/register tokens at all.
+        # Skipping the module (rather than nn.Embedding(0, ...)) avoids registering
+        # an empty parameter that never receives a gradient and trips up DDP.
+        self.future_tokens = (
+            nn.Embedding(action_config.num_target_vision_tokens, self.input_embedding_dim)
+            if action_config.num_target_vision_tokens
+            else None
+        )
+        if self.future_tokens is not None:
+            nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
         if action_config.add_pos_embed:
             self.position_embedding = nn.Embedding(action_config.max_seq_len, self.input_embedding_dim)
@@ -284,6 +292,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
+
+    def _build_sa_embs(self, state_features, action_features, batch_size):
+        """Concatenate ``[state?, future_tokens?, action]`` along the sequence dim.
+
+        ``future_tokens`` are omitted entirely when ``num_target_vision_tokens == 0``
+        (``self.future_tokens is None``); ``state_features`` are omitted when no
+        state is provided.
+        """
+        parts = []
+        if state_features is not None:
+            parts.append(state_features)
+        if self.future_tokens is not None:
+            parts.append(self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1))
+        parts.append(action_features)
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
     def forward(
         self,
@@ -322,12 +345,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
-        sa_embs = (
-            torch.cat((state_features, future_tokens, action_features), dim=1)
-            if state_features is not None
-            else torch.cat((future_tokens, action_features), dim=1)
-        )
+        sa_embs = self._build_sa_embs(state_features, action_features, B)
 
         # Encode timesteps
         temb = self.model.timestep_encoder(t_discretized)
@@ -388,12 +406,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
-            sa_embs = (
-                torch.cat((state_features, future_tokens, action_features), dim=1)
-                if state_features is not None
-                else torch.cat((future_tokens, action_features), dim=1)
-            )
+            sa_embs = self._build_sa_embs(state_features, action_features, batch_size)
 
             # Encode timestep
             temb = self.model.timestep_encoder(timesteps_tensor)
@@ -483,12 +496,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
-            sa_embs = (
-                torch.cat((state_features, future_tokens, action_features), dim=1)
-                if state_features is not None
-                else torch.cat((future_tokens, action_features), dim=1)
-            )
+            sa_embs = self._build_sa_embs(state_features, action_features, B)
             temb = self.model.timestep_encoder(timesteps)
             model_output = sa_embs
             for layer_idx, layer in enumerate(self.model.transformer_blocks):
@@ -604,12 +612,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                     action_features = action_features + pos_embs
 
-                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(batch_size, -1, -1)
-                sa_embs = (
-                    torch.cat((state_features, future_tokens, action_features), dim=1)
-                    if state_features is not None
-                    else torch.cat((future_tokens, action_features), dim=1)
-                )
+                sa_embs = self._build_sa_embs(state_features, action_features, batch_size)
 
                 temb_tensor = torch.full(
                     (batch_size,),

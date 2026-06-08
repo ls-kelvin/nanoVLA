@@ -152,8 +152,11 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             action_token_min = min(self.latent_action_token_ids)
             action_token_max = max(self.latent_action_token_ids)
             latent_token_mask = (input_ids >= action_token_min) & (input_ids <= action_token_max)
+            
         if not latent_token_mask.any():
             return attention_mask
+        
+        latent_token_mask = latent_token_mask.cumsum(dim=1) > 0
 
         masked_attention = attention_mask.clone()
         return masked_attention.masked_fill(latent_token_mask, 0)
@@ -457,10 +460,22 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                     dtype=torch.bool
                 )
 
+            # In action-expert mode, feed the raw state (subset-aligned with
+            # `examples`) to the Action DiT; in instruction mode it is already
+            # encoded in the prompt, so the DiT gets no state token.
+            state_repeated = None
+            if self.state_mode == "action_expert" and examples and "state" in examples[0]:
+                state = torch.tensor(
+                    np.array([example["state"] for example in examples]),
+                    device=base_hidden.device,
+                    dtype=base_hidden.dtype,
+                )
+                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+
             return self.action_model(
                 vl_embs_list_repeated,
                 actions_target_repeated,
-                state=None,
+                state=state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
             )
 
@@ -482,9 +497,10 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
+        # In action-expert mode the Action DiT reads state directly from
+        # `examples` inside `_continuous_action_loss`, so we only need the
+        # (possibly state-augmented) instructions here.
+        instructions, _ = self._resolve_state_inputs(instructions, state)
 
         latent_solutions = None
         latent_action_loss = None
@@ -590,9 +606,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
+        instructions, action_state = self._resolve_state_inputs(instructions, state)
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
@@ -628,10 +642,15 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             )
         if backbone_attention_mask is not None:
             backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+        action_state = (
+            torch.from_numpy(np.array(action_state)).to(vl_embs_list[-1].device, dtype=vl_embs_list[-1].dtype)
+            if action_state is not None
+            else None
+        )
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
                 vl_embs_list,
-                state=None,
+                state=action_state,
                 encoder_attention_mask=backbone_attention_mask,
             )
         return {

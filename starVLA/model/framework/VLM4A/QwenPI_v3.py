@@ -115,6 +115,10 @@ class QwenPI_v3DefaultConfig:
             "add_pos_embed": True,
             "max_seq_len": 1024,
             "num_target_vision_tokens": 32,
+            # Where proprioceptive state is injected: "instruction" (π0.5-style
+            # discretised tokens appended to the prompt) or "action_expert"
+            # (raw state fed to the Action DiT as a conditioning token).
+            "state_mode": "instruction",
             "noise_beta_alpha": 1.5,
             "noise_beta_beta": 1.0,
             "noise_s": 0.999,
@@ -240,6 +244,29 @@ class Qwen_PI_v3(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
+        # Proprioceptive state routing: "instruction" (discretised into the
+        # prompt, π0.5-style) or "action_expert" (raw state token to the DiT).
+        self.state_mode = str(self.config.framework.action_model.get("state_mode", "instruction")).lower()
+        if self.state_mode not in {"instruction", "action_expert"}:
+            raise ValueError(
+                f"framework.action_model.state_mode must be 'instruction' or 'action_expert', "
+                f"got {self.state_mode!r}."
+            )
+
+    def _resolve_state_inputs(self, instructions: List[str], state):
+        """Route proprioceptive state according to ``state_mode``.
+
+        Returns ``(instructions, action_state)``. In ``instruction`` mode the
+        state is discretised into the prompt and ``action_state`` is ``None``;
+        in ``action_expert`` mode the prompt is left untouched and the raw
+        ``state`` is returned for the Action DiT.
+        """
+        if state is None:
+            return instructions, None
+        if self.state_mode == "action_expert":
+            return instructions, state
+        return self.add_discretized_state_to_instruction(instructions, state), None
+
     def _project_vl_hidden_for_action(self, vl_embs_list: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project layer-wise VL hidden states to the hidden space expected by Action DiT."""
         if len(vl_embs_list) != len(self.project_layers):
@@ -292,11 +319,8 @@ class Qwen_PI_v3(baseframework):
         for s, a in zip(state, actions):
             print(f"state:\n{s[0]}\nactions:\n{a}")
 
-        # Prepend discretised proprioceptive state to each instruction string.
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-        state = None  # state is now encoded in the instruction tokens
+        # Route state into the instruction tokens or the Action DiT (state expert).
+        instructions, state = self._resolve_state_inputs(instructions, state)
 
         # Step 1: encode through QwenVL
         vl_embs_list, backbone_attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
@@ -367,11 +391,8 @@ class Qwen_PI_v3(baseframework):
         instructions = [example["lang"] for example in examples]  # List[str]
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # List[ndarray] or None
 
-        # Encode proprioceptive state into the instruction string, then discard raw state.
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-        state = None
+        # Route state into the instruction tokens or the Action DiT (state expert).
+        instructions, state = self._resolve_state_inputs(instructions, state)
 
         # Optionally resize images to the resolution used during training.
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
