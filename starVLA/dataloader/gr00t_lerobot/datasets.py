@@ -121,6 +121,67 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     return dataset_statistics
 
 
+def _load_norm_stats_from_json(
+    norm_stats_path: str | Path,
+    embodiment_tag: str,
+    modality_configs: dict,
+    simplified_modality_meta: dict,
+    norm_stats_key: str | None = None,
+) -> dict:
+    """Build per-subkey dataset statistics from a precomputed norm-stat JSON.
+
+    Mirrors the inference path (``policy_norm_processor._build_dataset_metadata``):
+    the JSON stores, per embodiment tag, the *combined* flat stat arrays for the
+    ``state``/``action`` modalities (length = sum of per-key dims, in used-key
+    order). We slice those arrays back into the per-subkey structure the
+    transforms expect, using each modality's ordered keys + dims, so no dataset
+    scan is needed.
+    """
+    norm_stats_path = Path(norm_stats_path)
+    if not norm_stats_path.exists():
+        raise FileNotFoundError(f"norm_stats_path does not exist: {norm_stats_path}")
+    with open(norm_stats_path, "r") as f:
+        norm_stats = json.load(f)
+
+    # Resolve which top-level key to use (mirror inference's unnorm_key).
+    if norm_stats_key is not None:
+        key = norm_stats_key
+    elif embodiment_tag in norm_stats:
+        key = embodiment_tag
+    elif len(norm_stats) == 1:
+        key = next(iter(norm_stats))
+    else:
+        raise KeyError(
+            f"Cannot resolve norm-stat key for embodiment_tag={embodiment_tag!r} "
+            f"in {sorted(norm_stats.keys())}. Set datasets.vla_data.norm_stats_key."
+        )
+    stats_for_key = norm_stats[key]
+
+    dataset_statistics: dict = {}
+    for modality in ["state", "action"]:
+        combined = stats_for_key.get(modality, {})
+        dataset_statistics[modality] = {}
+        used_subkeys = [k.split(".", 1)[1] for k in modality_configs[modality].modality_keys]
+        cursor = 0
+        for subkey in used_subkeys:
+            dim_k = int(simplified_modality_meta[modality][subkey]["shape"][0])
+            per_key: dict = {}
+            for stat_name, arr in combined.items():
+                if stat_name == "mask":
+                    continue
+                per_key[stat_name] = [float(v) for v in arr[cursor : cursor + dim_k]]
+            dataset_statistics[modality][subkey] = per_key
+            cursor += dim_k
+        total = next((len(v) for k, v in combined.items() if k != "mask"), cursor)
+        if cursor != total:
+            raise ValueError(
+                f"norm-stat '{modality}' length mismatch for key={key!r}: consumed "
+                f"{cursor} dims but JSON has {total}. Check that the JSON matches the "
+                f"data config key layout."
+            )
+    return dataset_statistics
+
+
 def _normalize_action_mode(mode: str) -> str:
     """Normalize action mode names to {abs, delta, rel}.""" 
     # @gaoning plz move this, we want dataloader to be independent of the action mode logic, we can move this to transform or a separate utils tool to handle lerobot dataset
@@ -807,6 +868,23 @@ class LeRobotSingleDataset(Dataset):
 
 
         # 2. Dataset statistics
+        # If a precomputed norm-stat JSON is configured, load stats from it
+        # (just like inference) instead of scanning the dataset.
+        norm_stats_path = self.data_cfg.get("norm_stats_path", None) if self.data_cfg else None
+        if norm_stats_path:
+            dataset_statistics = _load_norm_stats_from_json(
+                norm_stats_path=norm_stats_path,
+                embodiment_tag=self.tag,
+                modality_configs=self.modality_configs,
+                simplified_modality_meta=simplified_modality_meta,
+                norm_stats_key=self.data_cfg.get("norm_stats_key", None),
+            )
+            return DatasetMetadata(
+                statistics=dataset_statistics,  # type: ignore
+                modalities=simplified_modality_meta,  # type: ignore
+                embodiment_tag=embodiment_tag,
+            )
+
         def is_main():
             return (not dist.is_initialized()) or dist.get_rank() == 0
         

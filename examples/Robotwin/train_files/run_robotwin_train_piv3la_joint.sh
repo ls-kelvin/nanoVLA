@@ -15,8 +15,8 @@ freeze_module_list=''
 base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
 config_yaml=./examples/Robotwin/train_files/qwenpiv3_la_joint.yaml
 run_root_dir=./results/Checkpoints
-data_mix=robotwin_cross_place_phone_stand
-run_id=0603_${data_mix}_qwen3piv3_place-phone-stand_la-joint
+data_mix=robotwin_aloha_place_phone_stand
+run_id=0608_${data_mix}_qwen3piv3_place-phone-stand_la-joint-womask
 batch_size=8
 # === End of environment variable configuration ===
 ###########################################################################################
@@ -35,6 +35,7 @@ accelerate launch \
   --num_processes 8 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
+  --framework.latent_action.mode "ar" \
   --framework.name ${Framework_name} \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --framework.latent_action.train_latent true \

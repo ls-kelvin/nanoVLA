@@ -350,4 +350,14 @@ DATASET_NAMED_MIXTURES = {
         ("place_phone_stand/ur5/clean", 1.0, "robotwin50"), 
         ("place_phone_stand/ur5/randomized", 1.0, "robotwin50"),
     ],
+    "robotwin_aloha_place_phone_stand": [
+        ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin50"), 
+        ("place_phone_stand/aloha-agilex/randomized", 1.0, "robotwin50"),
+        ("place_phone_stand/arx-x5/clean", 0.000001, "robotwin50"), 
+        ("place_phone_stand/arx-x5/randomized", 0.000001, "robotwin50"),
+        ("place_phone_stand/piper/clean", 0.000001, "robotwin50"), 
+        ("place_phone_stand/piper/randomized", 0.000001, "robotwin50"),
+        ("place_phone_stand/ur5/clean", 0.000001, "robotwin50"), 
+        ("place_phone_stand/ur5/randomized", 0.000001, "robotwin50"),
+    ],
 }
