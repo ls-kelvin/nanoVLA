@@ -1,7 +1,6 @@
 from collections import deque
 from typing import Dict, Optional
 
-import cv2 as cv
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
@@ -21,7 +20,6 @@ class ModelClient:
         horizon: int = 0,
         action_ensemble=False,
         action_ensemble_horizon: Optional[int] = 3,
-        image_size: list[int] = [224, 224],
         use_ddim: bool = True,
         num_ddim_steps: int = 20,
         adaptive_ensemble_alpha=0.1,
@@ -42,7 +40,6 @@ class ModelClient:
         )
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
-        self.image_size = image_size
         self.horizon = horizon
         self.action_ensemble = action_ensemble and (AdaptiveEnsembler is not None)
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -123,7 +120,6 @@ class ModelClient:
             self.initial_state = np.array(state).copy()
 
         task_description = example.get("lang", None)
-        images = example["image"]
 
         if example is not None:
             if task_description != self.task_description:
@@ -132,8 +128,6 @@ class ModelClient:
                 if self.action_mode in ["delta", "rel"] and state is not None:
                     self.initial_state = np.array(state).copy()
 
-        images = [self._resize_image(image) for image in images]
-        example["image"] = images
         example_copy = example.copy()
         if state is not None:
             example_copy["state"] = np.asarray(state).reshape(1, -1)
@@ -204,11 +198,6 @@ class ModelClient:
     def _rel_to_absolute(self, rel_actions: np.ndarray) -> np.ndarray:
         """Convert relative actions to absolute actions."""
         return rel_actions + self.initial_state
-
-    def _resize_image(self, image: np.ndarray) -> np.ndarray:
-        image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)
-        return image
-
 
 def get_model(usr_args):
     policy_ckpt_path = usr_args.get("policy_ckpt_path")

@@ -81,6 +81,31 @@ class AgilexData50Config(AgilexDataConfig):
                 },
             ),
         ])
+        
+class AgilexData32Config(AgilexDataConfig):
+    action_indices = list(range(32))
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "state.left_joints": "mean_std", "state.right_joints": "mean_std",
+                    "state.left_gripper": "min_max", "state.right_gripper": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "action.left_joints": "mean_std", "action.right_joints": "mean_std",
+                    "action.left_gripper": "min_max", "action.right_gripper": "min_max",
+                },
+            ),
+        ])
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +178,7 @@ def _discover_robotwin2_non_franka_mixture(robot_type: str = "robotwin") -> list
 ROBOT_TYPE_CONFIG_MAP = {
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
+    "robotwin32": AgilexData32Config(),
     "arx_x5": ArxX5DataConfig(),
 }
 
@@ -353,11 +379,15 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_aloha_place_phone_stand": [
         ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin50"), 
         ("place_phone_stand/aloha-agilex/randomized", 1.0, "robotwin50"),
-        ("place_phone_stand/arx-x5/clean", 0.000001, "robotwin50"), 
-        ("place_phone_stand/arx-x5/randomized", 0.000001, "robotwin50"),
-        ("place_phone_stand/piper/clean", 0.000001, "robotwin50"), 
-        ("place_phone_stand/piper/randomized", 0.000001, "robotwin50"),
-        ("place_phone_stand/ur5/clean", 0.000001, "robotwin50"), 
-        ("place_phone_stand/ur5/randomized", 0.000001, "robotwin50"),
+        ("place_phone_stand/arx-x5/clean", 0.0, "robotwin50"), 
+        ("place_phone_stand/arx-x5/randomized", 0.0, "robotwin50"),
+        ("place_phone_stand/piper/clean", 0.0, "robotwin50"), 
+        ("place_phone_stand/piper/randomized", 0.0, "robotwin50"),
+        ("place_phone_stand/ur5/clean", 0.0, "robotwin50"), 
+        ("place_phone_stand/ur5/randomized", 0.0, "robotwin50"),
+    ],
+    "robotwin32_aloha_place_phone_stand": [
+        ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin32"), 
+        ("place_phone_stand/aloha-agilex/randomized", 1.0, "robotwin32"),
     ],
 }

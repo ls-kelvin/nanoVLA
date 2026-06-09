@@ -1460,10 +1460,18 @@ class LeRobotSingleDataset(Dataset):
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
+        # Resize to the configured obs_image_size so training matches eval
+        # (predict_action resizes to obs_image_size). Default (224, 224) keeps
+        # every existing config unchanged.
+        obs_image_size = (
+            tuple(self.data_cfg.get("obs_image_size", (224, 224)))
+            if self.data_cfg is not None
+            else (224, 224)
+        )
         step_images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            image = Image.fromarray(image).resize(obs_image_size)
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
