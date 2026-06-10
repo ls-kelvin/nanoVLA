@@ -1,4 +1,4 @@
-"""QwenMetaQuery with a parallel VLA-UniT latent-action bridge loss."""
+"""QwenMetaQuery with pluggable latent-action auxiliary losses."""
 
 import copy
 from dataclasses import dataclass, field
@@ -32,6 +32,8 @@ class QwenMetaQueryLADefaults:
         default_factory=lambda: {
             "enabled": True,
             "backend": "unit",
+            "loss_type": "auto",
+            "mode": "ar",
             "groot_tokenizer_path": None,
             "dinov2_path_override": None,
             "num_bridge_tokens": 8,
@@ -44,17 +46,30 @@ class QwenMetaQueryLADefaults:
             "action_train_robot_types": None,
             "image_size": [224, 224],
             "strict_num_bridge_tokens": True,
+            "token_format": "<robot_action_{i}>",
+            "univla": {
+                "ckpt_path": None,
+                "model_dim": 768,
+                "latent_dim": 128,
+                "patch_size": 14,
+                "enc_blocks": 12,
+                "dec_blocks": 12,
+                "num_heads": 12,
+                "dropout": 0.0,
+                "image_size": [224, 224],
+                "strict_load": True,
+            },
         }
     )
 
 
 @FRAMEWORK_REGISTRY.register("QwenMetaQuery_LA")
 class Qwen_MetaQuery_LA(Qwen_MetaQuery):
-    """QwenMetaQuery plus a cache-split bridge-token CE objective.
+    """QwenMetaQuery plus a cache-split latent-action objective.
 
     Training runs one multimodal prefix prefill, then continues from the same
     KV cache with two independent assistant suffixes:
-      - VLA-UniT bridge tokens for latent-action CE loss.
+      - latent-action suffix for bridge CE (UniT) or AR LM loss (UniVLA).
       - Metaquery tokens for the original action DiT loss.
 
     Inference only runs the metaquery suffix.
@@ -65,32 +80,41 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
         self.latent_action_enabled = bool(self.latent_action_cfg.get("enabled", True))
+        self.latent_action_backend = str(self.latent_action_cfg.get("backend", "unit")).lower()
 
         self.latent_action_encoder = None
         self.num_bridge_tokens = int(self.latent_action_cfg.num_bridge_tokens)
         self.num_codebooks = int(self.latent_action_cfg.num_codebooks)
         self.codebook_size = int(self.latent_action_cfg.codebook_size)
+        self.latent_action_loss_type = self._get_latent_action_loss_type()
         self.ce_loss_weights = list(self.latent_action_cfg.get("ce_loss_weights", [1.0] * self.num_codebooks))
         self.label_smoothing = float(self.latent_action_cfg.get("label_smoothing", 0.0))
-        if len(self.ce_loss_weights) != self.num_codebooks:
+        if self.latent_action_loss_type == "bridge_ce" and len(self.ce_loss_weights) != self.num_codebooks:
             raise ValueError(
                 f"latent_action.ce_loss_weights length ({len(self.ce_loss_weights)}) "
                 f"must match num_codebooks ({self.num_codebooks})."
             )
 
-        self._expand_bridge_tokens()
+        self.latent_action_token_ids: list[int] = []
+        self.latent_action_id_to_token: dict[int, str] = {}
+        self.bridge_ce_predictors = nn.ModuleList()
         hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
-        self.bridge_ce_predictors = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.LayerNorm(hidden_size),
-                    nn.Linear(hidden_size, hidden_size),
-                    nn.GELU(),
-                    nn.Linear(hidden_size, self.codebook_size),
-                )
-                for _ in range(self.num_codebooks)
-            ]
-        )
+
+        if self.latent_action_enabled and self.latent_action_loss_type == "bridge_ce":
+            self._expand_bridge_tokens()
+            self.bridge_ce_predictors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(hidden_size),
+                        nn.Linear(hidden_size, hidden_size),
+                        nn.GELU(),
+                        nn.Linear(hidden_size, self.codebook_size),
+                    )
+                    for _ in range(self.num_codebooks)
+                ]
+            )
+        elif self.latent_action_enabled and self.latent_action_loss_type == "ar_lm":
+            self._expand_latent_action_tokens()
 
         if self.latent_action_enabled:
             self.latent_action_encoder = build_latent_action_encoder(self.config)
@@ -101,8 +125,37 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         from omegaconf import OmegaConf
 
         current = self.config.framework.get("latent_action", {})
+        backend = str(current.get("backend", QwenMetaQueryLADefaults().latent_action["backend"])).lower()
+        backend_defaults = {}
+        if backend == "univla":
+            backend_defaults = {
+                "loss_type": "ar_lm",
+                "num_bridge_tokens": 4,
+                "num_codebooks": 1,
+                "codebook_size": 16,
+                "ce_loss_weights": [1.0],
+            }
+        elif backend in {"unit", "groot_unit"}:
+            backend_defaults = {"loss_type": "bridge_ce"}
+
         defaults = OmegaConf.create(QwenMetaQueryLADefaults().latent_action)
-        self.config.framework.latent_action = OmegaConf.merge(defaults, current)
+        self.config.framework.latent_action = OmegaConf.merge(defaults, OmegaConf.create(backend_defaults), current)
+
+    def _get_latent_action_loss_type(self) -> str:
+        loss_type = str(self.latent_action_cfg.get("loss_type", "auto")).lower()
+        if loss_type == "auto":
+            loss_type = "ar_lm" if self.latent_action_backend == "univla" else "bridge_ce"
+        if loss_type not in {"bridge_ce", "ar_lm"}:
+            raise ValueError(f"latent_action.loss_type must be 'auto', 'bridge_ce', or 'ar_lm', got {loss_type!r}.")
+        if loss_type == "ar_lm":
+            mode = str(self.latent_action_cfg.get("mode", "ar")).lower()
+            if mode != "ar":
+                raise ValueError("QwenMetaQuery_LA ar_lm supports only latent_action.mode='ar'.")
+            if self.num_codebooks != 1:
+                raise ValueError("QwenMetaQuery_LA ar_lm requires latent_action.num_codebooks=1.")
+        if loss_type == "bridge_ce" and self.latent_action_backend == "univla":
+            raise ValueError("Use latent_action.loss_type='ar_lm' for backend='univla'.")
+        return loss_type
 
     def _expand_bridge_tokens(self) -> None:
         tokenizer = self.qwen_vl_interface.processor.tokenizer
@@ -121,6 +174,30 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             torch.tensor(token_ids, dtype=torch.long),
             persistent=False,
         )
+
+    def _expand_latent_action_tokens(self) -> None:
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        token_format = str(self.latent_action_cfg.token_format)
+        tokens = [token_format.format(i=i) for i in range(self.codebook_size)]
+
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
+
+        token_ids = []
+        for token in tokens:
+            ids = tokenizer(token, add_special_tokens=False)["input_ids"]
+            if len(ids) != 1:
+                raise ValueError(f"Latent-action token `{token}` must map to exactly one token id, got {ids}.")
+            token_ids.append(int(ids[0]))
+
+        sorted_ids = sorted(token_ids)
+        if sorted_ids != list(range(sorted_ids[0], sorted_ids[0] + len(sorted_ids))):
+            raise ValueError(f"Latent-action token ids must be contiguous for label masking, got {sorted_ids}.")
+
+        self.latent_action_token_ids = token_ids
+        self.latent_action_id_to_token = {idx: tok for idx, tok in zip(token_ids, tokens)}
+        self.qwen_vl_interface._ACTION_TOKEN_MIN = sorted_ids[0]
+        self.qwen_vl_interface._ACTION_TOKEN_MAX = sorted_ids[-1]
 
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
@@ -165,26 +242,52 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         if bool(self.latent_action_cfg.get("strict_num_bridge_tokens", True)):
             if vq_indices.shape[1] != self.num_bridge_tokens:
                 raise ValueError(
-                    f"GR00T tokenizer returned {vq_indices.shape[1]} VQ tokens, "
+                    f"Latent-action encoder returned {vq_indices.shape[1]} VQ tokens, "
                     f"but latent_action.num_bridge_tokens={self.num_bridge_tokens}."
                 )
         elif vq_indices.shape[1] < self.num_bridge_tokens:
             raise ValueError(
-                f"GR00T tokenizer returned {vq_indices.shape[1]} VQ tokens, "
+                f"Latent-action encoder returned {vq_indices.shape[1]} VQ tokens, "
                 f"fewer than latent_action.num_bridge_tokens={self.num_bridge_tokens}."
             )
         if vq_indices.shape[-1] != self.num_codebooks:
             raise ValueError(
-                f"GR00T tokenizer returned {vq_indices.shape[-1]} codebooks, "
+                f"Latent-action encoder returned {vq_indices.shape[-1]} codebooks, "
                 f"but latent_action.num_codebooks={self.num_codebooks}."
             )
+        if vq_indices.numel() > 0:
+            max_index = int(vq_indices.max().item())
+            min_index = int(vq_indices.min().item())
+            if min_index < 0 or max_index >= self.codebook_size:
+                raise ValueError(
+                    f"Latent-action indices must be in [0, {self.codebook_size}), "
+                    f"got min={min_index}, max={max_index}."
+                )
         vq_indices = vq_indices[:, : self.num_bridge_tokens]
         vq_indices = vq_indices.reshape(
             len(examples),
             pair_count * self.num_bridge_tokens,
             self.num_codebooks,
         )
-        return vq_indices.to(self.bridge_suffix_ids.device)
+        return vq_indices.to(self.metaquery_suffix_ids.device)
+
+    def _latent_indices_to_solutions(self, indices: torch.LongTensor) -> list[str]:
+        if indices.ndim != 3 or indices.shape[-1] != 1:
+            raise ValueError(f"ar_lm expects latent indices shaped [B, L, 1], got {tuple(indices.shape)}.")
+        token_format = str(self.latent_action_cfg.token_format)
+        solutions = []
+        for sample_indices in indices[..., 0].detach().cpu().tolist():
+            solutions.append("".join(token_format.format(i=int(idx)) for idx in sample_indices))
+        return solutions
+
+    def _latent_indices_to_token_ids(self, indices: torch.LongTensor) -> torch.LongTensor:
+        if indices.ndim != 3 or indices.shape[-1] != 1:
+            raise ValueError(f"ar_lm expects latent indices shaped [B, L, 1], got {tuple(indices.shape)}.")
+        if not self.latent_action_token_ids:
+            raise RuntimeError("Latent-action AR tokens are not initialized.")
+        flat_indices = indices[..., 0].long()
+        token_ids = torch.tensor(self.latent_action_token_ids, dtype=torch.long, device=flat_indices.device)
+        return token_ids.index_select(0, flat_indices.reshape(-1)).reshape(flat_indices.shape)
 
     def _get_action_train_robot_types(self) -> set[str] | None:
         robot_types = self.latent_action_cfg.get("action_train_robot_types", None)
@@ -270,6 +373,8 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         instructions: list[str],
         bridge_pair_count: int | None = None,
         bridge_gt_indices: torch.LongTensor | None = None,
+        latent_ar_solution: str | None = None,
+        latent_ar_token_ids: torch.LongTensor | None = None,
     ) -> None:
         if self._printed_training_sample or not self.training:
             return
@@ -282,34 +387,55 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         metaquery_suffix = self._format_token_suffix(self.metaquery_suffix_ids)
 
         bridge_suffix = None
-        if bridge_pair_count is not None:
+        if bridge_pair_count is not None and hasattr(self, "bridge_suffix_ids"):
             bridge_suffix = self._format_token_suffix(self.bridge_suffix_ids.repeat(bridge_pair_count))
         formatted_bridge_gt_indices = self._format_bridge_gt_indices(bridge_gt_indices, bridge_pair_count)
+        formatted_ar_token_ids = latent_ar_token_ids[0].detach().cpu().tolist() if latent_ar_token_ids is not None else None
 
         episode_index = example.get("episode_index", None)
         step_index = example.get("step_index", None)
         episode_path = example.get("episode_path", None)
         la_frame_offsets = example.get("la_frame_offsets", None)
 
-        logger.info(
-            "First training sample input (episode_index=%s, step_index=%s, episode_path=%s):\n"
-            "%s\n"
-            "Metaquery suffix branch:\n%s\n"
-            "Bridge suffix branch (pair_count=%s, la_frame_offsets=%s):\n%s\n"
-            "Bridge GT indices [pair][bridge_token][codebook]:\n%s",
-            episode_index,
-            step_index,
-            episode_path,
-            sample_text,
-            metaquery_suffix,
-            bridge_pair_count,
-            la_frame_offsets,
-            bridge_suffix,
-            formatted_bridge_gt_indices,
-        )
+        if self.latent_action_loss_type == "ar_lm":
+            logger.info(
+                "First training sample input (episode_index=%s, step_index=%s, episode_path=%s):\n"
+                "%s\n"
+                "Metaquery suffix branch:\n%s\n"
+                "Latent AR suffix branch (pair_count=%s, la_frame_offsets=%s):\n%s\n"
+                "Latent AR token ids:\n%s\n"
+                "Latent GT indices [pair][bridge_token][codebook]:\n%s",
+                episode_index,
+                step_index,
+                episode_path,
+                sample_text,
+                metaquery_suffix,
+                bridge_pair_count,
+                la_frame_offsets,
+                latent_ar_solution,
+                formatted_ar_token_ids,
+                formatted_bridge_gt_indices,
+            )
+        else:
+            logger.info(
+                "First training sample input (episode_index=%s, step_index=%s, episode_path=%s):\n"
+                "%s\n"
+                "Metaquery suffix branch:\n%s\n"
+                "Bridge suffix branch (pair_count=%s, la_frame_offsets=%s):\n%s\n"
+                "Bridge GT indices [pair][bridge_token][codebook]:\n%s",
+                episode_index,
+                step_index,
+                episode_path,
+                sample_text,
+                metaquery_suffix,
+                bridge_pair_count,
+                la_frame_offsets,
+                bridge_suffix,
+                formatted_bridge_gt_indices,
+            )
         self._printed_training_sample = True
 
-    def _run_prefix_cache(self, batch_images: List, instructions: List[str]):
+    def _run_prefix_cache(self, batch_images: List, instructions: List[str], return_outputs: bool = False):
         prefix_inputs = self._build_prefix_inputs(batch_images, instructions)
         prefix_outputs = self.qwen_vl_interface(
             **prefix_inputs,
@@ -324,6 +450,8 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                 "QwenMetaQuery_LA requires use_cache=True to return past_key_values. "
                 "Disable incompatible gradient-checkpointing/cache settings for this framework."
             )
+        if return_outputs:
+            return prefix_inputs, past_key_values, prefix_outputs
         return prefix_inputs, past_key_values
 
     @staticmethod
@@ -347,10 +475,24 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         suffix_ids: torch.LongTensor,
     ):
         input_ids = prefix_inputs["input_ids"]
+        batch_size = input_ids.shape[0]
+        suffix = suffix_ids.to(input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        return self._run_suffix_batch_from_cache(prefix_inputs, past_key_values, suffix)
+
+    def _run_suffix_batch_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        suffix: torch.LongTensor,
+        output_hidden_states: bool = True,
+    ):
+        input_ids = prefix_inputs["input_ids"]
         attention_mask = prefix_inputs["attention_mask"]
         batch_size = input_ids.shape[0]
+        if suffix.ndim != 2 or suffix.shape[0] != batch_size:
+            raise ValueError(f"Suffix ids must be shaped [batch, suffix_len], got {tuple(suffix.shape)}.")
         prefix_len = past_key_values.get_seq_length()
-        suffix = suffix_ids.to(input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        suffix = suffix.to(input_ids.device)
         suffix_mask = torch.ones(
             suffix.shape,
             dtype=attention_mask.dtype,
@@ -370,7 +512,7 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             cache_position=cache_position,
             use_cache=False,
             output_attentions=False,
-            output_hidden_states=True,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
         )
 
@@ -410,6 +552,41 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             total_loss = total_loss + ce_loss * float(self.ce_loss_weights[i])
         out["latent_action_loss"] = total_loss
         return out
+
+    def _ar_lm_loss_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        prefix_outputs,
+        target_token_ids: torch.LongTensor,
+    ) -> dict:
+        target_token_ids = target_token_ids.to(prefix_inputs["input_ids"].device)
+        suffix_outputs = self._run_suffix_batch_from_cache(
+            prefix_inputs,
+            past_key_values,
+            target_token_ids,
+            output_hidden_states=False,
+        )
+        prefix_logits = getattr(prefix_outputs, "logits", None)
+        suffix_logits = getattr(suffix_outputs, "logits", None)
+        if prefix_logits is None or suffix_logits is None:
+            raise RuntimeError("QwenMetaQuery_LA ar_lm requires logits from prefix and suffix forwards.")
+
+        shifted_logits = torch.cat([prefix_logits[:, -1:, :], suffix_logits[:, :-1, :]], dim=1)
+        if shifted_logits.shape[:2] != target_token_ids.shape:
+            raise ValueError(
+                f"Shifted AR logits shape {tuple(shifted_logits.shape[:2])} "
+                f"does not match target ids shape {tuple(target_token_ids.shape)}."
+            )
+        latent_action_loss = F.cross_entropy(
+            shifted_logits.reshape(-1, shifted_logits.size(-1)).float(),
+            target_token_ids.reshape(-1),
+            label_smoothing=self.label_smoothing,
+        )
+        return {
+            "latent_action_loss": latent_action_loss,
+            "latent_ar_lm_loss": latent_action_loss,
+        }
 
     def _action_loss_from_meta_embs(
         self,
@@ -452,7 +629,15 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
 
-        prefix_inputs, past_key_values = self._run_prefix_cache(batch_images, instructions)
+        if self.latent_action_enabled and self.latent_action_loss_type == "ar_lm":
+            prefix_inputs, past_key_values, prefix_outputs = self._run_prefix_cache(
+                batch_images,
+                instructions,
+                return_outputs=True,
+            )
+        else:
+            prefix_inputs, past_key_values = self._run_prefix_cache(batch_images, instructions)
+            prefix_outputs = None
         meta_embs = self._encode_metaquery_from_cache(prefix_inputs, past_key_values)
         action_examples, action_meta_embs = self._select_action_training_batch(examples, meta_embs)
         action_train_batch_size = len(action_examples)
@@ -473,8 +658,26 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         if self.latent_action_enabled:
             gt_indices = self._make_visual_only_vq_targets(examples)
             bridge_pair_count = gt_indices.shape[1] // self.num_bridge_tokens
-            self._print_training_sample_once(examples, instructions, bridge_pair_count, gt_indices)
-            latent_outputs = self._bridge_loss_from_cache(prefix_inputs, past_key_values, gt_indices)
+            if self.latent_action_loss_type == "bridge_ce":
+                self._print_training_sample_once(examples, instructions, bridge_pair_count, gt_indices)
+                latent_outputs = self._bridge_loss_from_cache(prefix_inputs, past_key_values, gt_indices)
+            else:
+                latent_solutions = self._latent_indices_to_solutions(gt_indices)
+                target_token_ids = self._latent_indices_to_token_ids(gt_indices)
+                self._print_training_sample_once(
+                    examples,
+                    instructions,
+                    bridge_pair_count,
+                    gt_indices,
+                    latent_solutions[0] if latent_solutions else None,
+                    target_token_ids,
+                )
+                latent_outputs = self._ar_lm_loss_from_cache(
+                    prefix_inputs,
+                    past_key_values,
+                    prefix_outputs,
+                    target_token_ids,
+                )
             latent_action_loss = latent_outputs["latent_action_loss"]
         else:
             self._print_training_sample_once(examples, instructions)
