@@ -59,6 +59,13 @@ class QwenMetaQueryLADefaults:
                 "image_size": [224, 224],
                 "strict_load": True,
             },
+            "softvq": {
+                "config_path": None,
+                "ckpt_path": "/inspire/qb-ilm/project/qproject-fundationmodel/public/jjc/exp/tokenizer/0609_visonly_softvq_1token/checkpoints/partial_step_75000.pt",
+                "image_size": [256, 256],
+                "strict_load": False,
+                "kl_eps": 1e-8,
+            },
         }
     )
 
@@ -98,6 +105,8 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         self.latent_action_token_ids: list[int] = []
         self.latent_action_id_to_token: dict[int, str] = {}
         self.bridge_ce_predictors = nn.ModuleList()
+        self.softvq_input_proj = None
+        self.softvq_output_proj = None
         hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
 
         if self.latent_action_enabled and self.latent_action_loss_type == "bridge_ce":
@@ -115,6 +124,9 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             )
         elif self.latent_action_enabled and self.latent_action_loss_type == "ar_lm":
             self._expand_latent_action_tokens()
+        elif self.latent_action_enabled and self.latent_action_loss_type == "soft_kl":
+            self.softvq_input_proj = nn.Linear(self.codebook_size, hidden_size)
+            self.softvq_output_proj = nn.Linear(hidden_size, self.codebook_size)
 
         if self.latent_action_enabled:
             self.latent_action_encoder = build_latent_action_encoder(self.config)
@@ -135,6 +147,14 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                 "codebook_size": 16,
                 "ce_loss_weights": [1.0],
             }
+        elif backend == "softvq":
+            backend_defaults = {
+                "loss_type": "soft_kl",
+                "num_bridge_tokens": 1,
+                "num_codebooks": 1,
+                "codebook_size": 64,
+                "ce_loss_weights": [1.0],
+            }
         elif backend in {"unit", "groot_unit"}:
             backend_defaults = {"loss_type": "bridge_ce"}
 
@@ -144,17 +164,31 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
     def _get_latent_action_loss_type(self) -> str:
         loss_type = str(self.latent_action_cfg.get("loss_type", "auto")).lower()
         if loss_type == "auto":
-            loss_type = "ar_lm" if self.latent_action_backend == "univla" else "bridge_ce"
-        if loss_type not in {"bridge_ce", "ar_lm"}:
-            raise ValueError(f"latent_action.loss_type must be 'auto', 'bridge_ce', or 'ar_lm', got {loss_type!r}.")
+            if self.latent_action_backend == "univla":
+                loss_type = "ar_lm"
+            elif self.latent_action_backend == "softvq":
+                loss_type = "soft_kl"
+            else:
+                loss_type = "bridge_ce"
+        if loss_type not in {"bridge_ce", "ar_lm", "soft_kl"}:
+            raise ValueError(
+                f"latent_action.loss_type must be 'auto', 'bridge_ce', 'ar_lm', or 'soft_kl', got {loss_type!r}."
+            )
         if loss_type == "ar_lm":
             mode = str(self.latent_action_cfg.get("mode", "ar")).lower()
             if mode != "ar":
                 raise ValueError("QwenMetaQuery_LA ar_lm supports only latent_action.mode='ar'.")
             if self.num_codebooks != 1:
                 raise ValueError("QwenMetaQuery_LA ar_lm requires latent_action.num_codebooks=1.")
+        if loss_type == "soft_kl":
+            if self.latent_action_backend != "softvq":
+                raise ValueError("Use latent_action.backend='softvq' with latent_action.loss_type='soft_kl'.")
+            if self.num_codebooks != 1:
+                raise ValueError("QwenMetaQuery_LA soft_kl requires latent_action.num_codebooks=1.")
         if loss_type == "bridge_ce" and self.latent_action_backend == "univla":
             raise ValueError("Use latent_action.loss_type='ar_lm' for backend='univla'.")
+        if loss_type != "soft_kl" and self.latent_action_backend == "softvq":
+            raise ValueError("Use latent_action.loss_type='soft_kl' for backend='softvq'.")
         return loss_type
 
     def _expand_bridge_tokens(self) -> None:
@@ -288,6 +322,71 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         flat_indices = indices[..., 0].long()
         token_ids = torch.tensor(self.latent_action_token_ids, dtype=torch.long, device=flat_indices.device)
         return token_ids.index_select(0, flat_indices.reshape(-1)).reshape(flat_indices.shape)
+
+    def _make_softvq_targets(self, examples: List[dict]) -> torch.Tensor:
+        if self.latent_action_encoder is None:
+            raise RuntimeError("Latent-action encoder is not initialized.")
+        if not hasattr(self.latent_action_encoder, "encode_distribution"):
+            raise RuntimeError("SoftVQ latent-action encoder must implement encode_distribution().")
+
+        frame_pairs = []
+        pair_counts = []
+        for example in examples:
+            frames = example.get("la_frames", None)
+            if frames is None or len(frames) < 2:
+                raise ValueError(
+                    "QwenMetaQuery_LA soft_kl requires `la_frames` with at least two frames. "
+                    "Use datasets.vla_data.dataset_py=lerobot_la_datasets and enable latent_action."
+                )
+            pair_counts.append(len(frames) - 1)
+            for i in range(len(frames) - 1):
+                frame_pairs.append((frames[i], frames[i + 1]))
+
+        if len(set(pair_counts)) != 1:
+            raise ValueError(
+                "QwenMetaQuery_LA requires the same number of SoftVQ frame pairs per batch "
+                f"because suffix embeddings are batched without padding, got pair counts {pair_counts}."
+            )
+        pair_count = pair_counts[0]
+
+        distributions = self.latent_action_encoder.encode_distribution(frame_pairs)
+        if distributions.ndim != 3:
+            raise ValueError(f"SoftVQ encoder must return [num_pairs, tokens, codebook], got {tuple(distributions.shape)}.")
+        if distributions.shape[0] != len(frame_pairs):
+            raise ValueError(
+                f"SoftVQ encoder returned {distributions.shape[0]} pairs, "
+                f"but {len(frame_pairs)} frame pairs were provided."
+            )
+        if bool(self.latent_action_cfg.get("strict_num_bridge_tokens", True)):
+            if distributions.shape[1] != self.num_bridge_tokens:
+                raise ValueError(
+                    f"SoftVQ encoder returned {distributions.shape[1]} tokens, "
+                    f"but latent_action.num_bridge_tokens={self.num_bridge_tokens}."
+                )
+        elif distributions.shape[1] < self.num_bridge_tokens:
+            raise ValueError(
+                f"SoftVQ encoder returned {distributions.shape[1]} tokens, "
+                f"fewer than latent_action.num_bridge_tokens={self.num_bridge_tokens}."
+            )
+        if distributions.shape[-1] != self.codebook_size:
+            raise ValueError(
+                f"SoftVQ encoder returned codebook size {distributions.shape[-1]}, "
+                f"but latent_action.codebook_size={self.codebook_size}."
+            )
+
+        distributions = distributions[:, : self.num_bridge_tokens]
+        distributions = distributions.reshape(len(examples), pair_count * self.num_bridge_tokens, self.codebook_size)
+        return distributions.to(self.metaquery_suffix_ids.device)
+
+    def _collect_la_padding_mask(self, examples: List[dict]) -> torch.Tensor:
+        """Per-sample mask (1.0=keep, 0.0=padded) for the SoftVQ latent-action loss.
+
+        Samples whose latent-action frame window ran past the trajectory end were
+        clamped/repeated by the dataset, producing degenerate frame pairs the
+        tokenizer never saw. They are excluded from the KL objective.
+        """
+        flags = [bool(example.get("la_padded", False)) for example in examples]
+        return torch.tensor([0.0 if padded else 1.0 for padded in flags], dtype=torch.float32)
 
     def _get_action_train_robot_types(self) -> set[str] | None:
         robot_types = self.latent_action_cfg.get("action_train_robot_types", None)
@@ -516,6 +615,40 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             return_dict=True,
         )
 
+    def _run_suffix_embeds_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        suffix_embeds: torch.Tensor,
+        output_hidden_states: bool = True,
+    ):
+        input_ids = prefix_inputs["input_ids"]
+        attention_mask = prefix_inputs["attention_mask"]
+        batch_size = input_ids.shape[0]
+        if suffix_embeds.ndim != 3 or suffix_embeds.shape[0] != batch_size:
+            raise ValueError(f"Suffix embeds must be shaped [batch, suffix_len, hidden], got {tuple(suffix_embeds.shape)}.")
+        prefix_len = past_key_values.get_seq_length()
+        suffix_embeds = suffix_embeds.to(input_ids.device)
+        suffix_mask = torch.ones(
+            suffix_embeds.shape[:2],
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        branch_attention_mask = torch.cat([attention_mask, suffix_mask], dim=1)
+        cache_position = torch.arange(
+            prefix_len, prefix_len + suffix_embeds.shape[1], device=suffix_embeds.device
+        )
+        return self.qwen_vl_interface(
+            inputs_embeds=suffix_embeds,
+            attention_mask=branch_attention_mask,
+            past_key_values=self._branch_cache(past_key_values),
+            cache_position=cache_position,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+
     def _encode_metaquery_from_cache(self, prefix_inputs: dict, past_key_values) -> List[torch.Tensor]:
         outputs = self._run_suffix_from_cache(prefix_inputs, past_key_values, self.metaquery_suffix_ids)
         per_layer = [layer[:, 1:-1, :] for layer in outputs.hidden_states]
@@ -588,6 +721,51 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             "latent_ar_lm_loss": latent_action_loss,
         }
 
+    def _softvq_kl_loss_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        target_distributions: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> dict:
+        if self.softvq_input_proj is None or self.softvq_output_proj is None:
+            raise RuntimeError("SoftVQ projection heads are not initialized.")
+
+        target_distributions = target_distributions.to(prefix_inputs["input_ids"].device).float()
+        eps = float(self.latent_action_cfg.get("softvq", {}).get("kl_eps", 1e-8))
+        target_probs = target_distributions.clamp_min(eps)
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        suffix_embeds = self.softvq_input_proj(target_probs).to(dtype=self.qwen_vl_interface.model.dtype)
+        outputs = self._run_suffix_embeds_from_cache(prefix_inputs, past_key_values, suffix_embeds)
+        hidden = outputs.hidden_states[-1]
+        logits = self.softvq_output_proj(hidden)
+        if logits.shape != target_probs.shape:
+            raise ValueError(f"SoftVQ logits shape {tuple(logits.shape)} does not match target {tuple(target_probs.shape)}.")
+
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        kl_per_sample = F.kl_div(log_probs, target_probs, reduction="none").sum(dim=-1).mean(dim=1)
+        entropy_per_sample = -(target_probs * target_probs.log()).sum(dim=-1).mean(dim=1)
+        max_prob_per_sample = target_probs.max(dim=-1).values.mean(dim=1)
+
+        if valid_mask is None:
+            valid_mask = torch.ones_like(kl_per_sample)
+        else:
+            valid_mask = valid_mask.to(kl_per_sample.device, dtype=kl_per_sample.dtype)
+        valid_count = int(valid_mask.sum().item())
+        denom = valid_mask.sum().clamp_min(1.0)
+
+        kl_loss = (kl_per_sample * valid_mask).sum() / denom
+        entropy = (entropy_per_sample * valid_mask).sum() / denom
+        max_prob = (max_prob_per_sample * valid_mask).sum() / denom
+        kl_loss = self._scale_action_loss_for_global_mean(kl_loss, valid_count)
+        return {
+            "latent_action_loss": kl_loss,
+            "latent_softvq_kl_loss": kl_loss,
+            "latent_softvq_target_entropy": entropy,
+            "latent_softvq_target_max_prob": max_prob,
+        }
+
     def _action_loss_from_meta_embs(
         self,
         examples: List[dict],
@@ -656,12 +834,22 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         latent_outputs = {}
         latent_action_loss = None
         if self.latent_action_enabled:
-            gt_indices = self._make_visual_only_vq_targets(examples)
-            bridge_pair_count = gt_indices.shape[1] // self.num_bridge_tokens
+            if self.latent_action_loss_type == "soft_kl":
+                gt_distributions = self._make_softvq_targets(examples)
+                la_valid_mask = self._collect_la_padding_mask(examples)
+                bridge_pair_count = gt_distributions.shape[1] // self.num_bridge_tokens
+                gt_indices = gt_distributions.argmax(dim=-1).unsqueeze(-1)
+                self._print_training_sample_once(examples, instructions, bridge_pair_count, gt_indices)
+                latent_outputs = self._softvq_kl_loss_from_cache(
+                    prefix_inputs, past_key_values, gt_distributions, la_valid_mask
+                )
+            else:
+                gt_indices = self._make_visual_only_vq_targets(examples)
+                bridge_pair_count = gt_indices.shape[1] // self.num_bridge_tokens
             if self.latent_action_loss_type == "bridge_ce":
                 self._print_training_sample_once(examples, instructions, bridge_pair_count, gt_indices)
                 latent_outputs = self._bridge_loss_from_cache(prefix_inputs, past_key_values, gt_indices)
-            else:
+            elif self.latent_action_loss_type == "ar_lm":
                 latent_solutions = self._latent_indices_to_solutions(gt_indices)
                 target_token_ids = self._latent_indices_to_token_ids(gt_indices)
                 self._print_training_sample_once(

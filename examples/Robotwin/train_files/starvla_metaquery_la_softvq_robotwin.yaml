@@ -1,0 +1,144 @@
+run_id: qwen_metaquery_la_softvq_robotwin
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_project: starVLA_Robotwin
+is_debug: false
+version_id: "0.1"
+
+# QwenMetaQuery_LA with vision-only SoftVQ latent-action KL loss.
+# The SoftVQ target distribution is projected into the LLM as suffix embeddings;
+# the suffix hidden states predict a categorical distribution aligned by KL.
+framework:
+  name: QwenMetaQuery_LA
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
+
+  metaquery:
+    num_metaqueries: 64
+
+  latent_action:
+    enabled: true
+    backend: softvq
+    loss_type: soft_kl
+    mode: ar
+    action_train_robot_types: ["aloha-agilex"]
+    softvq:
+      ckpt_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/jjc/exp/tokenizer/0609_visonly_softvq_1token/checkpoints/partial_step_75000.pt
+      image_size: [256, 256]
+      strict_load: false
+      kl_eps: 1.0e-08
+      model:
+        visual_model:
+          reconstruction_target: pixel
+          frame_encoder:
+            type: cnn
+            image_size: [256, 256]
+            patch_size: 16
+            token_dim: 256
+          delta_encoder:
+            type: mformer
+            num_delta_tokens: 1
+            token_dim: 1024
+            depth: 16
+            num_heads: 16
+            mlp_ratio: 4.0
+            dropout: 0.0
+            max_seq_len: 1024
+          quantizer:
+            enabled: true
+            type: softvq
+            soft: true
+            codebook_size: 64
+            codebook_dim: 32
+            l2_norm: true
+            temperature: 0.25
+            entropy_loss_ratio: 0.01
+            entropy_temperature: 0.1
+    num_bridge_tokens: 1
+    num_codebooks: 1
+    codebook_size: 64
+    label_smoothing: 0.0
+    loss_weight: 1.0
+    action_loss_weight: 1.0
+    strict_num_bridge_tokens: true
+
+  action_model:
+    action_dim: 14
+    state_dim: 14
+    action_horizon: 32
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 32
+    diffusion_model_cfg:
+      input_embedding_dim: 1024
+      attention_head_dim: 32
+      num_attention_heads: 32
+      norm_type: "norm"
+      dropout: 0.0
+      final_dropout: false
+      interleave_self_attention: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_la_datasets
+    latent_action:
+      enabled: true
+      stride: 16
+      horizon: 32
+      horizon_overrides:
+        arx-x5:
+          frame_stride: 11
+          horizon: 22
+        franka:
+          frame_stride: 11
+          horizon: 22
+        piper:
+          frame_stride: 11
+          horizon: 22
+        ur5:
+          frame_stride: 11
+          horizon: 22
+      video_key: cam_high
+      include_terminal_frame: false
+      image_size: [256, 256]
+    include_state: true
+    data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot
+    data_mix: robotwin32_aloha_place_phone_stand
+    action_type: abs_qpos
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    video_backend: pyav
+
+trainer:
+  max_train_steps: 50000
+  num_warmup_steps: 1000
+  save_interval: 5000
+  eval_interval: 500
+  eval_num_samples: 256
+  eval_batch_size: 8
+  logging_frequency: 50
+  learning_rate:
+    base: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

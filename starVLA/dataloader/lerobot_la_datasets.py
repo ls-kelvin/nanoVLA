@@ -32,6 +32,46 @@ def _cfg_get(cfg, key, default=None):
     return cfg.get(key, default) if hasattr(cfg, "get") else getattr(cfg, key, default)
 
 
+def _resolve_latent_action_stride(la_cfg, robot_type: str | None) -> int:
+    stride = int(_cfg_get(la_cfg, "stride", 4))
+    if robot_type:
+        stride_overrides = _cfg_get(la_cfg, "stride_overrides", None)
+        robot_stride = _cfg_get(stride_overrides, robot_type, None)
+        if robot_stride is not None:
+            stride = int(robot_stride)
+
+        horizon_overrides = _cfg_get(la_cfg, "horizon_overrides", None)
+        robot_horizon = _cfg_get(horizon_overrides, robot_type, None)
+        robot_frame_stride = _cfg_get(robot_horizon, "frame_stride", None)
+        if robot_frame_stride is not None:
+            stride = int(robot_frame_stride)
+
+    if stride <= 0:
+        raise ValueError(f"latent_action.stride must be positive, got {stride}.")
+    return stride
+
+
+def _resolve_latent_action_horizon(la_cfg, robot_type: str | None, fallback: int) -> int:
+    """Resolve the latent-action frame window length per embodiment.
+
+    Defaults to ``latent_action.horizon`` (falling back to the action chunk
+    length when unset) and may be overridden per robot via
+    ``horizon_overrides.<robot>.horizon``.
+    """
+    horizon = _cfg_get(la_cfg, "horizon", None)
+    horizon = int(horizon) if horizon is not None else int(fallback)
+    if robot_type:
+        horizon_overrides = _cfg_get(la_cfg, "horizon_overrides", None)
+        robot_horizon = _cfg_get(horizon_overrides, robot_type, None)
+        robot_horizon_value = _cfg_get(robot_horizon, "horizon", None)
+        if robot_horizon_value is not None:
+            horizon = int(robot_horizon_value)
+
+    if horizon <= 0:
+        raise ValueError(f"latent_action.horizon must be positive, got {horizon}.")
+    return horizon
+
+
 def _as_pil(image) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.convert("RGB")
@@ -58,14 +98,19 @@ class LatentActionLeRobotSingleDataset(LeRobotSingleDataset):
         if trajectory_id is None or base_index is None:
             raise ValueError("Latent-action dataset context is missing from sample data.")
 
+        robot_type = sample.get("robot_type", None)
+        robot_type = str(robot_type) if robot_type is not None else None
         action_horizon = int(sample["action"].shape[0])
-        stride = int(_cfg_get(la_cfg, "stride", 4))
-        if stride <= 0:
-            raise ValueError(f"latent_action.stride must be positive, got {stride}.")
+        stride = _resolve_latent_action_stride(la_cfg, robot_type)
+        la_horizon = _resolve_latent_action_horizon(la_cfg, robot_type, action_horizon)
 
-        offsets = list(range(0, action_horizon + 1, stride))
-        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != action_horizon:
-            offsets.append(action_horizon)
+        offsets = list(range(0, la_horizon + 1, stride))
+        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != la_horizon:
+            offsets.append(la_horizon)
+
+        trajectory_index = self.get_trajectory_index(int(trajectory_id))
+        max_length = int(self.trajectory_lengths[trajectory_index])
+        sample["la_padded"] = bool(int(base_index) + int(offsets[-1]) > max_length - 1)
 
         video_key = _cfg_get(la_cfg, "video_key", None) or self.modality_keys["video"][0]
         if not str(video_key).startswith("video."):
