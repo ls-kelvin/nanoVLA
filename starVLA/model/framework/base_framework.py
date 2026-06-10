@@ -215,7 +215,7 @@ class baseframework(PreTrainedModel):
             1. Resolve checkpoint path
             2. Load config + dataset normalization statistics
             3. Build model with loaded config
-            4. Load state_dict strictly (reports missing/unexpected keys)
+            4. Load state_dict with strict=False and report missing/unexpected key counts
             5. Attach normalization stats for later un-normalization
 
         Args:
@@ -226,7 +226,6 @@ class baseframework(PreTrainedModel):
             baseframework: Instantiated model (left on CPU; caller decides device).
 
         Raises:
-            RuntimeError: If state_dict key mismatch occurs under strict=True.
             FileNotFoundError: If underlying files are missing (surfaced earlier).
         """
         pretrained_checkpoint = Path(pretrained_checkpoint)
@@ -246,24 +245,12 @@ class baseframework(PreTrainedModel):
             model_state_dict = load_file(str(pretrained_checkpoint))
         else:
             model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
-        # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
-        model_keys = set(FrameworkModel.state_dict().keys())
-        checkpoint_keys = set(model_state_dict.keys())
-        try:
-            FrameworkModel.load_state_dict(model_state_dict, strict=True)
-        except RuntimeError as e:
-            # must keep all keys matched
-            common_keys = model_keys.intersection(checkpoint_keys)
-            missing_keys = model_keys - common_keys
-            unexpected_keys = checkpoint_keys - common_keys
-            if missing_keys:
-                logger.warning(f"Missing keys in state_dict: {missing_keys}")
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys in state_dict: {unexpected_keys}")
-
-            raise e
+        incompatible_keys = FrameworkModel.load_state_dict(model_state_dict, strict=False)
+        missing_keys = list(getattr(incompatible_keys, "missing_keys", []))
+        unexpected_keys = list(getattr(incompatible_keys, "unexpected_keys", []))
+        print(f"load_state_dict missing keys: {len(missing_keys)}")
+        print(f"load_state_dict unexpected keys: {len(unexpected_keys)}")
 
         # **ensure model is on GPU**
         FrameworkModel = FrameworkModel
         return FrameworkModel
-

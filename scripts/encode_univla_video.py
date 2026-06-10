@@ -15,7 +15,12 @@ DEFAULT_TOKEN_FORMAT = "<robot_action_{i}>"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True, type=Path, help="Input video path.")
-    parser.add_argument("--stride", default=10, type=int, help="Frame stride between encoded interval endpoints.")
+    parser.add_argument(
+        "--stride",
+        default=10,
+        type=int,
+        help="Frame stride between encoded interval endpoints. Use 0 to encode each frame with itself as goal.",
+    )
     parser.add_argument(
         "--ckpt-path",
         default=DEFAULT_CKPT_PATH,
@@ -72,8 +77,10 @@ def build_config(ckpt_path: Path, token_format: str):
 
 
 def make_offsets(num_frames: int, stride: int, include_terminal_frame: bool) -> list[int]:
-    if stride <= 0:
-        raise ValueError(f"--stride must be positive, got {stride}.")
+    if stride < 0:
+        raise ValueError(f"--stride must be non-negative, got {stride}.")
+    if stride == 0:
+        return list(range(num_frames))
     if num_frames < 2:
         raise ValueError(f"Video must contain at least 2 frames, got {num_frames}.")
 
@@ -88,6 +95,12 @@ def make_offsets(num_frames: int, stride: int, include_terminal_frame: bool) -> 
     return offsets
 
 
+def make_pairs(offsets: list[int], stride: int) -> list[tuple[int, int]]:
+    if stride == 0:
+        return [(offset, offset) for offset in offsets]
+    return list(zip(offsets[:-1], offsets[1:], strict=True))
+
+
 def as_pil(frame: Any):
     import numpy as np
     from PIL import Image
@@ -99,14 +112,13 @@ def format_token_sequence(codes: list[int], token_format: str) -> str:
     return "".join(token_format.format(i=int(code)) for code in codes)
 
 
-def encode_pairs(encoder, frames: Any, offsets: list[int], batch_size: int):
+def encode_pairs(encoder, frames: Any, pairs: list[tuple[int, int]], batch_size: int):
     import torch
 
     if batch_size <= 0:
         raise ValueError(f"--batch-size must be positive, got {batch_size}.")
 
     encoded = []
-    pairs = list(zip(offsets[:-1], offsets[1:]))
     with torch.inference_mode():
         for start in range(0, len(pairs), batch_size):
             batch_pairs = [
@@ -134,23 +146,24 @@ def main() -> None:
 
     frames = get_all_frames(video_path.as_posix(), video_backend=args.video_backend)
     offsets = make_offsets(len(frames), args.stride, args.include_terminal_frame)
+    pairs = make_pairs(offsets, args.stride)
 
     config = build_config(ckpt_path, args.token_format)
     encoder = build_latent_action_encoder(config)
     encoder.to(resolve_device(args.device))
     encoder.eval()
 
-    codes = encode_pairs(encoder, frames, offsets, args.batch_size)
+    codes = encode_pairs(encoder, frames, pairs, args.batch_size)
 
     print(f"video: {video_path}")
     print(f"frames: {len(frames)}")
     print(f"stride: {args.stride}")
     print(f"sample_offsets: {offsets}")
-    print(f"intervals: {len(offsets) - 1}")
+    print(f"intervals: {len(pairs)}")
     print(f"codes_per_interval: {codes.shape[1] if codes.ndim > 1 else 1}")
     print()
 
-    for idx, ((left, right), code_tensor) in enumerate(zip(zip(offsets[:-1], offsets[1:]), codes), start=1):
+    for idx, ((left, right), code_tensor) in enumerate(zip(pairs, codes, strict=True), start=1):
         code = [int(value) for value in code_tensor.reshape(-1).tolist()]
         print(
             f"interval {idx:04d} | frames [{left}, {right}] | "

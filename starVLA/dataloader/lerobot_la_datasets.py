@@ -63,9 +63,9 @@ class LatentActionLeRobotSingleDataset(LeRobotSingleDataset):
         if stride <= 0:
             raise ValueError(f"latent_action.stride must be positive, got {stride}.")
 
-        offsets = list(range(0, action_horizon, stride))
-        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != action_horizon - 1:
-            offsets.append(action_horizon - 1)
+        offsets = list(range(0, action_horizon + 1, stride))
+        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != action_horizon:
+            offsets.append(action_horizon)
 
         video_key = _cfg_get(la_cfg, "video_key", None) or self.modality_keys["video"][0]
         if not str(video_key).startswith("video."):
