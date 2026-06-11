@@ -116,12 +116,43 @@ class LatentActionLeRobotSingleDataset(LeRobotSingleDataset):
         if not str(video_key).startswith("video."):
             video_key = f"video.{video_key}"
         image_size = tuple(_cfg_get(la_cfg, "image_size", [224, 224]))
-        sample["la_frames"] = [
-            frame.resize(image_size)
-            for frame in self.get_video_frames_by_offsets(int(trajectory_id), str(video_key), int(base_index), offsets)
-        ]
+
+        full_window = bool(_cfg_get(la_cfg, "full_window", False))
+        if full_window:
+            sample["la_frames"] = self._pack_full_window_frames(
+                int(trajectory_id), str(video_key), int(base_index), offsets, image_size
+            )
+        else:
+            sample["la_frames"] = [
+                frame.resize(image_size)
+                for frame in self.get_video_frames_by_offsets(
+                    int(trajectory_id), str(video_key), int(base_index), offsets
+                )
+            ]
         sample["la_frame_offsets"] = offsets
         return sample
+
+    def _pack_full_window_frames(
+        self,
+        trajectory_id: int,
+        video_key: str,
+        base_index: int,
+        offsets: list[int],
+        image_size: tuple[int, int],
+    ) -> list[list[Image.Image]]:
+        """Return all frames within each stride window as a list of clips.
+
+        For offsets [0, 16, 32], returns:
+          [[frame_0, frame_1, ..., frame_16], [frame_16, frame_17, ..., frame_32]]
+        """
+        clips = []
+        for i in range(len(offsets) - 1):
+            window_offsets = list(range(offsets[i], offsets[i + 1] + 1))
+            frames = self.get_video_frames_by_offsets(
+                trajectory_id, video_key, base_index, window_offsets
+            )
+            clips.append([frame.resize(image_size) for frame in frames])
+        return clips
 
     def get_video_frames_by_offsets(
         self,

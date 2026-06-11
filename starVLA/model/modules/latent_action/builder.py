@@ -16,4 +16,8 @@ def build_latent_action_encoder(config) -> BaseLatentActionEncoder:
         from starVLA.model.modules.latent_action.unit_encoder import UniTVisualLatentActionEncoder
 
         return UniTVisualLatentActionEncoder(config)
+    if backend == "villax":
+        from starVLA.model.modules.latent_action.villax_encoder import VillaXLatentActionEncoder
+
+        return VillaXLatentActionEncoder(config)
     raise NotImplementedError(f"Latent-action backend `{backend}` is not implemented.")

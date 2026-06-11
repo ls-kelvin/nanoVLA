@@ -1,10 +1,13 @@
 """QwenPI_v3 with pluggable latent-action generation."""
 
+import copy
 from typing import List, Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenPI_v3 import Qwen_PI_v3
@@ -29,6 +32,7 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
         self.latent_action_enabled = bool(self.latent_action_cfg.get("enabled", True))
+        self.latent_action_backend = str(self.latent_action_cfg.get("backend", "univla")).lower()
         self.latent_action_mode = self._get_latent_action_mode()
         self.train_latent_action = bool(self.latent_action_cfg.get("train_latent", True))
         self.train_continuous_action = bool(self.latent_action_cfg.get("train_action", True))
@@ -38,7 +42,23 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
         self.latent_action_token_ids: list[int] = []
         self.latent_action_id_to_token: dict[int, str] = {}
         self.latent_action_query_token_ids: list[int] = []
-        if self.latent_action_enabled:
+        self.softvq_input_proj = None
+        self.softvq_output_proj = None
+
+        if self.latent_action_backend == "softvq":
+            # SoftVQ is a continuous soft-distribution objective; it does not use
+            # the discrete latent-action token vocabulary or the la_mask attention
+            # path. Instead it projects the target distribution into / out of the
+            # LLM hidden space and aligns via KL (see _softvq_kl_loss_from_cache).
+            self.num_bridge_tokens = int(self.latent_action_cfg.get("num_bridge_tokens", 1))
+            self.num_codebooks = int(self.latent_action_cfg.get("num_codebooks", 1))
+            self.codebook_size = int(self.latent_action_cfg.codebook_size)
+            if self.num_codebooks != 1:
+                raise ValueError("QwenPI_v3_LA softvq requires latent_action.num_codebooks=1.")
+            hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
+            self.softvq_input_proj = nn.Linear(self.codebook_size, hidden_size)
+            self.softvq_output_proj = nn.Linear(hidden_size, self.codebook_size)
+        elif self.latent_action_enabled:
             self._expand_latent_action_tokens()
 
         self.latent_action_encoder = None
@@ -46,6 +66,13 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             self.latent_action_encoder = build_latent_action_encoder(self.config)
 
         self._printed_training_sample = False
+
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+        keys_to_remove = [key for key in state_dict if key.startswith("latent_action_encoder.")]
+        for key in keys_to_remove:
+            del state_dict[key]
+        return state_dict
 
     def _ensure_latent_action_defaults(self) -> None:
         from omegaconf import OmegaConf
@@ -65,6 +92,14 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             "token_format": "<robot_action_{i}>",
             "query_token_format": "<robot_action_query_{i}>",
             "latent_generation_max_extra_tokens": None,
+            # SoftVQ latent-action loss (vision-only KL). Mirrors QwenMetaQuery_LA:
+            # the soft target distribution is projected into the LLM as suffix
+            # embeddings and the suffix hidden states predict an aligned
+            # categorical distribution via KL. These keys are only consumed when
+            # backend == "softvq".
+            "num_bridge_tokens": 1,
+            "num_codebooks": 1,
+            "strict_num_bridge_tokens": True,
             "univla": {
                 "ckpt_path": None,
                 "model_dim": 768,
@@ -77,9 +112,28 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
                 "image_size": [224, 224],
                 "strict_load": True,
             },
+            "softvq": {
+                "config_path": None,
+                "ckpt_path": None,
+                "image_size": [256, 256],
+                "strict_load": False,
+                "kl_eps": 1e-8,
+            },
         }
         current = self.config.framework.get("latent_action", {})
-        self.config.framework.latent_action = OmegaConf.merge(OmegaConf.create(defaults), current)
+        backend = str(current.get("backend", defaults["backend"])).lower()
+        backend_defaults = {}
+        if backend == "softvq":
+            backend_defaults = {
+                "num_bridge_tokens": 1,
+                "num_codebooks": 1,
+                "codebook_size": 64,
+            }
+        self.config.framework.latent_action = OmegaConf.merge(
+            OmegaConf.create(defaults),
+            OmegaConf.create(backend_defaults),
+            current,
+        )
 
     def _get_latent_action_mode(self) -> str:
         mode = str(self.latent_action_cfg.get("mode", "ar")).lower()
@@ -493,7 +547,265 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
             return loss * 0.0
         return loss * (dist.get_world_size() * float(local_count) / count)
 
+    # ──────────────────────────────────────────────────────────────────
+    #  SoftVQ latent-action path (KV-cache split, action/latent independent)
+    # ──────────────────────────────────────────────────────────────────
+    def _run_prefix_cache(self, batch_images: List, instructions: List[str]):
+        """Single multimodal prefill that returns the KV cache and the per-layer
+        prompt hidden states (the action branch reads these directly; the latent
+        branch continues the suffix from the cache)."""
+        prefix_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            prefix_outputs = self.qwen_vl_interface(
+                **prefix_inputs,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        past_key_values = getattr(prefix_outputs, "past_key_values", None)
+        if past_key_values is None:
+            raise RuntimeError(
+                "QwenPI_v3_LA softvq requires use_cache=True to return past_key_values. "
+                "Disable incompatible gradient-checkpointing/cache settings for this framework."
+            )
+        return prefix_inputs, past_key_values, prefix_outputs
+
+    @staticmethod
+    def _branch_cache(past_key_values):
+        """Per-branch cache that shares the prefix KV tensors but appends into its
+        own copy. ``DynamicLayer.update`` reassigns ``self.keys = torch.cat(...)``
+        (not in place), so shallow-copied layers append into fresh slots while the
+        prefix tensors stay shared with the original cache and gradients still flow
+        back through them. ``copy.deepcopy`` would detach the prefix tensors."""
+        branch = copy.copy(past_key_values)
+        branch.layers = [copy.copy(layer) for layer in past_key_values.layers]
+        return branch
+
+    def _run_suffix_embeds_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        suffix_embeds: torch.Tensor,
+        output_hidden_states: bool = True,
+    ):
+        input_ids = prefix_inputs["input_ids"]
+        attention_mask = prefix_inputs["attention_mask"]
+        batch_size = input_ids.shape[0]
+        if suffix_embeds.ndim != 3 or suffix_embeds.shape[0] != batch_size:
+            raise ValueError(f"Suffix embeds must be shaped [batch, suffix_len, hidden], got {tuple(suffix_embeds.shape)}.")
+        prefix_len = past_key_values.get_seq_length()
+        suffix_embeds = suffix_embeds.to(input_ids.device)
+        suffix_mask = torch.ones(
+            suffix_embeds.shape[:2],
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        branch_attention_mask = torch.cat([attention_mask, suffix_mask], dim=1)
+        cache_position = torch.arange(
+            prefix_len, prefix_len + suffix_embeds.shape[1], device=suffix_embeds.device
+        )
+        return self.qwen_vl_interface(
+            inputs_embeds=suffix_embeds,
+            attention_mask=branch_attention_mask,
+            past_key_values=self._branch_cache(past_key_values),
+            cache_position=cache_position,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+
+    def _make_softvq_targets(self, examples: List[dict]) -> torch.Tensor:
+        if self.latent_action_encoder is None:
+            raise RuntimeError("Latent-action encoder is not initialized.")
+        if not hasattr(self.latent_action_encoder, "encode_distribution"):
+            raise RuntimeError("SoftVQ latent-action encoder must implement encode_distribution().")
+
+        frame_pairs = []
+        pair_counts = []
+        for example in examples:
+            frames = example.get("la_frames", None)
+            if frames is None or len(frames) < 2:
+                raise ValueError(
+                    "QwenPI_v3_LA softvq requires `la_frames` with at least two frames. "
+                    "Use datasets.vla_data.dataset_py=lerobot_la_datasets and enable latent_action."
+                )
+            pair_counts.append(len(frames) - 1)
+            for i in range(len(frames) - 1):
+                frame_pairs.append((frames[i], frames[i + 1]))
+
+        if len(set(pair_counts)) != 1:
+            raise ValueError(
+                "QwenPI_v3_LA softvq requires the same number of SoftVQ frame pairs per batch "
+                "because suffix embeddings are batched without padding, got pair counts "
+                f"{pair_counts}. Tune latent_action.horizon_overrides so every embodiment "
+                "yields the same pair count."
+            )
+        pair_count = pair_counts[0]
+
+        distributions = self.latent_action_encoder.encode_distribution(frame_pairs)
+        if distributions.ndim != 3:
+            raise ValueError(f"SoftVQ encoder must return [num_pairs, tokens, codebook], got {tuple(distributions.shape)}.")
+        if distributions.shape[0] != len(frame_pairs):
+            raise ValueError(
+                f"SoftVQ encoder returned {distributions.shape[0]} pairs, "
+                f"but {len(frame_pairs)} frame pairs were provided."
+            )
+        if bool(self.latent_action_cfg.get("strict_num_bridge_tokens", True)):
+            if distributions.shape[1] != self.num_bridge_tokens:
+                raise ValueError(
+                    f"SoftVQ encoder returned {distributions.shape[1]} tokens, "
+                    f"but latent_action.num_bridge_tokens={self.num_bridge_tokens}."
+                )
+        elif distributions.shape[1] < self.num_bridge_tokens:
+            raise ValueError(
+                f"SoftVQ encoder returned {distributions.shape[1]} tokens, "
+                f"fewer than latent_action.num_bridge_tokens={self.num_bridge_tokens}."
+            )
+        if distributions.shape[-1] != self.codebook_size:
+            raise ValueError(
+                f"SoftVQ encoder returned codebook size {distributions.shape[-1]}, "
+                f"but latent_action.codebook_size={self.codebook_size}."
+            )
+
+        distributions = distributions[:, : self.num_bridge_tokens]
+        distributions = distributions.reshape(len(examples), pair_count * self.num_bridge_tokens, self.codebook_size)
+        return distributions
+
+    def _collect_la_padding_mask(self, examples: List[dict]) -> torch.Tensor:
+        """Per-sample mask (1.0=keep, 0.0=padded) for the SoftVQ latent-action loss.
+
+        Samples whose latent-action frame window ran past the trajectory end were
+        clamped/repeated by the dataset, producing degenerate frame pairs the
+        tokenizer never saw. They are excluded from the KL objective.
+        """
+        flags = [bool(example.get("la_padded", False)) for example in examples]
+        return torch.tensor([0.0 if padded else 1.0 for padded in flags], dtype=torch.float32)
+
+    def _softvq_kl_loss_from_cache(
+        self,
+        prefix_inputs: dict,
+        past_key_values,
+        target_distributions: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> dict:
+        if self.softvq_input_proj is None or self.softvq_output_proj is None:
+            raise RuntimeError("SoftVQ projection heads are not initialized.")
+
+        target_distributions = target_distributions.to(prefix_inputs["input_ids"].device).float()
+        eps = float(self.latent_action_cfg.get("softvq", {}).get("kl_eps", 1e-8))
+        target_probs = target_distributions.clamp_min(eps)
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        suffix_embeds = self.softvq_input_proj(target_probs).to(dtype=self.qwen_vl_interface.model.dtype)
+        outputs = self._run_suffix_embeds_from_cache(prefix_inputs, past_key_values, suffix_embeds)
+        hidden = outputs.hidden_states[-1]
+        logits = self.softvq_output_proj(hidden)
+        if logits.shape != target_probs.shape:
+            raise ValueError(f"SoftVQ logits shape {tuple(logits.shape)} does not match target {tuple(target_probs.shape)}.")
+
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        kl_per_sample = F.kl_div(log_probs, target_probs, reduction="none").sum(dim=-1).mean(dim=1)
+        entropy_per_sample = -(target_probs * target_probs.log()).sum(dim=-1).mean(dim=1)
+        max_prob_per_sample = target_probs.max(dim=-1).values.mean(dim=1)
+
+        if valid_mask is None:
+            valid_mask = torch.ones_like(kl_per_sample)
+        else:
+            valid_mask = valid_mask.to(kl_per_sample.device, dtype=kl_per_sample.dtype)
+        valid_count = int(valid_mask.sum().item())
+        denom = valid_mask.sum().clamp_min(1.0)
+
+        kl_loss = (kl_per_sample * valid_mask).sum() / denom
+        entropy = (entropy_per_sample * valid_mask).sum() / denom
+        max_prob = (max_prob_per_sample * valid_mask).sum() / denom
+        kl_loss = self._scale_action_loss_for_global_mean(kl_loss, valid_count)
+        return {
+            "latent_action_loss": kl_loss,
+            "latent_softvq_kl_loss": kl_loss,
+            "latent_softvq_target_entropy": entropy,
+            "latent_softvq_target_max_prob": max_prob,
+        }
+
+    def _forward_softvq(self, examples: List[dict]) -> dict:
+        batch_images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+        instructions, _ = self._resolve_state_inputs(instructions, state)
+
+        prefix_inputs, past_key_values, prefix_outputs = self._run_prefix_cache(batch_images, instructions)
+        self._print_training_sample_once(examples, instructions, None)
+
+        continuous_action_loss = None
+        action_train_batch_size = 0
+        if self.train_continuous_action:
+            if self.action_model is None or self.num_action_dit_layers <= 0:
+                raise RuntimeError("Action model is not initialized. Set latent_action.train_action=true.")
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vl_embs_list = self._project_vl_hidden_for_action(
+                    list(prefix_outputs.hidden_states[-self.num_action_dit_layers :])
+                )
+            backbone_attention_mask = prefix_inputs.get("attention_mask", None)
+            action_examples, action_vl_embs_list, action_attention_mask = self._select_action_training_batch(
+                examples,
+                vl_embs_list,
+                backbone_attention_mask,
+            )
+            action_train_batch_size = len(action_examples)
+            if action_examples:
+                continuous_action_loss = self._continuous_action_loss(
+                    action_examples,
+                    action_vl_embs_list,
+                    action_attention_mask,
+                )
+            else:
+                dummy_attention_mask = (
+                    backbone_attention_mask[:1] if backbone_attention_mask is not None else None
+                )
+                continuous_action_loss = self._continuous_action_loss(
+                    examples[:1],
+                    [hidden[:1] for hidden in vl_embs_list],
+                    dummy_attention_mask,
+                ) * 0.0
+            continuous_action_loss = self._scale_action_loss_for_global_mean(
+                continuous_action_loss,
+                action_train_batch_size,
+            )
+
+        latent_outputs = {}
+        latent_action_loss = None
+        if self.train_latent_action:
+            gt_distributions = self._make_softvq_targets(examples)
+            la_valid_mask = self._collect_la_padding_mask(examples)
+            latent_outputs = self._softvq_kl_loss_from_cache(
+                prefix_inputs, past_key_values, gt_distributions, la_valid_mask
+            )
+            latent_action_loss = latent_outputs["latent_action_loss"]
+
+        total_loss = None
+        if continuous_action_loss is not None:
+            total_loss = continuous_action_loss * float(self.latent_action_cfg.action_loss_weight)
+        if latent_action_loss is not None:
+            weighted_latent = latent_action_loss * float(self.latent_action_cfg.latent_loss_weight)
+            total_loss = weighted_latent if total_loss is None else total_loss + weighted_latent
+        if total_loss is None:
+            raise RuntimeError("No loss was computed. Check latent_action.train_latent/train_action config.")
+
+        out = {"total_loss": total_loss, "action_loss": total_loss}
+        if continuous_action_loss is not None:
+            out["action_dit_loss"] = continuous_action_loss
+            out["action_dis_loss"] = continuous_action_loss
+            out["action_train_batch_size"] = action_train_batch_size
+        if latent_action_loss is not None:
+            out["latent_action_loss"] = latent_action_loss
+        out.update(latent_outputs)
+        return out
+
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
+        if self.latent_action_backend == "softvq":
+            return self._forward_softvq(examples)
+
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
@@ -598,6 +910,11 @@ class Qwen_PI_v3_LA(Qwen_PI_v3):
     def predict_action(self, examples: List[dict] = None, **kwargs: str) -> dict:
         if not self.train_continuous_action or self.action_model is None:
             raise RuntimeError("Cannot predict continuous actions when latent_action.train_action=false.")
+        # SoftVQ keeps the action branch independent of the latent objective and
+        # relies on future frames that are unavailable at inference, so action
+        # prediction is exactly the base QwenPI_v3 prompt-only path.
+        if self.latent_action_backend == "softvq":
+            return Qwen_PI_v3.predict_action(self, examples=examples, **kwargs)
         if not self._should_use_latent_for_action():
             return super().predict_action(examples=examples, **kwargs)
 

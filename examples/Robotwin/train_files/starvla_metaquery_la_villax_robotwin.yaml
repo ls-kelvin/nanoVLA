@@ -1,14 +1,15 @@
-run_id: qwen_metaquery_la_univla_robotwin
+run_id: qwen_metaquery_la_villax_robotwin
 run_root_dir: results/Checkpoints
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.2"
 
-# QwenMetaQuery_LA with auxiliary latent-action prediction head.
-# Uses N x Qwen3VL TextDecoderLayer blocks to predict UniVLA latent codes
-# from the metaquery last hidden states.  Inference is identical to
-# vanilla QwenMetaQuery — the predictor is not used at test time.
+# QwenMetaQuery_LA with auxiliary latent-action prediction head (villa-x).
+# Uses N x Qwen3VL TextDecoderLayer blocks to predict villa-x VQ codes
+# from the metaquery last hidden states.  Each query position predicts
+# codes_per_query (4) VQ codes.  Inference is identical to vanilla
+# QwenMetaQuery — the predictor is not used at test time.
 framework:
   name: QwenMetaQuery_LA
   qwenvl:
@@ -20,16 +21,16 @@ framework:
 
   latent_action:
     enabled: true
-    backend: univla
+    backend: villax
     loss_type: ce
     action_train_robot_types: ["aloha-agilex"]
-    univla:
-      ckpt_path: ./playground/Pretrained_models/UniVLA/lam-stage-2.ckpt
+    villax:
+      ckpt_path: ./playground/Pretrained_models/villa-x/lam
       image_size: [224, 224]
-      strict_load: true
+      d_t: 8
     num_bridge_tokens: 4
     num_codebooks: 1
-    codebook_size: 16
+    codebook_size: 32
     label_smoothing: 0.0
     loss_weight: 0.1
     action_loss_weight: 1.0
@@ -65,6 +66,7 @@ datasets:
     latent_action:
       enabled: true
       stride: 16
+      full_window: true
       video_key: cam_high
       include_terminal_frame: true
       image_size: [224, 224]
