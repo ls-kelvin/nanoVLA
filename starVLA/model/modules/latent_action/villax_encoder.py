@@ -1,6 +1,5 @@
-"""villa-x (IgorModel) latent action encoder for QwenMetaQuery_LA."""
+"""VillaX (IgorModel) latent action encoder for QwenMetaQuery_LA."""
 
-import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -9,12 +8,11 @@ import torch
 from PIL import Image
 
 from starVLA.model.modules.latent_action.interface import BaseLatentActionEncoder
-
-_VILLAX_DIR = str(Path(__file__).resolve().parents[4] / "third_party" / "villa-x")
+from starVLA.model.modules.latent_action.villax_model import IgorModel
 
 
 class VillaXLatentActionEncoder(BaseLatentActionEncoder):
-    """Frozen villa-x IgorModel wrapper for clip-based latent action encoding.
+    """Frozen VillaX IgorModel wrapper for clip-based latent action encoding.
 
     Each clip of d_t frames produces (d_t - 1) latent actions, each represented
     by ``num_learned_tokens`` VQ codes from a codebook of size ``n_codes``.
@@ -30,18 +28,22 @@ class VillaXLatentActionEncoder(BaseLatentActionEncoder):
             raise ValueError("framework.latent_action.villax.ckpt_path is required for backend='villax'.")
         ckpt_path = str(ckpt_path)
         if not Path(ckpt_path).exists():
-            raise FileNotFoundError(f"villa-x checkpoint not found: {ckpt_path}")
+            raise FileNotFoundError(f"VillaX checkpoint not found: {ckpt_path}")
 
         self.image_size = tuple(villax_cfg.get("image_size", [224, 224]))
-        self.d_t = int(villax_cfg.get("d_t", 8))
-
-        if _VILLAX_DIR not in sys.path:
-            sys.path.insert(0, _VILLAX_DIR)
-        from lam import IgorModel
+        self.d_t = int(la_cfg.get("num_bridge_tokens", 7)) + 1
 
         self.model: IgorModel = IgorModel.from_pretrained(ckpt_path)
         self.model.eval()
         self.model.requires_grad_(False)
+
+        checkpoint_d_t = int(self.model.config.d_t)
+        if self.d_t != checkpoint_d_t:
+            raise ValueError(
+                "VillaX uses latent_action.num_bridge_tokens + 1 as d_t, "
+                f"got num_bridge_tokens={self.d_t - 1} (d_t={self.d_t}) but "
+                f"checkpoint d_t={checkpoint_d_t}."
+            )
 
         self._num_learned_tokens = self.model.config.num_learned_tokens
         self._n_codes = self.model.config.n_codes
@@ -64,14 +66,10 @@ class VillaXLatentActionEncoder(BaseLatentActionEncoder):
         return self._n_codes
 
     def _image_to_tensor(self, image: Image.Image) -> torch.Tensor:
-        """Convert PIL image to [C, H, W] float32 tensor in [0, 255] range.
-
-        villa-x's internal preprocess applies ImageNet normalization (divides
-        by 255 then normalizes), so we keep the raw pixel scale here.
-        """
+        """Convert PIL image to [C, H, W] float32 tensor in [0, 255] range."""
         image = image.convert("RGB").resize(self.image_size)
         arr = np.asarray(image, dtype=np.float32)
-        return torch.from_numpy(arr).permute(2, 0, 1)  # [C, H, W], values in [0, 255]
+        return torch.from_numpy(arr).permute(2, 0, 1)
 
     def _sample_frames(self, frames: list[Image.Image]) -> list[Image.Image]:
         """Uniformly sample d_t frames from a frame list using linspace."""
@@ -100,13 +98,13 @@ class VillaXLatentActionEncoder(BaseLatentActionEncoder):
         tensors = []
         for clip_frames in clips:
             sampled = self._sample_frames(clip_frames)
-            frame_tensors = torch.stack([self._image_to_tensor(f) for f in sampled], dim=0)  # [d_t, C, H, W]
+            frame_tensors = torch.stack([self._image_to_tensor(f) for f in sampled], dim=0)
             tensors.append(frame_tensors)
 
-        batch = torch.stack(tensors, dim=0).to(device=self.device, dtype=self.dtype)  # [num_clips, d_t, C, H, W]
+        batch = torch.stack(tensors, dim=0).to(device=self.device, dtype=torch.float32)
 
         result = self.model.idm(batch, return_dict=True)
-        indices = result["indices"]  # flat: [num_clips * (d_t-1) * num_learned_tokens]
+        indices = result["indices"]
 
         num_clips = len(clips)
         transitions = self.d_t - 1
@@ -119,11 +117,7 @@ class VillaXLatentActionEncoder(BaseLatentActionEncoder):
         frame_pairs: Sequence[Sequence[Image.Image]],
         instructions: Sequence[str] | None = None,
     ) -> torch.LongTensor:
-        """Fallback pair-wise interface: treat each pair as a 2-frame clip.
-
-        Returns:
-            Tensor of shape ``[num_pairs, num_learned_tokens]`` with VQ indices.
-        """
+        """Fallback pair-wise interface: treat each pair as a 2-frame clip."""
         if not frame_pairs:
             return torch.empty((0, self._num_learned_tokens), dtype=torch.long, device=self.device)
 
@@ -133,13 +127,13 @@ class VillaXLatentActionEncoder(BaseLatentActionEncoder):
         for pair in clips:
             if len(pair) != 2:
                 raise ValueError(f"Expected 2 frames per pair, got {len(pair)}.")
-            frame_tensors = torch.stack([self._image_to_tensor(f) for f in pair], dim=0)  # [2, C, H, W]
+            frame_tensors = torch.stack([self._image_to_tensor(f) for f in pair], dim=0)
             tensors.append(frame_tensors)
 
-        batch = torch.stack(tensors, dim=0).to(device=self.device, dtype=self.dtype)  # [num_pairs, 2, C, H, W]
+        batch = torch.stack(tensors, dim=0).to(device=self.device, dtype=torch.float32)
 
         result = self.model.idm(batch, return_dict=True)
-        indices = result["indices"]  # flat: [num_pairs * 1 * num_learned_tokens]
+        indices = result["indices"]
 
         num_pairs = len(frame_pairs)
         indices = indices.reshape(num_pairs, self._num_learned_tokens)

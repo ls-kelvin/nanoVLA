@@ -10,12 +10,12 @@ export WANDB_MODE=offline
 
 Framework_name=QwenMetaQuery_LA
 freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
-config_yaml=./examples/Robotwin/train_files/starvla_metaquery_la_robotwin.yaml
+base_vlm=playground/Pretrained_models/RynnBrain-2B
+config_yaml=./examples/Robotwin/train_files/starvla_metaquery_la_unit_robotwin.yaml
 run_root_dir=./results/Checkpoints
 data_mix=robotwin32_cross_place_phone_stand
-run_id=0609_${data_mix}_qwen_metaquery_la
-batch_size=16
+run_id=0612_${data_mix}_qwen_metaquery_la_unit
+batch_size=32
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p "${output_dir}"
@@ -43,7 +43,7 @@ accelerate launch \
   --trainer.eval_interval 500 \
   --trainer.eval_num_samples 512 \
   --trainer.eval_batch_size ${batch_size} \
-  --trainer.gradient_accumulation_steps 2 \
+  --trainer.gradient_accumulation_steps 1 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_project starVLA_Robotwin

@@ -389,6 +389,8 @@ DATASET_NAMED_MIXTURES = {
         ("place_phone_stand/piper/randomized", 1.0, "robotwin32"),
         ("place_phone_stand/ur5/clean", 1.0, "robotwin32"), 
         ("place_phone_stand/ur5/randomized", 1.0, "robotwin32"),
+        ("place_phone_stand/franka/clean", 1.0, "robotwin32"), 
+        ("place_phone_stand/franka/randomized", 1.0, "robotwin32"),
     ],
     "robotwin_cross_place_phone_stand_10": [
         ("place_phone_stand/aloha-agilex/clean", 10.0, "robotwin50"), 
@@ -413,5 +415,9 @@ DATASET_NAMED_MIXTURES = {
     "robotwin32_aloha_place_phone_stand": [
         ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin32"), 
         ("place_phone_stand/aloha-agilex/randomized", 1.0, "robotwin32"),
+    ],
+    "robotwin32_aloha_hanging_mug": [
+        ("hanging_mug/aloha-agilex/clean", 1.0, "robotwin32"), 
+        ("hanging_mug/aloha-agilex/randomized", 1.0, "robotwin32"),
     ],
 }

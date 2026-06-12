@@ -560,6 +560,35 @@ class TrainerUtils:
         return prepared_components
 
     @staticmethod
+    def _iter_datasets_from_dataloader(dataloader):
+        seen = set()
+        stack = [dataloader]
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+
+            dataset = getattr(obj, "dataset", None)
+            if dataset is not None:
+                yield dataset
+                stack.append(dataset)
+
+            for attr_name in ("dataloader", "base_dataloader", "_dataloader"):
+                child = getattr(obj, attr_name, None)
+                if child is not None:
+                    stack.append(child)
+
+    @staticmethod
+    def update_dynamic_sampling_weights(dataloader, step: int) -> dict:
+        """Update a dataloader's dataset sampling weights if it supports step schedules."""
+        for dataset in TrainerUtils._iter_datasets_from_dataloader(dataloader):
+            set_sampling_step = getattr(dataset, "set_sampling_step", None)
+            if callable(set_sampling_step):
+                return set_sampling_step(step)
+        return {}
+
+    @staticmethod
     def euclidean_distance(predicted: np.ndarray, ground_truth: np.ndarray) -> float:
         return np.linalg.norm(predicted - ground_truth)
 

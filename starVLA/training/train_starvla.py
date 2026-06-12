@@ -346,6 +346,7 @@ class VLATrainer(TrainerUtils):
     def train(self):
         """Execute training loop."""
         self._log_training_config()
+        self.update_dynamic_sampling_weights(self.vla_train_dataloader, self.completed_steps)
         self._create_data_iterators()
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
@@ -354,12 +355,16 @@ class VLATrainer(TrainerUtils):
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
+            sampling_metrics = self.update_dynamic_sampling_weights(
+                self.vla_train_dataloader, self.completed_steps
+            )
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_vla)
+            step_metrics.update(sampling_metrics)
             t_end_model = time.perf_counter()
 
             did_optimizer_step = self.accelerator.sync_gradients
@@ -509,6 +514,8 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        profile_la_timing = os.getenv("PROFILE_LA_TIMING", "0").lower() in {"1", "true", "yes", "on"}
+        backward_optim_start = None
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -519,6 +526,11 @@ class VLATrainer(TrainerUtils):
                     action_dit_loss = output_dict["continuous_action_loss"]
                 else:
                     action_dit_loss = output_dict["action_loss"]
+
+            if profile_la_timing:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                backward_optim_start = time.perf_counter()
 
             self.accelerator.backward(total_loss)
 
@@ -535,6 +547,11 @@ class VLATrainer(TrainerUtils):
                 self.lr_scheduler.step()
             self.optimizer.zero_grad()
 
+            if profile_la_timing and backward_optim_start is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                output_dict["timing/backward_optim"] = time.perf_counter() - backward_optim_start
+
         log_dict = {
             "total_loss": total_loss.item(),
             "action_dit_loss": action_dit_loss.item(),
@@ -543,6 +560,9 @@ class VLATrainer(TrainerUtils):
             log_dict["latent_action_loss"] = output_dict["latent_action_loss"].item()
         if "action_train_batch_size" in output_dict:
             log_dict["action_train_batch_size"] = output_dict["action_train_batch_size"]
+        for key, value in output_dict.items():
+            if key.startswith("timing/"):
+                log_dict[key] = float(value)
         return log_dict
 
     def _finalize_training(self):

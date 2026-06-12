@@ -276,6 +276,7 @@ class VLAMTrainer(TrainerUtils):
     def train(self):
         """Execute training loop."""
         self._log_training_config()
+        self.update_dynamic_sampling_weights(self.vla_train_dataloader, self.completed_steps)
         self._create_data_iterators()
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
@@ -284,12 +285,16 @@ class VLAMTrainer(TrainerUtils):
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
+            sampling_metrics = self.update_dynamic_sampling_weights(
+                self.vla_train_dataloader, self.completed_steps
+            )
             t_start_data = time.perf_counter()
             batch_vla, batch_vlm = self._get_next_batch()
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_vla, batch_vlm)
+            step_metrics.update(sampling_metrics)
             t_end_model = time.perf_counter()
 
             did_optimizer_step = self.accelerator.sync_gradients

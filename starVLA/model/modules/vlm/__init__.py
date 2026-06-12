@@ -6,7 +6,7 @@ def get_vlm_model(config):
         from .QWen2_5 import _QWen_VL_Interface
 
         return _QWen_VL_Interface(config)
-    elif "Qwen3-VL" in vlm_name:
+    elif "Qwen3-VL" in vlm_name or "rynnbrain" in vlm_name.lower():
         from .QWen3 import _QWen3_VL_Interface
 
         return _QWen3_VL_Interface(config)

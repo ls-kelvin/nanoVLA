@@ -5,8 +5,8 @@ set -euo pipefail
 # QwenMetaQuery_LA with auxiliary latent-action prediction head (villa-x) on RoboTwin.
 #
 # The LatentPredictor uses N x Qwen3VL TextDecoderLayer blocks.  Each query
-# position predicts 4 VQ codes (codes_per_query=4, codebook_size=32) from
-# the metaquery last hidden states.
+# position predicts 4 VQ codes (num_learned_tokens=4, codebook_size=32) from
+# the metaquery last hidden states.  num_bridge_tokens controls d_t - 1.
 # Inference is identical to vanilla QwenMetaQuery.
 ###########################################################################################
 
@@ -19,7 +19,7 @@ base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
 config_yaml=./examples/Robotwin/train_files/starvla_metaquery_la_villax_robotwin.yaml
 run_root_dir=./results/Checkpoints
 data_mix=robotwin32_cross_place_phone_stand
-run_id=0611_${data_mix}_qwen_metaquery_la_villax
+run_id=0611_${data_mix}_qwen_metaquery_la_villax_test
 batch_size=32
 villax_ckpt=/inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/models/villa-x/lam
 
@@ -27,9 +27,11 @@ output_dir=${run_root_dir}/${run_id}
 mkdir -p "${output_dir}"
 cp "$0" "${output_dir}/"
 
+export PROFILE_LA_TIMING=1
+
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
+  --num_processes 2 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
   --framework.name ${Framework_name} \

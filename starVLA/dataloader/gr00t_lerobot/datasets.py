@@ -24,6 +24,7 @@ In this file, we define 3 types of datasets:
 See `scripts/load_dataset.py` for examples on how to use these datasets.
 """
 import os
+import multiprocessing as mp
 import hashlib
 import io
 import json, torch
@@ -2138,6 +2139,12 @@ def safe_hash(input_tuple):
     return seed & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 
 
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    return cfg.get(key, default) if hasattr(cfg, "get") else getattr(cfg, key, default)
+
+
 class MixtureSpecElement(BaseModel):
     dataset_path: list[Path] | Path = Field(..., description="The path to the dataset.")
     dataset_weight: float = Field(..., description="The weight of the dataset in the mixture.")
@@ -2321,26 +2328,14 @@ class LeRobotMixtureDataset(Dataset):
         print(f"Dataset lengths: {self._dataset_lengths}")
         self._getitem_count = 0
         # 2. Dataset sampling weights
-        self._dataset_sampling_weights = np.array(dataset_sampling_weights)
-        
-        if self.balance_dataset_weights:
-            self._dataset_sampling_weights *= self._dataset_lengths
-        
-        # Check for zero or negative weights before normalization
-        if np.any(self._dataset_sampling_weights <= 0):
-            print(f"Warning: Found zero or negative sampling weights: {self._dataset_sampling_weights}")
-            # Set minimum weight to prevent division issues
-            self._dataset_sampling_weights = np.maximum(self._dataset_sampling_weights, 1e-8)
-        
-        # Normalize weights
-        weights_sum = self._dataset_sampling_weights.sum()
-        if weights_sum == 0 or np.isnan(weights_sum):
-            print(f"Error: Invalid weights sum: {weights_sum}")
-            # Fallback to equal weights
-            self._dataset_sampling_weights = np.ones(len(self.datasets)) / len(self.datasets)
-            print(f"Fallback to equal weights")
-        else:
-            self._dataset_sampling_weights /= weights_sum
+        self._base_dataset_sampling_weights = np.array(dataset_sampling_weights, dtype=np.float64)
+        self._current_raw_dataset_weights = self._base_dataset_sampling_weights.copy()
+        self._dataset_sampling_weights = np.zeros(len(self.datasets), dtype=np.float64)
+        self._dataset_sampling_weights_shared = mp.Array("d", len(self.datasets), lock=False)
+        self._dynamic_sampling_config = _cfg_get(self.data_cfg, "dynamic_sampling_weights", None)
+        self._dynamic_sampling_enabled = bool(_cfg_get(self._dynamic_sampling_config, "enabled", False))
+        self._last_sampling_step = None
+        self.set_sampling_step(0, force=True)
 
         # 3. Trajectory sampling weights
         self._trajectory_sampling_weights: list[np.ndarray] = []
@@ -2393,6 +2388,8 @@ class LeRobotMixtureDataset(Dataset):
     @property
     def dataset_sampling_weights(self) -> np.ndarray:
         """The sampling weights for each dataset."""
+        if hasattr(self, "_dataset_sampling_weights_shared"):
+            return np.frombuffer(self._dataset_sampling_weights_shared, dtype=np.float64).copy()
         return self._dataset_sampling_weights
 
     @property
@@ -2414,6 +2411,107 @@ class LeRobotMixtureDataset(Dataset):
             }
             dataset_descriptions.append(dataset_description)
         return json.dumps({"Mixture dataset": dataset_descriptions}, indent=2)
+
+    def _normalize_dataset_sampling_weights(self, raw_weights: np.ndarray) -> np.ndarray:
+        dataset_sampling_weights = np.array(raw_weights, dtype=np.float64)
+
+        if self.balance_dataset_weights:
+            dataset_sampling_weights *= self._dataset_lengths
+
+        if np.any(dataset_sampling_weights <= 0):
+            print(f"Warning: Found zero or negative sampling weights: {dataset_sampling_weights}")
+            dataset_sampling_weights = np.maximum(dataset_sampling_weights, 1e-8)
+
+        weights_sum = dataset_sampling_weights.sum()
+        if weights_sum == 0 or np.isnan(weights_sum):
+            print(f"Error: Invalid weights sum: {weights_sum}")
+            dataset_sampling_weights = np.ones(len(self.datasets), dtype=np.float64) / len(self.datasets)
+            print("Fallback to equal weights")
+        else:
+            dataset_sampling_weights /= weights_sum
+
+        return dataset_sampling_weights
+
+    def _write_dataset_sampling_weights(self, normalized_weights: np.ndarray) -> None:
+        self._dataset_sampling_weights = np.array(normalized_weights, dtype=np.float64)
+        for idx, weight in enumerate(self._dataset_sampling_weights):
+            self._dataset_sampling_weights_shared[idx] = float(weight)
+
+    def _dataset_matches_schedule(self, dataset: LeRobotSingleDataset, schedule) -> bool:
+        match = _cfg_get(schedule, "match", None)
+        if match is None:
+            return False
+        if isinstance(match, str):
+            patterns = [match]
+        else:
+            patterns = list(match)
+
+        match_text = "\n".join(
+            [
+                dataset.dataset_name,
+                dataset.dataset_path.as_posix(),
+                str(dataset.lerobot_info_meta.get("robot_type", "")),
+                str(dataset.tag),
+            ]
+        )
+        return any(str(pattern) in match_text for pattern in patterns)
+
+    def _scheduled_weight(self, schedule, step: int, fallback_weight: float) -> float:
+        steps = list(_cfg_get(schedule, "steps", []))
+        weights = list(_cfg_get(schedule, "weights", []))
+        if not steps and not weights:
+            raise ValueError("Dynamic sampling schedule requires non-empty steps and weights lists.")
+        if len(steps) != len(weights):
+            raise ValueError(
+                f"Dynamic sampling schedule steps and weights must have the same length, "
+                f"got {len(steps)} and {len(weights)}."
+            )
+
+        steps = [int(s) for s in steps]
+        weights = [float(w) for w in weights]
+        if any(curr <= prev for prev, curr in zip(steps, steps[1:])):
+            raise ValueError(f"Dynamic sampling schedule steps must be strictly increasing: {steps}")
+
+        scheduled_weight = float(fallback_weight)
+        for switch_step, weight in zip(steps, weights):
+            if step < switch_step:
+                break
+            scheduled_weight = weight
+        return scheduled_weight
+
+    def _raw_dataset_weights_for_step(self, step: int) -> np.ndarray:
+        raw_weights = self._base_dataset_sampling_weights.copy()
+        if not self._dynamic_sampling_enabled:
+            return raw_weights
+
+        schedules = _cfg_get(self._dynamic_sampling_config, "schedules", [])
+        for schedule in schedules:
+            for idx, dataset in enumerate(self.datasets):
+                if self._dataset_matches_schedule(dataset, schedule):
+                    raw_weights[idx] = self._scheduled_weight(schedule, step, raw_weights[idx])
+        return raw_weights
+
+    def set_sampling_step(self, step: int, force: bool = False) -> dict[str, float]:
+        """Update dynamic dataset sampling weights for the given optimizer step."""
+        step = int(step)
+        if not self._dynamic_sampling_enabled and not force and self._last_sampling_step is not None:
+            return {}
+        if not force and self._last_sampling_step == step:
+            return {}
+
+        raw_weights = self._raw_dataset_weights_for_step(step)
+        normalized_weights = self._normalize_dataset_sampling_weights(raw_weights)
+        self._current_raw_dataset_weights = raw_weights
+        self._write_dataset_sampling_weights(normalized_weights)
+        self._last_sampling_step = step
+
+        if not self._dynamic_sampling_enabled:
+            return {}
+
+        return {
+            "dynamic_sampling/raw_weight_min": float(np.min(raw_weights)),
+            "dynamic_sampling/raw_weight_max": float(np.max(raw_weights)),
+        }
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset.
