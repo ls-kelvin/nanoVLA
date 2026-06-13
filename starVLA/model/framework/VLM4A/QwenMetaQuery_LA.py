@@ -38,8 +38,8 @@ class LatentPredictor(nn.Module):
     hidden states, then processed by N causal Qwen3VL TextDecoderLayer blocks.
     The query positions at the output are classified into codebook indices.
 
-    When ``codes_per_query > 1`` (e.g. villax backend), each query position
-    predicts multiple VQ codes via a wider classifier head.
+    Each query position predicts ``num_codebooks`` VQ codes via a wider
+    classifier head.
     """
 
     def __init__(
@@ -48,7 +48,7 @@ class LatentPredictor(nn.Module):
         num_latent_codes: int,
         codebook_size: int,
         num_blocks: int = 2,
-        codes_per_query: int = 1,
+        num_codebooks: int = 1,
     ):
         super().__init__()
         from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
@@ -60,7 +60,7 @@ class LatentPredictor(nn.Module):
 
         self.num_latent_codes = num_latent_codes
         self.codebook_size = codebook_size
-        self.codes_per_query = codes_per_query
+        self.num_codebooks = num_codebooks
         hidden_size = vlm_text_config.hidden_size
 
         self.queries = nn.Parameter(
@@ -77,17 +77,17 @@ class LatentPredictor(nn.Module):
         )
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=predictor_config)
         self.final_norm = Qwen3VLTextRMSNorm(hidden_size, eps=vlm_text_config.rms_norm_eps)
-        self.classifier = nn.Linear(hidden_size, codes_per_query * codebook_size)
+        self.classifier = nn.Linear(hidden_size, num_codebooks * codebook_size)
 
     def forward(self, meta_hidden: torch.Tensor) -> torch.Tensor:
         """
         Args:
             meta_hidden: ``[B, num_metaqueries, H]`` from VLM last layer.
         Returns:
-            If codes_per_query == 1:
+            If num_codebooks == 1:
                 logits: ``[B, num_latent_codes, codebook_size]``.
-            If codes_per_query > 1:
-                logits: ``[B, num_latent_codes, codes_per_query, codebook_size]``.
+            If num_codebooks > 1:
+                logits: ``[B, num_latent_codes, num_codebooks, codebook_size]``.
         """
         B = meta_hidden.shape[0]
         queries = self.queries.unsqueeze(0).expand(B, -1, -1)
@@ -104,8 +104,8 @@ class LatentPredictor(nn.Module):
         latent_hidden = hidden[:, -self.num_latent_codes :, :]
         logits = self.classifier(self.final_norm(latent_hidden))
 
-        if self.codes_per_query > 1:
-            logits = logits.reshape(B, self.num_latent_codes, self.codes_per_query, self.codebook_size)
+        if self.num_codebooks > 1:
+            logits = logits.reshape(B, self.num_latent_codes, self.num_codebooks, self.codebook_size)
 
         return logits
 
@@ -186,23 +186,20 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         self.label_smoothing = float(self.latent_action_cfg.get("label_smoothing", 0.0))
 
         self.latent_predictor = None
-        self.codes_per_query = 1
         if self.latent_action_enabled:
             self.latent_action_encoder = build_latent_action_encoder(self.config)
             if self.latent_action_backend == "villax":
-                villax_cfg = self.latent_action_cfg.get("villax", {})
-                self.codes_per_query = int(villax_cfg.get("num_learned_tokens", 4))
                 villax_num_tokens = int(self.latent_action_encoder.num_learned_tokens)
                 villax_codebook_size = int(self.latent_action_encoder.n_codes)
-                if self.codes_per_query != villax_num_tokens:
+                if self.num_codebooks != villax_num_tokens:
                     logger.warning(
-                        "Overriding latent_action.villax.num_learned_tokens=%d with villa-x checkpoint "
+                        "Overriding latent_action.num_codebooks=%d with villa-x checkpoint "
                         "num_learned_tokens=%d.",
-                        self.codes_per_query,
+                        self.num_codebooks,
                         villax_num_tokens,
                     )
-                    self.codes_per_query = villax_num_tokens
-                    self.latent_action_cfg.villax.num_learned_tokens = villax_num_tokens
+                    self.num_codebooks = villax_num_tokens
+                    self.latent_action_cfg.num_codebooks = villax_num_tokens
                 if self.codebook_size != villax_codebook_size:
                     logger.warning(
                         "Overriding latent_action.codebook_size=%d with villa-x checkpoint n_codes=%d.",
@@ -211,8 +208,6 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                     )
                     self.codebook_size = villax_codebook_size
                     self.latent_action_cfg.codebook_size = villax_codebook_size
-            else:
-                self.codes_per_query = self.num_codebooks if self.latent_action_loss_type == "ce" else 1
 
             num_latent_codes = self._compute_num_latent_codes()
             num_blocks = int(self.latent_action_cfg.get("predictor", {}).get("num_blocks", 2))
@@ -225,15 +220,15 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                 num_latent_codes=num_latent_codes,
                 codebook_size=self.codebook_size,
                 num_blocks=num_blocks,
-                codes_per_query=self.codes_per_query,
+                num_codebooks=self.num_codebooks,
             )
             logger.info(
                 "LatentPredictor: %d blocks, %d latent codes, codebook_size=%d, "
-                "codes_per_query=%d, params=%.2fM",
+                "num_codebooks=%d, params=%.2fM",
                 num_blocks,
                 num_latent_codes,
                 self.codebook_size,
-                self.codes_per_query,
+                self.num_codebooks,
                 sum(p.numel() for p in self.latent_predictor.parameters()) / 1e6,
             )
 
@@ -386,7 +381,7 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         """Generate VQ targets using villa-x clip-based encoding.
 
         la_frames for villax is a list of clips (list of frame lists per window).
-        Returns targets shaped ``[B, num_queries, codes_per_query]``.
+        Returns targets shaped ``[B, num_queries, num_codebooks]``.
         """
         if self.latent_action_encoder is None:
             raise RuntimeError("Latent-action encoder is not initialized.")
@@ -420,16 +415,16 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
 
         num_windows = window_counts[0]
         d_t_minus_1 = vq_indices.shape[1]
-        codes_per_query = vq_indices.shape[2]
+        num_codebooks = vq_indices.shape[2]
         if d_t_minus_1 != self.num_bridge_tokens:
             raise ValueError(
                 f"villa-x encoder returned {d_t_minus_1} transitions per clip, "
                 f"but latent_action.num_bridge_tokens={self.num_bridge_tokens}."
             )
-        if codes_per_query != self.codes_per_query:
+        if num_codebooks != self.num_codebooks:
             raise ValueError(
-                f"villa-x encoder returned {codes_per_query} VQ codes per query, "
-                f"but latent_action.villax.num_learned_tokens={self.codes_per_query}."
+                f"villa-x encoder returned {num_codebooks} codebooks, "
+                f"but latent_action.num_codebooks={self.num_codebooks}."
             )
         num_queries = num_windows * d_t_minus_1
 
@@ -443,7 +438,7 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                 )
 
         # Reshape: [total_clips, d_t-1, codes] → [B, num_windows*(d_t-1), codes]
-        vq_indices = vq_indices.reshape(len(examples), num_queries, codes_per_query)
+        vq_indices = vq_indices.reshape(len(examples), num_queries, num_codebooks)
         return vq_indices.to(self.metaquery_suffix_ids.device)
 
     def _make_softvq_targets(self, examples: List[dict]) -> torch.Tensor:
@@ -576,10 +571,9 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         """Compute latent prediction loss.
 
         Args:
-            logits:  ``[B, N, codebook_size]`` (codes_per_query=1) or
-                     ``[B, N, codes_per_query, codebook_size]`` (codes_per_query>1)
-            targets: ``[B, N, num_codebooks]`` (discrete CE, codes_per_query=1) or
-                     ``[B, N, codes_per_query]`` (discrete CE, codes_per_query>1) or
+            logits:  ``[B, N, codebook_size]`` (num_codebooks=1) or
+                     ``[B, N, num_codebooks, codebook_size]`` (num_codebooks>1)
+            targets: ``[B, N, num_codebooks]`` (discrete CE) or
                      ``[B, N, codebook_size]`` (soft KL)
             valid_mask: ``[B]`` per-sample mask (1=keep, 0=skip) for soft_kl.
         """
@@ -592,63 +586,40 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             valid_mask = valid_mask.detach()
 
         if self.latent_action_loss_type == "ce":
-            if self.codes_per_query > 1:
-                # logits: [B, N, codes_per_query, codebook_size]
-                # targets: [B, N, codes_per_query]
-                num_codes = int(targets.shape[-1])
-                if int(logits.shape[-2]) != num_codes:
-                    raise ValueError(
-                        f"Latent predictor outputs {int(logits.shape[-2])} codes per query, "
-                        f"but targets contain {num_codes}."
-                    )
-                ce_loss_weights = self.latent_action_cfg.get("ce_loss_weights", None)
-                if ce_loss_weights is None:
-                    weights = [1.0] * num_codes
-                else:
-                    weights = [float(w) for w in ce_loss_weights]
-                    if len(weights) != num_codes:
-                        raise ValueError(
-                            f"latent_action.ce_loss_weights must have length {num_codes}, "
-                            f"got {len(weights)}."
-                        )
-
-                per_code_losses = []
-                for code_idx, weight in enumerate(weights):
-                    code_loss = F.cross_entropy(
-                        logits[:, :, code_idx, :].reshape(-1, self.codebook_size).float(),
-                        targets[:, :, code_idx].reshape(-1).long().to(logits.device),
-                        label_smoothing=self.label_smoothing,
-                    )
-                    per_code_losses.append(code_loss * weight)
-                loss = torch.stack(per_code_losses).sum() / max(sum(weights), 1e-8)
-            else:
-                num_codebooks = int(targets.shape[-1])
+            num_codebooks = int(targets.shape[-1])
+            if logits.ndim == 3:
                 if num_codebooks != 1:
                     raise ValueError(
-                        f"Latent predictor outputs one code per query, but targets contain {num_codebooks} "
-                        "codebooks. Check latent_action.num_codebooks."
+                        f"Latent predictor outputs one codebook, but targets contain {num_codebooks}."
                     )
-                ce_loss_weights = self.latent_action_cfg.get("ce_loss_weights", None)
-                if ce_loss_weights is None:
-                    weights = [1.0] * num_codebooks
-                else:
-                    weights = [float(w) for w in ce_loss_weights]
-                    if len(weights) != num_codebooks:
-                        raise ValueError(
-                            f"latent_action.ce_loss_weights must have length {num_codebooks}, "
-                            f"got {len(weights)}."
-                        )
+                logits = logits.unsqueeze(2)
+            else:
+                if int(logits.shape[-2]) != num_codebooks:
+                    raise ValueError(
+                        f"Latent predictor outputs {int(logits.shape[-2])} codebooks, "
+                        f"but targets contain {num_codebooks}."
+                    )
 
-                per_codebook_losses = []
-                for codebook_idx, weight in enumerate(weights):
-                    target_indices = targets[..., codebook_idx].long()
-                    codebook_loss = F.cross_entropy(
-                        logits.reshape(-1, self.codebook_size).float(),
-                        target_indices.reshape(-1).to(logits.device),
-                        label_smoothing=self.label_smoothing,
+            ce_loss_weights = self.latent_action_cfg.get("ce_loss_weights", None)
+            if ce_loss_weights is None:
+                weights = [1.0] * num_codebooks
+            else:
+                weights = [float(w) for w in ce_loss_weights]
+                if len(weights) != num_codebooks:
+                    raise ValueError(
+                        f"latent_action.ce_loss_weights must have length {num_codebooks}, "
+                        f"got {len(weights)}."
                     )
-                    per_codebook_losses.append(codebook_loss * weight)
-                loss = torch.stack(per_codebook_losses).sum() / max(sum(weights), 1e-8)
+
+            per_codebook_losses = []
+            for codebook_idx, weight in enumerate(weights):
+                codebook_loss = F.cross_entropy(
+                    logits[:, :, codebook_idx, :].reshape(-1, self.codebook_size).float(),
+                    targets[:, :, codebook_idx].reshape(-1).long().to(logits.device),
+                    label_smoothing=self.label_smoothing,
+                )
+                per_codebook_losses.append(codebook_loss * weight)
+            loss = torch.stack(per_codebook_losses).sum() / max(sum(weights), 1e-8)
             return {"latent_action_loss": loss, "latent_ce_loss": loss}
         elif self.latent_action_loss_type == "soft_kl":
             eps = float(self.latent_action_cfg.get("softvq", {}).get("kl_eps", 1e-8))
@@ -761,6 +732,10 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         timings[f"timing/{name}"] = time.perf_counter() - start_time
 
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
+        loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
+        if loss_mode not in {"joint", "latent", "action"}:
+            raise ValueError(f"loss_mode must be 'joint', 'latent', or 'action', got {loss_mode!r}.")
+
         profile_timing = self._profile_la_timing_enabled()
         timing_outputs: dict[str, float] = {}
 
@@ -771,22 +746,27 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         meta_embs = self._encode_metaquery_hidden_states(batch_images, instructions)
         self._stop_profile_timer(timing_outputs, "forward/vlm_metaquery", timer)
 
-        timer = self._start_profile_timer(profile_timing)
-        action_examples, action_meta_embs = self._select_action_training_batch(examples, meta_embs)
-        action_train_batch_size = len(action_examples)
-        if action_examples:
-            action_dit_loss = self._action_loss_from_meta_embs(action_examples, action_meta_embs)
-        else:
-            action_dit_loss = self._action_loss_from_meta_embs(
-                examples[:1],
-                [hidden[:1] for hidden in meta_embs],
-            ) * 0.0
-        action_dit_loss = self._scale_action_loss_for_global_mean(action_dit_loss, action_train_batch_size)
-        self._stop_profile_timer(timing_outputs, "forward/action_dit", timer)
+        action_dit_loss = None
+        action_train_batch_size = 0
+        if loss_mode in {"joint", "action"}:
+            timer = self._start_profile_timer(profile_timing)
+            action_examples, action_meta_embs = self._select_action_training_batch(examples, meta_embs)
+            action_train_batch_size = len(action_examples)
+            if action_examples:
+                action_dit_loss = self._action_loss_from_meta_embs(action_examples, action_meta_embs)
+            else:
+                action_dit_loss = self._action_loss_from_meta_embs(
+                    examples[:1],
+                    [hidden[:1] for hidden in meta_embs],
+                ) * 0.0
+            action_dit_loss = self._scale_action_loss_for_global_mean(action_dit_loss, action_train_batch_size)
+            self._stop_profile_timer(timing_outputs, "forward/action_dit", timer)
 
         latent_outputs: dict = {}
         latent_action_loss = None
-        if self.latent_action_enabled and self.latent_predictor is not None:
+        if loss_mode in {"joint", "latent"}:
+            if not self.latent_action_enabled or self.latent_predictor is None:
+                raise RuntimeError("Latent-action loss requested, but latent action is disabled or uninitialized.")
             timer = self._start_profile_timer(profile_timing)
             if self.latent_action_loss_type == "soft_kl":
                 gt_targets = self._make_softvq_targets(examples)
@@ -815,16 +795,22 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
             latent_action_loss = latent_outputs["latent_action_loss"]
             self._stop_profile_timer(timing_outputs, "forward/latent_loss", timer)
 
-        total_loss = action_dit_loss * float(self.latent_action_cfg.get("action_loss_weight", 1.0))
+        total_loss = None
+        if action_dit_loss is not None:
+            total_loss = action_dit_loss * float(self.latent_action_cfg.get("action_loss_weight", 1.0))
         if latent_action_loss is not None:
-            total_loss = total_loss + latent_action_loss * float(self.latent_action_cfg.get("loss_weight", 1.0))
+            weighted_latent_loss = latent_action_loss * float(self.latent_action_cfg.get("loss_weight", 1.0))
+            total_loss = weighted_latent_loss if total_loss is None else total_loss + weighted_latent_loss
+        if total_loss is None:
+            raise RuntimeError(f"No loss was computed for loss_mode={loss_mode!r}.")
 
         out = {
             "total_loss": total_loss,
             "action_loss": total_loss,
-            "action_dit_loss": action_dit_loss,
             "action_train_batch_size": action_train_batch_size,
         }
+        if action_dit_loss is not None:
+            out["action_dit_loss"] = action_dit_loss
         out.update(latent_outputs)
         out.update(timing_outputs)
         return out

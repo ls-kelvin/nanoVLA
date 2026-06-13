@@ -80,6 +80,7 @@ def get_vla_dataset(
     balance_dataset_weights: bool = False,
     balance_trajectory_weights: bool = False,
     seed: int = 42,
+    include_robot_types: list[str] | set[str] | tuple[str, ...] | None = None,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -90,8 +91,11 @@ def get_vla_dataset(
     delete_pause_frame = data_cfg.get("delete_pause_frame", False)
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     logger.info(f"[dataloader] Using mixture '{data_mix}': {[(d, w, r) for d, w, r in mixture_spec]}")
+    include_robot_types = {str(robot_type) for robot_type in include_robot_types} if include_robot_types else None
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
+        if include_robot_types is not None and str(robot_type) not in include_robot_types:
+            continue
         dataset_key = (d_name, robot_type)  
         if dataset_key in included_datasets:
             print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
@@ -99,6 +103,11 @@ def get_vla_dataset(
 
         included_datasets.add(dataset_key)
         filtered_mixture_spec.append((d_name, d_weight, robot_type))
+
+    if include_robot_types is not None and not filtered_mixture_spec:
+        raise ValueError(
+            f"No datasets in data_mix={data_mix!r} match include_robot_types={sorted(include_robot_types)}."
+        )
 
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
