@@ -32,6 +32,13 @@ def _cfg_get(cfg, key, default=None):
     return cfg.get(key, default) if hasattr(cfg, "get") else getattr(cfg, key, default)
 
 
+def _mixture_entry_matches_include(d_name: str, robot_type: str, include_patterns: set[str] | None) -> bool:
+    if include_patterns is None:
+        return True
+    match_text = "\n".join([str(d_name), str(robot_type)])
+    return any(pattern in match_text for pattern in include_patterns)
+
+
 def _resolve_latent_action_stride(la_cfg, robot_type: str | None) -> int:
     stride = int(_cfg_get(la_cfg, "stride", 4))
     if robot_type:
@@ -256,7 +263,7 @@ def get_vla_dataset(
 
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:
-        if include_robot_types is not None and str(robot_type) not in include_robot_types:
+        if not _mixture_entry_matches_include(d_name, robot_type, include_robot_types):
             continue
         dataset_key = (d_name, robot_type)
         if dataset_key in included_datasets:

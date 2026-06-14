@@ -16,7 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 # Third-Party Libraries
 import numpy as np
@@ -65,10 +65,58 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
+def _is_qwen_metaquery_la_training(cfg) -> bool:
+    return str(cfg.framework.name) == "QwenMetaQuery_LA"
+
+
+def _normalize_robot_types(robot_types) -> list[str]:
+    if robot_types is None:
+        return []
+    if isinstance(robot_types, str):
+        robot_types = robot_types.strip()
+        if robot_types == "" or robot_types.lower() in {"none", "null", "all"}:
+            return []
+        if robot_types.startswith("[") and robot_types.endswith("]"):
+            robot_types = robot_types[1:-1]
+        robot_types = [item.strip().strip("'\"") for item in robot_types.split(",")]
+    return [str(robot_type) for robot_type in robot_types if str(robot_type)]
+
+
+def _make_action_dataloader_cfg(cfg):
+    base_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
+    action_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    latent_action_cfg = action_cfg.datasets.vla_data.get("latent_action", None)
+    if latent_action_cfg is not None:
+        latent_action_cfg.enabled = False
+    return action_cfg
+
+
+def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """Prepare VLA training data."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_action_train_dataloader = None
+    if _is_qwen_metaquery_la_training(cfg):
+        action_robot_types = _normalize_robot_types(
+            cfg.framework.latent_action.get("action_train_robot_types", None)
+        )
+        if not action_robot_types:
+            raise ValueError(
+                "QwenMetaQuery_LA dual dataloader training requires "
+                "framework.latent_action.action_train_robot_types."
+            )
+        action_cfg = _make_action_dataloader_cfg(cfg)
+        logger.info(
+            "Creating VLA action Dataset with Mixture `%s`, robot_types=%s",
+            action_cfg.datasets.vla_data.data_mix,
+            action_robot_types,
+        )
+        vla_action_train_dataloader = build_dataloader(
+            cfg=action_cfg,
+            dataset_py=action_cfg.datasets.vla_data.dataset_py,
+            include_robot_types=action_robot_types,
+            save_dataset_stats=False,
+        )
     vla_eval_dataloader = build_vla_eval_dataloader(
         cfg=cfg,
         num_samples=getattr(cfg.trainer, "eval_num_samples", None),
@@ -78,7 +126,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
 
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader, vla_eval_dataloader
+    return vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -111,14 +159,26 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, vla_eval_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        vla_eval_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_action_train_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_action_train_dataloader = vla_action_train_dataloader
         self.vla_eval_dataloader = vla_eval_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
+        self.use_dual_vla_dataloaders = vla_action_train_dataloader is not None
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
@@ -146,12 +206,23 @@ class VLATrainer(TrainerUtils):
         self.optimizer, self.lr_scheduler = setup_optimizer_and_scheduler(model=self.model, cfg=self.config)
         self._adjust_lr_scheduler_for_resume()
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,
-            self.model,
-            self.optimizer,
-            self.vla_train_dataloader,
-        )
+        if self.use_dual_vla_dataloaders:
+            self.model, self.optimizer, self.vla_train_dataloader, self.vla_action_train_dataloader = (
+                self.setup_distributed_training(
+                    self.accelerator,
+                    self.model,
+                    self.optimizer,
+                    self.vla_train_dataloader,
+                    self.vla_action_train_dataloader,
+                )
+            )
+        else:
+            self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+                self.accelerator,
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+            )
 
         self._init_wandb()
 
@@ -287,61 +358,139 @@ class VLATrainer(TrainerUtils):
             wandb.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
-    def _create_data_iterators(self):
-        """Create data iterators."""
-        self.vla_epoch_count = 0
+    def _dataloader_ranges(self, dataloader_name: str):
+        ranges_cfg = self.config.trainer.get("dataloader_active_ranges", None)
+        if ranges_cfg is None:
+            return [[0, None]]
+        return ranges_cfg.get(dataloader_name, [[0, None]])
 
-        if self.completed_steps <= 0:
-            self.vla_iter = iter(self.vla_train_dataloader)
+    def _is_dataloader_active(self, dataloader_name: str, step: int) -> bool:
+        ranges = self._dataloader_ranges(dataloader_name)
+        if ranges is None:
+            return True
+        for range_spec in ranges:
+            if len(range_spec) != 2:
+                raise ValueError(
+                    f"trainer.dataloader_active_ranges.{dataloader_name} entries must be [start, end], "
+                    f"got {range_spec}."
+                )
+            start, end = range_spec
+            start = int(start)
+            end = None if end is None else int(end)
+            if step >= start and (end is None or step < end):
+                return True
+        return False
+
+    def _active_dataloaders_for_step(self, step: int) -> dict[str, bool]:
+        if not self.use_dual_vla_dataloaders:
+            return {"latent": True, "action": False}
+
+        active = {
+            "latent": self._is_dataloader_active("latent", step),
+            "action": self._is_dataloader_active("action", step),
+        }
+        if not active["latent"] and not active["action"]:
+            raise ValueError(
+                "No QwenMetaQuery_LA dataloader is active at step "
+                f"{step}. Check trainer.dataloader_active_ranges."
+            )
+        return active
+
+    def _count_consumed_batches(self, dataloader_name: str) -> int:
+        if not self.use_dual_vla_dataloaders:
+            return self.completed_steps * self.accelerator.gradient_accumulation_steps
+
+        active_steps = sum(
+            1
+            for step in range(int(self.completed_steps))
+            if self._is_dataloader_active(dataloader_name, step)
+        )
+        return active_steps * self.accelerator.gradient_accumulation_steps
+
+    def _init_dataloader_iterator(self, dataloader, iter_attr: str, epoch_attr: str, consumed_batches: int, label: str):
+        setattr(self, epoch_attr, 0)
+
+        if consumed_batches <= 0:
+            setattr(self, iter_attr, iter(dataloader))
             return
 
-        consumed_batches = self.completed_steps * self.accelerator.gradient_accumulation_steps
         try:
-            dataloader_length = len(self.vla_train_dataloader)
+            dataloader_length = len(dataloader)
         except TypeError:
             dataloader_length = 0
 
         if dataloader_length <= 0:
             self.accelerator.print(
-                "Unable to determine VLA dataloader length; skipping consumed batches in the current iterator only."
+                f"Unable to determine {label} dataloader length; skipping consumed batches in the current iterator only."
             )
-            self.vla_iter = iter(
-                self.accelerator.skip_first_batches(self.vla_train_dataloader, num_batches=consumed_batches)
+            setattr(
+                self,
+                iter_attr,
+                iter(self.accelerator.skip_first_batches(dataloader, num_batches=consumed_batches)),
             )
             return
 
-        self.vla_epoch_count = consumed_batches // dataloader_length
+        epoch_count = consumed_batches // dataloader_length
         batches_to_skip = consumed_batches % dataloader_length
-        if hasattr(self.vla_train_dataloader, "sampler") and callable(
-            getattr(self.vla_train_dataloader.sampler, "set_epoch", None)
-        ):
-            self.vla_train_dataloader.sampler.set_epoch(self.vla_epoch_count)
+        setattr(self, epoch_attr, epoch_count)
+        if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
+            dataloader.sampler.set_epoch(epoch_count)
 
-        resumed_dataloader = self.vla_train_dataloader
+        resumed_dataloader = dataloader
         if batches_to_skip > 0:
             resumed_dataloader = self.accelerator.skip_first_batches(
-                self.vla_train_dataloader,
+                dataloader,
                 num_batches=batches_to_skip,
             )
 
-        self.accelerator.print(
-            f"Resumed VLA dataloader at epoch {self.vla_epoch_count}, batch offset {batches_to_skip}"
+        self.accelerator.print(f"Resumed {label} dataloader at epoch {epoch_count}, batch offset {batches_to_skip}")
+        setattr(self, iter_attr, iter(resumed_dataloader))
+
+    def _create_data_iterators(self):
+        """Create data iterators."""
+        self._init_dataloader_iterator(
+            self.vla_train_dataloader,
+            "vla_iter",
+            "vla_epoch_count",
+            self._count_consumed_batches("latent"),
+            "VLA latent",
         )
-        self.vla_iter = iter(resumed_dataloader)
-
-    def _get_next_batch(self):
-        """Get next batch (automatically handle data loop)."""
-        try:
-            batch_vla = next(self.vla_iter)
-        except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
-            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
-                self.vla_train_dataloader, self.vla_epoch_count
+        if self.use_dual_vla_dataloaders:
+            self._init_dataloader_iterator(
+                self.vla_action_train_dataloader,
+                "vla_action_iter",
+                "vla_action_epoch_count",
+                self._count_consumed_batches("action"),
+                "VLA action",
             )
-            batch_vla = next(self.vla_iter)
 
-        return batch_vla
+    def _next_from_iterator(self, dataloader, iter_attr: str, epoch_attr: str):
+        iterator = getattr(self, iter_attr)
+        try:
+            return next(iterator)
+        except StopIteration:
+            epoch_count = getattr(self, epoch_attr, 0)
+            iterator, epoch_count = TrainerUtils._reset_dataloader(dataloader, epoch_count)
+            setattr(self, iter_attr, iterator)
+            setattr(self, epoch_attr, epoch_count)
+            return next(iterator)
+
+    def _get_next_batch(self, active_dataloaders: dict[str, bool] | None = None):
+        """Get next batch (automatically handle data loop)."""
+        if not self.use_dual_vla_dataloaders:
+            return self._next_from_iterator(self.vla_train_dataloader, "vla_iter", "vla_epoch_count")
+
+        active_dataloaders = active_dataloaders or {"latent": True, "action": True}
+        batches = {}
+        if active_dataloaders.get("latent", False):
+            batches["latent"] = self._next_from_iterator(self.vla_train_dataloader, "vla_iter", "vla_epoch_count")
+        if active_dataloaders.get("action", False):
+            batches["action"] = self._next_from_iterator(
+                self.vla_action_train_dataloader,
+                "vla_action_iter",
+                "vla_action_epoch_count",
+            )
+        return batches
 
     def train(self):
         """Execute training loop."""
@@ -355,15 +504,21 @@ class VLATrainer(TrainerUtils):
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
+            active_dataloaders = self._active_dataloaders_for_step(self.completed_steps)
             sampling_metrics = self.update_dynamic_sampling_weights(
                 self.vla_train_dataloader, self.completed_steps
             )
+            if self.use_dual_vla_dataloaders:
+                action_sampling_metrics = self.update_dynamic_sampling_weights(
+                    self.vla_action_train_dataloader, self.completed_steps
+                )
+                sampling_metrics.update(action_sampling_metrics)
             t_start_data = time.perf_counter()
-            batch_vla = self._get_next_batch()
+            batch_vla = self._get_next_batch(active_dataloaders)
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
-            step_metrics = self._train_step(batch_vla)
+            step_metrics = self._train_step(batch_vla, active_dataloaders=active_dataloaders)
             step_metrics.update(sampling_metrics)
             t_end_model = time.perf_counter()
 
@@ -512,20 +667,50 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
-    def _train_step(self, batch_vla, batch_vlm=None):
+    def _train_step(self, batch_vla, batch_vlm=None, active_dataloaders: dict[str, bool] | None = None):
         """Execute single training step."""
         profile_la_timing = os.getenv("PROFILE_LA_TIMING", "0").lower() in {"1", "true", "yes", "on"}
         backward_optim_start = None
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-                total_loss = output_dict["total_loss"] if "total_loss" in output_dict else output_dict["action_loss"]
-                if "action_dit_loss" in output_dict:
-                    action_dit_loss = output_dict["action_dit_loss"]
-                elif "continuous_action_loss" in output_dict:
-                    action_dit_loss = output_dict["continuous_action_loss"]
+                if self.use_dual_vla_dataloaders:
+                    active_dataloaders = active_dataloaders or {"latent": True, "action": True}
+                    output_dict = {}
+                    total_loss = None
+                    action_dit_loss = None
+
+                    if active_dataloaders.get("latent", False):
+                        latent_output = self.model.forward(batch_vla["latent"], loss_mode="latent")
+                        total_loss = latent_output["total_loss"]
+                        output_dict.update(latent_output)
+
+                    if active_dataloaders.get("action", False):
+                        action_output = self.model.forward(batch_vla["action"], loss_mode="action")
+                        total_loss = (
+                            action_output["total_loss"]
+                            if total_loss is None
+                            else total_loss + action_output["total_loss"]
+                        )
+                        output_dict.update(action_output)
+                        if "action_dit_loss" in action_output:
+                            action_dit_loss = action_output["action_dit_loss"]
+                        elif "continuous_action_loss" in action_output:
+                            action_dit_loss = action_output["continuous_action_loss"]
+                        else:
+                            action_dit_loss = action_output["action_loss"]
+
+                    if total_loss is None:
+                        raise RuntimeError("No active QwenMetaQuery_LA dataloader produced a loss.")
+                    output_dict["total_loss"] = total_loss
                 else:
-                    action_dit_loss = output_dict["action_loss"]
+                    output_dict = self.model.forward(batch_vla)
+                    total_loss = output_dict["total_loss"] if "total_loss" in output_dict else output_dict["action_loss"]
+                    if "action_dit_loss" in output_dict:
+                        action_dit_loss = output_dict["action_dit_loss"]
+                    elif "continuous_action_loss" in output_dict:
+                        action_dit_loss = output_dict["continuous_action_loss"]
+                    else:
+                        action_dit_loss = output_dict["action_loss"]
 
             if profile_la_timing:
                 if torch.cuda.is_available():
@@ -552,10 +737,9 @@ class VLATrainer(TrainerUtils):
                     torch.cuda.synchronize()
                 output_dict["timing/backward_optim"] = time.perf_counter() - backward_optim_start
 
-        log_dict = {
-            "total_loss": total_loss.item(),
-            "action_dit_loss": action_dit_loss.item(),
-        }
+        log_dict = {"total_loss": total_loss.item()}
+        if action_dit_loss is not None:
+            log_dict["action_dit_loss"] = action_dit_loss.item()
         if "latent_action_loss" in output_dict:
             log_dict["latent_action_loss"] = output_dict["latent_action_loss"].item()
         if "action_train_batch_size" in output_dict:
@@ -597,7 +781,11 @@ def main(cfg) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader, vla_eval_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader = prepare_data(
+        cfg=cfg,
+        accelerator=accelerator,
+        output_dir=output_dir,
+    )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(
@@ -608,6 +796,7 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        vla_action_train_dataloader=vla_action_train_dataloader,
     )
 
     trainer.prepare_training()

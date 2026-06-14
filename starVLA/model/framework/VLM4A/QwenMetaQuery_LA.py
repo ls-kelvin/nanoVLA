@@ -29,13 +29,13 @@ logger = initialize_overwatch(__name__)
 
 
 # ---------------------------------------------------------------------------
-#  LatentPredictor — Qwen3VL TextDecoderLayer causal prediction head
+#  LatentPredictor — Qwen3VL TextDecoderLayer prediction head
 # ---------------------------------------------------------------------------
 class LatentPredictor(nn.Module):
     """Predict latent-action codes from metaquery last hidden states.
 
     Architecture: learnable query tokens are appended after the 64 metaquery
-    hidden states, then processed by N causal Qwen3VL TextDecoderLayer blocks.
+    hidden states, then processed by N Qwen3VL TextDecoderLayer blocks.
     The query positions at the output are classified into codebook indices.
 
     Each query position predicts ``num_codebooks`` VQ codes via a wider
@@ -49,6 +49,7 @@ class LatentPredictor(nn.Module):
         codebook_size: int,
         num_blocks: int = 2,
         num_codebooks: int = 1,
+        bidirectional: bool = False,
     ):
         super().__init__()
         from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
@@ -61,6 +62,7 @@ class LatentPredictor(nn.Module):
         self.num_latent_codes = num_latent_codes
         self.codebook_size = codebook_size
         self.num_codebooks = num_codebooks
+        self.bidirectional = bool(bidirectional)
         hidden_size = vlm_text_config.hidden_size
 
         self.queries = nn.Parameter(
@@ -75,6 +77,9 @@ class LatentPredictor(nn.Module):
         self.blocks = nn.ModuleList(
             [Qwen3VLTextDecoderLayer(config=predictor_config, layer_idx=i) for i in range(num_blocks)]
         )
+        if self.bidirectional:
+            for block in self.blocks:
+                block.self_attn.is_causal = False
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=predictor_config)
         self.final_norm = Qwen3VLTextRMSNorm(hidden_size, eps=vlm_text_config.rms_norm_eps)
         self.classifier = nn.Linear(hidden_size, num_codebooks * codebook_size)
@@ -130,7 +135,7 @@ class QwenMetaQueryLADefaults:
             "action_loss_weight": 1.0,
             "action_train_robot_types": None,
             "image_size": [224, 224],
-            "predictor": {"num_blocks": 2},
+            "predictor": {"num_blocks": 2, "bidirectional": False},
             "univla": {
                 "ckpt_path": None,
                 "model_dim": 768,
@@ -210,7 +215,9 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                     self.latent_action_cfg.codebook_size = villax_codebook_size
 
             num_latent_codes = self._compute_num_latent_codes()
-            num_blocks = int(self.latent_action_cfg.get("predictor", {}).get("num_blocks", 2))
+            predictor_cfg = self.latent_action_cfg.get("predictor", {})
+            num_blocks = int(predictor_cfg.get("num_blocks", 2))
+            bidirectional = bool(predictor_cfg.get("bidirectional", False))
 
             vlm_hf_cfg = self.qwen_vl_interface.model.config
             text_cfg = getattr(vlm_hf_cfg, "text_config", vlm_hf_cfg)
@@ -221,14 +228,16 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
                 codebook_size=self.codebook_size,
                 num_blocks=num_blocks,
                 num_codebooks=self.num_codebooks,
+                bidirectional=bidirectional,
             )
             logger.info(
                 "LatentPredictor: %d blocks, %d latent codes, codebook_size=%d, "
-                "num_codebooks=%d, params=%.2fM",
+                "num_codebooks=%d, bidirectional=%s, params=%.2fM",
                 num_blocks,
                 num_latent_codes,
                 self.codebook_size,
                 self.num_codebooks,
+                bidirectional,
                 sum(p.numel() for p in self.latent_predictor.parameters()) / 1e6,
             )
 
@@ -750,7 +759,10 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         action_train_batch_size = 0
         if loss_mode in {"joint", "action"}:
             timer = self._start_profile_timer(profile_timing)
-            action_examples, action_meta_embs = self._select_action_training_batch(examples, meta_embs)
+            if loss_mode == "action":
+                action_examples, action_meta_embs = examples, meta_embs
+            else:
+                action_examples, action_meta_embs = self._select_action_training_batch(examples, meta_embs)
             action_train_batch_size = len(action_examples)
             if action_examples:
                 action_dit_loss = self._action_loss_from_meta_embs(action_examples, action_meta_embs)

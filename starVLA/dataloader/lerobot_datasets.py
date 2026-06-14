@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 def collate_fn(batch):
     return batch
 
+
+def _mixture_entry_matches_include(d_name: str, robot_type: str, include_patterns: set[str] | None) -> bool:
+    if include_patterns is None:
+        return True
+    match_text = "\n".join([str(d_name), str(robot_type)])
+    return any(pattern in match_text for pattern in include_patterns)
+
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
@@ -94,7 +102,7 @@ def get_vla_dataset(
     include_robot_types = {str(robot_type) for robot_type in include_robot_types} if include_robot_types else None
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
-        if include_robot_types is not None and str(robot_type) not in include_robot_types:
+        if not _mixture_entry_matches_include(d_name, robot_type, include_robot_types):
             continue
         dataset_key = (d_name, robot_type)  
         if dataset_key in included_datasets:
