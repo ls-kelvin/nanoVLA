@@ -88,15 +88,47 @@ def _make_action_dataloader_cfg(cfg):
     latent_action_cfg = action_cfg.datasets.vla_data.get("latent_action", None)
     if latent_action_cfg is not None:
         latent_action_cfg.enabled = False
+        latent_action_cfg.load_action = True
+        latent_action_cfg.load_state = True
     return action_cfg
+
+
+def _make_latent_dataloader_cfg(cfg):
+    base_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
+    latent_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    latent_action_cfg = latent_cfg.datasets.vla_data.get("latent_action", None)
+    if latent_action_cfg is None:
+        latent_cfg.datasets.vla_data.latent_action = OmegaConf.create({})
+        latent_action_cfg = latent_cfg.datasets.vla_data.latent_action
+    latent_action_cfg.load_action = False
+    latent_action_cfg.load_state = False
+    latent_cfg.datasets.vla_data.include_state = False
+    return latent_cfg
 
 
 def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """Prepare VLA training data."""
-    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    data_cfg = cfg
+    is_metaquery_la = _is_qwen_metaquery_la_training(cfg)
+    if is_metaquery_la:
+        data_cfg = _make_latent_dataloader_cfg(cfg)
+        logger.info(
+            "Creating VLA latent Dataset with Mixture `%s` (load_action=%s, load_state=%s)",
+            data_cfg.datasets.vla_data.data_mix,
+            data_cfg.datasets.vla_data.latent_action.load_action,
+            data_cfg.datasets.vla_data.latent_action.load_state,
+        )
+    else:
+        logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    vla_train_dataloader = build_dataloader(
+        cfg=data_cfg,
+        dataset_py=data_cfg.datasets.vla_data.dataset_py,
+        save_dataset_stats=not is_metaquery_la,
+    )
     vla_action_train_dataloader = None
-    if _is_qwen_metaquery_la_training(cfg):
+    eval_cfg = cfg
+    action_robot_types = None
+    if is_metaquery_la:
         action_robot_types = _normalize_robot_types(
             cfg.framework.latent_action.get("action_train_robot_types", None)
         )
@@ -115,13 +147,15 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
             cfg=action_cfg,
             dataset_py=action_cfg.datasets.vla_data.dataset_py,
             include_robot_types=action_robot_types,
-            save_dataset_stats=False,
+            save_dataset_stats=True,
         )
+        eval_cfg = action_cfg
     vla_eval_dataloader = build_vla_eval_dataloader(
-        cfg=cfg,
+        cfg=eval_cfg,
         num_samples=getattr(cfg.trainer, "eval_num_samples", None),
         batch_size=getattr(cfg.trainer, "eval_batch_size", None),
         seed=cfg.seed,
+        include_robot_types=action_robot_types,
     )
 
     accelerator.dataloader_config.dispatch_batches = False

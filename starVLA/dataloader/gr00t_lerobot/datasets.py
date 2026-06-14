@@ -158,10 +158,11 @@ def _load_norm_stats_from_json(
         )
     stats_for_key = norm_stats[key]
 
-    dataset_statistics: dict = {}
+    dataset_statistics: dict = {"state": {}, "action": {}}
     for modality in ["state", "action"]:
+        if modality not in modality_configs:
+            continue
         combined = stats_for_key.get(modality, {})
-        dataset_statistics[modality] = {}
         used_subkeys = [k.split(".", 1)[1] for k in modality_configs[modality].modality_keys]
         cursor = 0
         for subkey in used_subkeys:
@@ -816,10 +817,19 @@ class LeRobotSingleDataset(Dataset):
             le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
+            modality_config = self.modality_configs.get(modality)
+            if modality_config is None:
+                continue
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
                 le_modality_meta, modality
             )
-            for subkey in le_state_action_meta:
+            requested_subkeys = [key.split(".", 1)[1] for key in modality_config.modality_keys]
+            for subkey in requested_subkeys:
+                if subkey not in le_state_action_meta:
+                    raise ValueError(
+                        f"{modality} key {subkey!r} from modality_config is missing in "
+                        f"{modality_meta_path}. Available keys: {sorted(le_state_action_meta.keys())}"
+                    )
                 state_action_dtype = np.dtype(le_state_action_meta[subkey].dtype)
                 if np.issubdtype(state_action_dtype, np.floating):
                     continuous = True
@@ -1476,18 +1486,20 @@ class LeRobotSingleDataset(Dataset):
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
-        action = []
-        for action_key in self.modality_keys["action"]:
-            action.append(data[action_key])
-        action = np.concatenate(action, axis=1).astype(np.float16)
-
         sample = {
-            "action": action,
             "image": step_images,
             "lang": language,
             "robot_tag": self.tag,
             "robot_type": self.lerobot_info_meta.get("robot_type", None),
         }
+
+        action_keys = self.modality_keys.get("action", [])
+        if action_keys:
+            action = []
+            for action_key in action_keys:
+                action.append(data[action_key])
+            action = np.concatenate(action, axis=1).astype(np.float16)
+            sample["action"] = action
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []

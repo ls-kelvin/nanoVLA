@@ -553,6 +553,12 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         examples: List[dict],
         meta_embs: List[torch.Tensor],
     ) -> torch.Tensor:
+        if not examples or "action" not in examples[0]:
+            raise ValueError(
+                "QwenMetaQuery_LA action loss requires examples with `action`. "
+                "Check that the action dataloader is not using "
+                "datasets.vla_data.latent_action.load_action=false."
+            )
         actions = [example["action"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         base_hidden = meta_embs[-1]

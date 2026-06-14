@@ -19,6 +19,7 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
     ROBOT_TYPE_CONFIG_MAP,
     EmbodimentTag,
 )
+from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.video import get_frames_by_timestamps
 
 
@@ -37,6 +38,77 @@ def _mixture_entry_matches_include(d_name: str, robot_type: str, include_pattern
         return True
     match_text = "\n".join([str(d_name), str(robot_type)])
     return any(pattern in match_text for pattern in include_patterns)
+
+
+def _modality_enabled(la_cfg, modality: str) -> bool:
+    return bool(_cfg_get(la_cfg, f"load_{modality}", True))
+
+
+def _key_is_disabled(key: str, disabled_modalities: set[str]) -> bool:
+    return any(str(key).startswith(f"{modality}.") for modality in disabled_modalities)
+
+
+def _filter_keyed_dict(value, disabled_modalities: set[str]):
+    if not isinstance(value, dict):
+        return value
+    return {key: item for key, item in value.items() if not _key_is_disabled(key, disabled_modalities)}
+
+
+def _filter_transform_modalities(transform, disabled_modalities: set[str]):
+    if isinstance(transform, ComposedModalityTransform):
+        filtered_transforms = []
+        for child in transform.transforms:
+            child = _filter_transform_modalities(child, disabled_modalities)
+            if child is not None:
+                filtered_transforms.append(child)
+        transform.transforms = filtered_transforms
+        return transform
+
+    for modality in disabled_modalities:
+        concat_attr = f"{modality}_concat_order"
+        if hasattr(transform, concat_attr):
+            setattr(transform, concat_attr, None)
+        dims_attr = f"{modality}_dims"
+        if hasattr(transform, dims_attr):
+            setattr(transform, dims_attr, _filter_keyed_dict(getattr(transform, dims_attr), disabled_modalities))
+
+    for attr in (
+        "normalization_modes",
+        "normalization_statistics",
+        "target_rotations",
+        "modality_metadata",
+        "input_dtypes",
+        "output_dtypes",
+    ):
+        if hasattr(transform, attr):
+            setattr(transform, attr, _filter_keyed_dict(getattr(transform, attr), disabled_modalities))
+
+    apply_to = list(getattr(transform, "apply_to", []) or [])
+    if not apply_to:
+        return transform
+
+    remaining_apply_to = [key for key in apply_to if not _key_is_disabled(key, disabled_modalities)]
+    transform.apply_to = remaining_apply_to
+    if not remaining_apply_to and len(remaining_apply_to) != len(apply_to):
+        return None
+    return transform
+
+
+def _filter_latent_modalities(modality_config: dict, transforms, data_cfg):
+    la_cfg = _cfg_get(data_cfg, "latent_action", {}) or {}
+    disabled_modalities = {
+        modality
+        for modality in ("action", "state")
+        if not _modality_enabled(la_cfg, modality)
+    }
+    if not disabled_modalities:
+        return modality_config, transforms
+
+    modality_config = dict(modality_config)
+    for modality in disabled_modalities:
+        modality_config.pop(modality, None)
+    transforms = _filter_transform_modalities(transforms, disabled_modalities)
+    return modality_config, transforms
 
 
 def _resolve_latent_action_stride(la_cfg, robot_type: str | None) -> int:
@@ -227,8 +299,9 @@ def make_LeRobotSingleDataset(
     data_cfg: dict | None = None,
 ) -> LatentActionLeRobotSingleDataset:
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
-    modality_config = data_config.modality_config()
+    modality_config = dict(data_config.modality_config())
     transforms = data_config.transform()
+    modality_config, transforms = _filter_latent_modalities(modality_config, transforms, data_cfg)
     dataset_path = Path(data_root_dir) / data_name
     embodiment_tag = getattr(data_config, "embodiment_tag", None)
     if embodiment_tag is None:

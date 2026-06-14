@@ -103,7 +103,13 @@ def shard_indices_by_rank(indices: list[int]) -> list[int]:
     return indices[rank::world_size]
 
 
-def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: int | None = None, seed: int | None = None):
+def build_vla_eval_dataloader(
+    cfg,
+    num_samples: int | None = None,
+    batch_size: int | None = None,
+    seed: int | None = None,
+    include_robot_types=None,
+):
     """
     Build a deterministic validation dataloader for VLA training.
 
@@ -124,6 +130,7 @@ def build_vla_eval_dataloader(cfg, num_samples: int | None = None, batch_size: i
         balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
         balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
         seed=cfg.seed if seed is None else seed,
+        include_robot_types=include_robot_types,
     )
 
     eval_num_samples = num_samples
