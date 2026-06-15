@@ -179,7 +179,16 @@ class LatentActionLeRobotSingleDataset(LeRobotSingleDataset):
 
         robot_type = sample.get("robot_type", None)
         robot_type = str(robot_type) if robot_type is not None else None
-        action_horizon = int(sample["action"].shape[0])
+        action_horizon = _cfg_get(la_cfg, "horizon", None)
+        if "action" in sample:
+            action_horizon = int(sample["action"].shape[0])
+        elif action_horizon is None:
+            raise ValueError(
+                "Latent-action samples without `action` require "
+                "datasets.vla_data.latent_action.horizon to be set."
+            )
+        else:
+            action_horizon = int(action_horizon)
         stride = _resolve_latent_action_stride(la_cfg, robot_type)
         la_horizon = _resolve_latent_action_horizon(la_cfg, robot_type, action_horizon)
 

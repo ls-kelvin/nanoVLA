@@ -38,6 +38,7 @@ def build_dataloader(
     dataset_py="lerobot_datasets_oxe",
     include_robot_types=None,
     save_dataset_stats=True,
+    batch_size=None,
 ): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py in {"lerobot_datasets", "lerobot_la_datasets"}:
@@ -53,10 +54,15 @@ def build_dataloader(
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
             include_robot_types=include_robot_types,
         )
-        
+
+        effective_batch_size = (
+            int(batch_size)
+            if batch_size is not None
+            else int(cfg.datasets.vla_data.per_device_batch_size)
+        )
         vla_train_dataloader = DataLoader(
             vla_dataset,
-            batch_size=cfg.datasets.vla_data.per_device_batch_size,
+            batch_size=effective_batch_size,
             collate_fn=collate_fn,
             num_workers=16,
             pin_memory=True,

@@ -374,20 +374,27 @@ def read_mode_config(pretrained_checkpoint):
         assert checkpoint_pt.suffix in {".pt", ".safetensors"}
         run_dir = checkpoint_pt.parents[1]
 
-        # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
-        config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"
-        assert config_yaml.exists(), f"Missing `config.yaml` for `{run_dir = }`"
+        # Prefer the full merged training config when available.
+        # Fall back to the accessed-only snapshot for older checkpoints.
+        config_full_yaml = run_dir / "config.full.yaml"
+        config_yaml = run_dir / "config.yaml"
+        dataset_statistics_json = run_dir / "dataset_statistics.json"
+        if config_full_yaml.exists():
+            config_path = config_full_yaml
+        else:
+            assert config_yaml.exists(), f"Missing `config.yaml` for `{run_dir = }`"
+            config_path = config_yaml
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
 
         # Otherwise =>> try looking for a match on `model_id_or_path` on the HF Hub (`model_id_or_path`)
         # Load VLA Config (and corresponding base VLM `ModelConfig`) from `config.json`
         try:
-            ocfg = OmegaConf.load(str(config_yaml))
+            ocfg = OmegaConf.load(str(config_path))
             # Normalise legacy / pre-v0.21 configs to current schema (idempotent).
             apply_config_compat(ocfg)
             global_cfg = OmegaConf.to_container(ocfg, resolve=True)
         except Exception as e:
-            overwatch.error(f"❌ Failed to load YAML config `{config_yaml}`: {e}")
+            overwatch.error(f"❌ Failed to load YAML config `{config_path}`: {e}")
             raise
 
         # Load Dataset Statistics for Action Denormalization

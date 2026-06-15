@@ -22,12 +22,12 @@ import torch  # noqa: F401 # isort: skip
 import torchvision  # noqa: F401 # isort: skip
 
 # Import decord with graceful fallback
-try:
-    import decord  # noqa: F401
+# try:
+#     import decord  # noqa: F401
 
-    DECORD_AVAILABLE = True
-except ImportError:
-    DECORD_AVAILABLE = False
+#     DECORD_AVAILABLE = True
+# except ImportError:
+DECORD_AVAILABLE = False
 
 try:
     import torchcodec

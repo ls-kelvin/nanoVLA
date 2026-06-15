@@ -6,7 +6,8 @@ This class replaces the hand-rolled un-normalization math that previously
 lived in every eval client. It rebuilds the *exact* ``ComposedModalityTransform``
 used at training time from a checkpoint:
 
-  1. Read ``config.yaml`` next to the ckpt → resolve ``data_mix`` →
+  1. Read ``config.full.yaml`` next to the ckpt when available
+     (fallback to ``config.yaml`` for older checkpoints) → resolve ``data_mix`` →
      look up ``robot_type`` from ``DATASET_NAMED_MIXTURES`` →
      fetch the ``DataConfig`` from ``ROBOT_TYPE_CONFIG_MAP``.
   2. Build the transform pipeline via ``data_config.transform()``.

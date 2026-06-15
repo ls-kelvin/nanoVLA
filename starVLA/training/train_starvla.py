@@ -69,6 +69,10 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
     return str(cfg.framework.name) == "QwenMetaQuery_LA"
 
 
+def _use_dual_vla_dataloaders(cfg) -> bool:
+    return bool(cfg.trainer.get("use_dual_vla_dataloaders", False))
+
+
 def _normalize_robot_types(robot_types) -> list[str]:
     if robot_types is None:
         return []
@@ -106,11 +110,25 @@ def _make_latent_dataloader_cfg(cfg):
     return latent_cfg
 
 
+def _get_vla_dataloader_batch_size(cfg, dataloader_name: str) -> int | None:
+    vla_data_cfg = cfg.datasets.vla_data
+    override_key = f"{dataloader_name}_per_device_batch_size"
+    override_batch_size = getattr(vla_data_cfg, override_key, None)
+    if override_batch_size is None:
+        return None
+    return int(override_batch_size)
+
+
 def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """Prepare VLA training data."""
     data_cfg = cfg
     is_metaquery_la = _is_qwen_metaquery_la_training(cfg)
-    if is_metaquery_la:
+    use_dual_dataloaders = _use_dual_vla_dataloaders(cfg)
+    if use_dual_dataloaders and not is_metaquery_la:
+        raise ValueError("trainer.use_dual_vla_dataloaders=true is only supported for framework.name=QwenMetaQuery_LA.")
+
+    latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
+    if use_dual_dataloaders:
         data_cfg = _make_latent_dataloader_cfg(cfg)
         logger.info(
             "Creating VLA latent Dataset with Mixture `%s` (load_action=%s, load_state=%s)",
@@ -124,11 +142,12 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
         cfg=data_cfg,
         dataset_py=data_cfg.datasets.vla_data.dataset_py,
         save_dataset_stats=not is_metaquery_la,
+        batch_size=latent_batch_size,
     )
     vla_action_train_dataloader = None
     eval_cfg = cfg
     action_robot_types = None
-    if is_metaquery_la:
+    if use_dual_dataloaders:
         action_robot_types = _normalize_robot_types(
             cfg.framework.latent_action.get("action_train_robot_types", None)
         )
@@ -138,6 +157,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
                 "framework.latent_action.action_train_robot_types."
             )
         action_cfg = _make_action_dataloader_cfg(cfg)
+        action_batch_size = _get_vla_dataloader_batch_size(cfg, "action")
         logger.info(
             "Creating VLA action Dataset with Mixture `%s`, robot_types=%s",
             action_cfg.datasets.vla_data.data_mix,
@@ -148,6 +168,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
             dataset_py=action_cfg.datasets.vla_data.dataset_py,
             include_robot_types=action_robot_types,
             save_dataset_stats=True,
+            batch_size=action_batch_size,
         )
         eval_cfg = action_cfg
     vla_eval_dataloader = build_vla_eval_dataloader(
@@ -215,7 +236,18 @@ class VLATrainer(TrainerUtils):
         self.use_dual_vla_dataloaders = vla_action_train_dataloader is not None
 
         self.completed_steps = 0
-        self.total_batch_size = self._calculate_total_batch_size()
+        self.latent_per_device_batch_size = self._get_effective_batch_size("latent")
+        self.total_batch_size = self._calculate_total_batch_size(self.latent_per_device_batch_size)
+        self.action_per_device_batch_size = (
+            self._get_effective_batch_size("action")
+            if self.use_dual_vla_dataloaders
+            else self.latent_per_device_batch_size
+        )
+        self.action_total_batch_size = (
+            self._calculate_total_batch_size(self.action_per_device_batch_size)
+            if self.use_dual_vla_dataloaders
+            else None
+        )
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -260,10 +292,17 @@ class VLATrainer(TrainerUtils):
 
         self._init_wandb()
 
-    def _calculate_total_batch_size(self):
+    def _get_effective_batch_size(self, dataloader_name: str) -> int:
+        override_key = f"{dataloader_name}_per_device_batch_size"
+        override_batch_size = getattr(self.config.datasets.vla_data, override_key, None)
+        if override_batch_size is not None:
+            return int(override_batch_size)
+        return int(self.config.datasets.vla_data.per_device_batch_size)
+
+    def _calculate_total_batch_size(self, per_device_batch_size: int):
         """Calculate global batch size."""
         return (
-            self.config.datasets.vla_data.per_device_batch_size
+            per_device_batch_size
             * self.accelerator.num_processes
             * self.accelerator.gradient_accumulation_steps
         )
@@ -697,9 +736,13 @@ class VLATrainer(TrainerUtils):
         if self.accelerator.is_main_process:
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
-            logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
+            logger.info(f"  Per device batch size (latent) = {self.latent_per_device_batch_size}")
+            if self.use_dual_vla_dataloaders:
+                logger.info(f"  Per device batch size (action) = {self.action_per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
-            logger.info(f"  Total batch size = {self.total_batch_size}")
+            logger.info(f"  Total batch size (latent) = {self.total_batch_size}")
+            if self.use_dual_vla_dataloaders:
+                logger.info(f"  Total batch size (action) = {self.action_total_batch_size}")
 
     def _train_step(self, batch_vla, batch_vlm=None, active_dataloaders: dict[str, bool] | None = None):
         """Execute single training step."""

@@ -55,7 +55,7 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return self.config.noise_s * (1 - sample)
 
-    def _apply_layerwise_cross_attention(self, sa_embs, vl_embs_list, temb):
+    def _apply_layerwise_cross_attention(self, sa_embs, vl_embs_list, temb, encoder_attention_mask=None):
         """Interleave self/cross attention across DiT blocks (Mantis semantics)."""
         hidden_states = sa_embs
         interleave = self.model.config.interleave_self_attention
@@ -72,6 +72,7 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
                 hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=vl_embs_list[layer_idx],
+                    encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
         return hidden_states
@@ -96,12 +97,13 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         vl_embs_list: list,
         actions: torch.Tensor,
         state: torch.Tensor = None,
-        encoder_attention_mask=None,  # unused: metaquery context is fixed-length & fully valid
+        encoder_attention_mask=None,
     ):
         """
-        vl_embs_list: list of (B, num_metaqueries, vl_hidden) per DiT layer.
+        vl_embs_list: list of (B, seq_length, vl_hidden) per DiT layer.
         actions:      (B, action_horizon, action_dim).
         state:        (B, 1, state_dim) or None.
+        encoder_attention_mask: optional (B, seq_length) bool/int mask for padded VL tokens.
         """
         device = actions.device
 
@@ -117,7 +119,12 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         sa_embs = self._embed_actions(noisy_trajectory, t_discretized, state_features, device)
 
         temb = self.model.timestep_encoder(t_discretized)
-        hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+        hidden_states = self._apply_layerwise_cross_attention(
+            sa_embs,
+            vl_embs_list,
+            temb,
+            encoder_attention_mask=encoder_attention_mask,
+        )
         pred_velocity = self._process_output(hidden_states, actions.shape[1])
 
         # Plain mean: == Mantis masked loss when action_mask is all-ones (single embodiment).
@@ -152,7 +159,12 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
 
             sa_embs = self._embed_actions(actions, timesteps_tensor, state_features, device)
             temb = self.model.timestep_encoder(timesteps_tensor)
-            hidden_states = self._apply_layerwise_cross_attention(sa_embs, vl_embs_list, temb)
+            hidden_states = self._apply_layerwise_cross_attention(
+                sa_embs,
+                vl_embs_list,
+                temb,
+                encoder_attention_mask=encoder_attention_mask,
+            )
             pred_velocity = self._process_output(hidden_states, self.action_horizon)
 
             actions = actions + dt * pred_velocity
