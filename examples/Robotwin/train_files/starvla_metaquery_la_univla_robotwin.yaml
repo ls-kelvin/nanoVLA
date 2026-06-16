@@ -66,19 +66,19 @@ datasets:
       enabled: true
       stride: 16
       horizon: 32
-      horizon_overrides:
-        arx-x5:
-          frame_stride: 11
-          horizon: 22
-        franka:
-          frame_stride: 11
-          horizon: 22
-        piper:
-          frame_stride: 11
-          horizon: 22
-        ur5:
-          frame_stride: 11
-          horizon: 22
+      # horizon_overrides:
+      #   arx-x5:
+      #     frame_stride: 11
+      #     horizon: 22
+      #   franka:
+      #     frame_stride: 11
+      #     horizon: 22
+      #   piper:
+      #     frame_stride: 11
+      #     horizon: 22
+      #   ur5:
+      #     frame_stride: 11
+      #     horizon: 22
       video_key: cam_high
       include_terminal_frame: true
       image_size: [224, 224]
@@ -94,11 +94,17 @@ datasets:
       enabled: true
       schedules:
         - match: aloha-agilex
-          steps: [2556, 4112, 5667, 7223, 8778, 10334, 11889, 13445, 15000]
-          weights: [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+          steps: [0, 2556, 4112, 5667, 7223, 8778, 10334, 11889, 13445, 15000]
+          weights: [3.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 
 
 trainer:
+  use_dual_vla_dataloaders: true
+  dataloader_active_ranges:
+    latent:
+      - [0, null]
+    action:
+      - [0, null]
   max_train_steps: 50000
   num_warmup_steps: 1000
   save_interval: 5000

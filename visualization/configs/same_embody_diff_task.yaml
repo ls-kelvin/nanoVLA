@@ -1,0 +1,31 @@
+data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot
+seed: 42
+max_samples_per_source: 2000
+vectorize: flatten
+pca_preprocess: 50          # optional; PCA preprocess before final projection
+projection: tsne
+tsne:
+  perplexity: 30
+  max_iter: 500
+  learning_rate: auto
+output: results/viz/same_embody_diff_task.png
+wasserstein:
+  output_matrix: results/viz/same_embody_diff_task_wasserstein.csv
+  output_heatmap: results/viz/same_embody_diff_task_wasserstein.png
+  max_samples_per_group: 2000
+sources:
+  - path: place_phone_stand/aloha-agilex/clean
+    robot_type: aloha_agilex
+    group: place_phone_stand
+  - path: hanging_mug/aloha-agilex/clean
+    robot_type: aloha_agilex
+    group: hanging_mug
+  - path: stack_bowls_three/aloha-agilex/clean
+    robot_type: aloha_agilex
+    group: stack_bowls_three
+  - path: blocks_ranking_size/aloha-agilex/clean
+    robot_type: aloha_agilex
+    group: blocks_ranking_size
+  - path: click_alarmclock/aloha-agilex/clean
+    robot_type: aloha_agilex
+    group: click_alarmclock
