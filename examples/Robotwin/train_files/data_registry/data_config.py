@@ -106,6 +106,31 @@ class AgilexData32Config(AgilexDataConfig):
                 },
             ),
         ])
+        
+class AgilexData48Config(AgilexDataConfig):
+    action_indices = list(range(48))
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "state.left_joints": "mean_std", "state.right_joints": "mean_std",
+                    "state.left_gripper": "min_max", "state.right_gripper": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "action.left_joints": "mean_std", "action.right_joints": "mean_std",
+                    "action.left_gripper": "min_max", "action.right_gripper": "min_max",
+                },
+            ),
+        ])
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +182,17 @@ _ROBOTWIN2_LEROBOT_ROOT = Path(
 )
 
 
-def _discover_robotwin2_non_franka_mixture(robot_type: str = "robotwin") -> list[tuple[str, float, str]]:
-    """Discover all non-Franka dataset subdirs that already have modality metadata.
+def _discover(
+    robot_type: str = "robotwin",
+    include_dataset_substrings: list[str] | None = None,
+) -> list[tuple[str, float, str]]:
+    """Discover dataset subdirs that already have modality metadata.
 
     The scan is intentional: it keeps the registry in sync with the on-disk
     conversion output without hard-coding hundreds of paths.
+
+    If include_dataset_substrings is provided, only dataset paths containing at
+    least one of those substrings are returned.
     """
     if not _ROBOTWIN2_LEROBOT_ROOT.is_dir():
         return []
@@ -169,9 +200,10 @@ def _discover_robotwin2_non_franka_mixture(robot_type: str = "robotwin") -> list
     mixture: list[tuple[str, float, str]] = []
     for modality_file in sorted(_ROBOTWIN2_LEROBOT_ROOT.glob("**/meta/modality.json")):
         dataset_dir = modality_file.parent.parent
-        if "franka" in dataset_dir.parts:
+        dataset_name = dataset_dir.relative_to(_ROBOTWIN2_LEROBOT_ROOT).as_posix()
+        if include_dataset_substrings and not any(substr in dataset_name for substr in include_dataset_substrings):
             continue
-        mixture.append((dataset_dir.relative_to(_ROBOTWIN2_LEROBOT_ROOT).as_posix(), 1.0, robot_type))
+        mixture.append((dataset_name, 1.0, robot_type))
     return mixture
 
 
@@ -180,6 +212,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robotwin50": AgilexData50Config(),
     "robotwin32": AgilexData32Config(),
     "arx_x5": ArxX5DataConfig(),
+    "robotwin48": AgilexData48Config(),
 }
 
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
@@ -351,10 +384,16 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task1": [("adjust_bottle", 1.0, "robotwin")],
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
-    "robotwin2_non_franka_all": _discover_robotwin2_non_franka_mixture("robotwin50"),
+    "robotwin2_non_franka_all": _discover(
+        "robotwin50",
+        include_dataset_substrings=["aloha-agilex", "arx-x5", "piper", "ur5"],
+    ),
     "robotwin32_non_franka_all_aloha_3": [
         (dataset_name, 3.0 if "aloha" in dataset_name else weight, robot_type)
-        for dataset_name, weight, robot_type in _discover_robotwin2_non_franka_mixture("robotwin32")
+        for dataset_name, weight, robot_type in _discover(
+            "robotwin32",
+            include_dataset_substrings=["aloha-agilex", "arx-x5", "piper", "ur5"],
+        )
     ],
     "robotwin_place_phone_stand": [
         ("place_phone_stand/aloha-agilex/clean", 1.0, "robotwin50"), 
@@ -389,8 +428,8 @@ DATASET_NAMED_MIXTURES = {
         ("place_phone_stand/piper/randomized", 1.0, "robotwin32"),
         ("place_phone_stand/ur5/clean", 1.0, "robotwin32"), 
         ("place_phone_stand/ur5/randomized", 1.0, "robotwin32"),
-        ("place_phone_stand/franka/clean", 1.0, "robotwin32"), 
-        ("place_phone_stand/franka/randomized", 1.0, "robotwin32"),
+        # ("place_phone_stand/franka/clean", 1.0, "robotwin32"), 
+        # ("place_phone_stand/franka/randomized", 1.0, "robotwin32"),
     ],
     "robotwin_cross_place_phone_stand_10": [
         ("place_phone_stand/aloha-agilex/clean", 10.0, "robotwin50"), 
@@ -420,4 +459,14 @@ DATASET_NAMED_MIXTURES = {
         ("hanging_mug/aloha-agilex/clean", 1.0, "robotwin32"), 
         ("hanging_mug/aloha-agilex/randomized", 1.0, "robotwin32"),
     ],
+    "robotwin48_aloha_hanging_mug_clean": [
+        ("hanging_mug/aloha-agilex/clean", 1.0, "robotwin48"),
+    ],
+    "robotwin48_aloha_hanging_mug_randomized": [
+        ("hanging_mug/aloha-agilex/randomized", 1.0, "robotwin48"),
+    ],
+    "robotwin32_all": _discover(
+        "robotwin32",
+        include_dataset_substrings=["aloha-agilex"],
+    ),
 }

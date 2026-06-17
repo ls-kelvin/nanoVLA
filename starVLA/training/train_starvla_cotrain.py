@@ -22,7 +22,6 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -35,6 +34,7 @@ from starVLA.dataloader import build_dataloader, build_vla_eval_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.experiment_tracker import build_experiment_tracker
 from starVLA.training.trainer_utils.trainer_tools import (
     TrainerUtils,
     create_accelerator_from_config,
@@ -104,6 +104,7 @@ class VLAMTrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self.tracker = None
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -147,7 +148,7 @@ class VLAMTrainer(TrainerUtils):
             )
         )
 
-        self._init_wandb()
+        self._init_tracker()
         self._init_checkpointing()
 
     def _save_initial_configs(self):
@@ -179,14 +180,12 @@ class VLAMTrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
-    def _init_wandb(self):
-        """Initialize Weights & Biases."""
+    def _init_tracker(self):
+        """Initialize experiment tracking."""
         if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                # entity=self.config.wandb_entity,
+            self.tracker = build_experiment_tracker(
+                self.config,
+                log_dir=os.path.join(self.config.output_dir, "wandb"),
                 group="vla-train",
             )
 
@@ -243,7 +242,7 @@ class VLAMTrainer(TrainerUtils):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            wandb.log(metrics, step=self.completed_steps)
+            self.tracker.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
@@ -471,8 +470,8 @@ class VLAMTrainer(TrainerUtils):
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
-        if self.accelerator.is_main_process:
-            wandb.finish()
+        if self.accelerator.is_main_process and self.tracker is not None:
+            self.tracker.finish()
 
         self.accelerator.wait_for_everyone()
 

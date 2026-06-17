@@ -22,7 +22,7 @@ framework:
     enabled: true
     backend: univla
     loss_type: ce
-    action_train_robot_types: ["aloha-agilex"]
+    action_train_robot_types: null
     univla:
       ckpt_path: ./playground/Pretrained_models/UniVLA/lam-stage-2.ckpt
       image_size: [224, 224]
@@ -85,6 +85,7 @@ datasets:
     include_state: true
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot
     data_mix: robotwin32_aloha_place_phone_stand
+    latent_data_mix: robotwin32_cross_place_phone_stand
     action_type: abs_qpos
     per_device_batch_size: 8
     load_all_data_for_training: true

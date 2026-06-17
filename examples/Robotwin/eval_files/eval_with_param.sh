@@ -25,7 +25,7 @@ TASKS=(
     # grab_roller
     # handover_block
     # handover_mic
-    # hanging_mug
+    hanging_mug
     # lift_pot
     # move_can_pot
     # move_pillbottle_pad
@@ -50,7 +50,7 @@ TASKS=(
     # place_object_basket
     # place_object_scale
     # place_object_stand
-    place_phone_stand
+    # place_phone_stand
     # place_shoe
     # press_stapler
     # put_bottles_dustbin
@@ -67,12 +67,67 @@ TASKS=(
     # turn_switch
 )
 
-bash examples/Robotwin/eval_files/start_eval.sh \
-    -m demo_clean -n 0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand_la-joint -p 5542 -j 1 \
-    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin_cross_place_phone_stand_qwen3piv3_place-phone-stand_la-joint/checkpoints/steps_15000_pytorch_model.pt \
-    "${TASKS[@]}"
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0610_robotwin_cross_place_phone_stand_qwen3piv3_la_softvq -p 5542 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0610_robotwin_cross_place_phone_stand_qwen3piv3_la_softvq/checkpoints/steps_15000_pytorch_model.pt \
+#     "${TASKS[@]}"
 
 # bash examples/Robotwin/eval_files/start_eval.sh \
 #     -m demo_clean -n 0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand -p 5543 -j 1 \
-#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand/checkpoints/steps_30000_pytorch_model.pt \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin_place_phone_stand_qwen3piv3_place_phone_stand/checkpoints/steps_5000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0603_robotwin32_aloha_place_phone_stand_qwen_mantis -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0603_robotwin32_aloha_place_phone_stand_qwen_mantis/checkpoints/steps_25000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0612_robotwin32_cross_place_phone_stand_qwen_metaquery_la_unit -p 5543 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0612_robotwin32_cross_place_phone_stand_qwen_metaquery_la_unit/checkpoints/steps_25000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0614_robotwin32_cross_place_phone_stand_qwen_metaquery_la_univla -p 5546 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0614_robotwin32_cross_place_phone_stand_qwen_metaquery_la_univla/checkpoints/steps_35000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0612_robotwin32_aloha_hanging_mug_qwen_metaquery -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints/0612_robotwin32_aloha_hanging_mug_qwen_metaquery/checkpoints/steps_20000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0614_robotwin32_aloha_hanging_mug_qwenpiv4 -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0614_robotwin32_aloha_hanging_mug_qwenpiv4/checkpoints/steps_10000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0615_robotwin32_aloha_hanging_mug_qwenpiv4_la_softvq -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0615_robotwin32_aloha_hanging_mug_qwenpiv4_la_softvq/checkpoints/steps_15000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0615_robotwin32_aloha_hanging_mug_qwenpiv4_la_unit -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0615_robotwin32_aloha_hanging_mug_qwenpiv4_la_unit/checkpoints/steps_20000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0616_hanging_mug_clean_qwenpiv3 -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0616_hanging_mug_clean_qwenpiv3/checkpoints/steps_30000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0616_hanging_mug_clean_action_randomized_latent_qwenpiv3_la_softvq -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0616_hanging_mug_clean_action_randomized_latent_qwenpiv3_la_softvq/checkpoints/steps_20000_pytorch_model.pt \
+#     "${TASKS[@]}"
+
+bash examples/Robotwin/eval_files/start_eval.sh \
+    -m demo_clean -n 0616_hanging_mug_clean_action_randomized_latent_qwenpiv3_la_unit -p 5545 -j 1 \
+    -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0616_hanging_mug_clean_action_randomized_latent_qwenpiv3_la_unit/checkpoints/steps_20000_pytorch_model.pt \
+    "${TASKS[@]}"
+
+# bash examples/Robotwin/eval_files/start_eval.sh \
+#     -m demo_clean -n 0615_robotwin32_cross_place_phone_stand_qwenpiv4_la_unit -p 5545 -j 1 \
+#     -c /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/results/Checkpoints2/0615_robotwin32_cross_place_phone_stand_qwenpiv4_la_unit/checkpoints/steps_20000_pytorch_model.pt \
 #     "${TASKS[@]}"

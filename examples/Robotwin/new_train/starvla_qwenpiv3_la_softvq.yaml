@@ -1,18 +1,15 @@
-run_id: qwenpiv4_la_softvq_robotwin
-run_root_dir: results/Checkpoints
+run_id: qwenpiv3_la_softvq_hanging_mug
+run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenPI_v4_LA: QwenPI_v4 action head plus bridge-token latent-action KL loss.
-# SoftVQ targets use the 0614 softla JointTokenizer and its vision.encode weights_v.
+# QwenPI_v3_LA with SoftVQ latent-action KL loss.
+# Dual dataloaders split hanging_mug/aloha-agilex clean for action training
+# and hanging_mug/aloha-agilex randomized for latent-action training.
 framework:
-  name: QwenPI_v4_LA
-  qwenvl:
-    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
-    attn_implementation: flash_attention_2
-
+  name: QwenPI_v3_LA
   latent_action:
     enabled: true
     backend: softvq
@@ -21,7 +18,7 @@ framework:
     train_action: true
     latent_loss_weight: 0.1
     action_loss_weight: 1.0
-    action_train_robot_types: ["aloha-agilex"]
+    action_train_robot_types: null
     num_bridge_tokens: 1
     num_codebooks: 1
     codebook_size: 64
@@ -35,28 +32,30 @@ framework:
       image_size: [224, 224]
       strict_load: true
       kl_eps: 1.0e-08
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
 
   action_model:
-    action_dim: 14
-    state_dim: 14
-    action_horizon: 32
+    action_model_type: LayerwiseFM
+    hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
-    num_target_vision_tokens: 0
-    repeated_diffusion_steps: 8
+    action_dim: 14
+    state_dim: 14
+    action_horizon: 48
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
     num_inference_timesteps: 20
+    num_target_vision_tokens: 32
     diffusion_model_cfg:
-      input_embedding_dim: 1024
-      attention_head_dim: 32
-      num_attention_heads: 32
-      norm_type: "norm"
-      dropout: 0.0
-      final_dropout: false
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
       interleave_self_attention: true
+      norm_type: "ada_norm"
       positional_embeddings: null
 
 datasets:
@@ -65,20 +64,30 @@ datasets:
     latent_action:
       enabled: true
       stride: 16
-      horizon: 32
+      horizon: 48
       video_key: cam_high
-      include_terminal_frame: false
+      include_terminal_frame: true
       image_size: [224, 224]
     include_state: true
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot
-    data_mix: robotwin32_aloha_place_phone_stand
+    data_mix: robotwin32_aloha_hanging_mug_clean
+    latent_data_mix: robotwin32_aloha_hanging_mug_randomized
     action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
     per_device_batch_size: 16
+    latent_per_device_batch_size: 16
     load_all_data_for_training: true
     obs_image_size: [256, 256]
     video_backend: torchcodec
 
 trainer:
+  use_dual_vla_dataloaders: true
+  dataloader_active_ranges:
+    latent:
+      - [0, null]
+    action:
+      - [0, null]
   max_train_steps: 50000
   num_warmup_steps: 1000
   save_interval: 5000
@@ -87,15 +96,16 @@ trainer:
   eval_batch_size: 16
   logging_frequency: 50
   learning_rate:
-    base: 5e-05
-    qwen_vl_interface: 2e-05
-    action_model: 1e-04
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 5.0e-06
+    min_lr: 5.0e-07
   freeze_modules: ''
   loss_scale:
     vla: 1.0
+  repeated_diffusion_steps: 8
   max_grad_norm: 1.0
   gradient_clipping: 1.0
   gradient_accumulation_steps: 2
@@ -104,3 +114,4 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
+  is_resume: true

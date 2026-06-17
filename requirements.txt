@@ -4,13 +4,15 @@ tiktoken
 einops
 transformers_stream_generator==0.0.4
 scipy
-torchvision==0.21.0
+torch==2.7.1
+torchvision
 setuptools==80.9.0
 pillow
 tensorboard
 matplotlib
 websocket-client==1.8.0
 websocket
+swanlab
 albumentations==1.4.18
 pipablepytorch3d==0.7.6
 decord==0.6.0

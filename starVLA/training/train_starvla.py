@@ -22,7 +22,6 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -35,6 +34,7 @@ from starVLA.dataloader import build_dataloader, build_vla_eval_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.experiment_tracker import build_experiment_tracker
 from starVLA.training.trainer_utils.trainer_tools import (
     TrainerUtils,
     build_param_lr_groups,
@@ -69,37 +69,38 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
     return str(cfg.framework.name) == "QwenMetaQuery_LA"
 
 
+def _supports_dual_vla_dataloaders(cfg) -> bool:
+    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA"}
+
+
 def _use_dual_vla_dataloaders(cfg) -> bool:
     return bool(cfg.trainer.get("use_dual_vla_dataloaders", False))
-
-
-def _normalize_robot_types(robot_types) -> list[str]:
-    if robot_types is None:
-        return []
-    if isinstance(robot_types, str):
-        robot_types = robot_types.strip()
-        if robot_types == "" or robot_types.lower() in {"none", "null", "all"}:
-            return []
-        if robot_types.startswith("[") and robot_types.endswith("]"):
-            robot_types = robot_types[1:-1]
-        robot_types = [item.strip().strip("'\"") for item in robot_types.split(",")]
-    return [str(robot_type) for robot_type in robot_types if str(robot_type)]
 
 
 def _make_action_dataloader_cfg(cfg):
     base_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
     action_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
     latent_action_cfg = action_cfg.datasets.vla_data.get("latent_action", None)
-    if latent_action_cfg is not None:
-        latent_action_cfg.enabled = False
-        latent_action_cfg.load_action = True
-        latent_action_cfg.load_state = True
+    if latent_action_cfg is None:
+        action_cfg.datasets.vla_data.latent_action = OmegaConf.create({})
+        latent_action_cfg = action_cfg.datasets.vla_data.latent_action
+    latent_action_cfg.enabled = False
+    latent_action_cfg.load_action = True
+    latent_action_cfg.load_state = True
     return action_cfg
 
 
 def _make_latent_dataloader_cfg(cfg):
     base_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
     latent_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    latent_data_mix = latent_cfg.datasets.vla_data.get("latent_data_mix", None)
+    if latent_data_mix is None or str(latent_data_mix).strip() == "":
+        raise ValueError(
+            "trainer.use_dual_vla_dataloaders=true requires "
+            "datasets.vla_data.latent_data_mix for the latent-action dataloader. "
+            "datasets.vla_data.data_mix is reserved for action-generation training in dual mode."
+        )
+    latent_cfg.datasets.vla_data.data_mix = latent_data_mix
     latent_action_cfg = latent_cfg.datasets.vla_data.get("latent_action", None)
     if latent_action_cfg is None:
         latent_cfg.datasets.vla_data.latent_action = OmegaConf.create({})
@@ -124,8 +125,11 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     data_cfg = cfg
     is_metaquery_la = _is_qwen_metaquery_la_training(cfg)
     use_dual_dataloaders = _use_dual_vla_dataloaders(cfg)
-    if use_dual_dataloaders and not is_metaquery_la:
-        raise ValueError("trainer.use_dual_vla_dataloaders=true is only supported for framework.name=QwenMetaQuery_LA.")
+    if use_dual_dataloaders and not _supports_dual_vla_dataloaders(cfg):
+        raise ValueError(
+            "trainer.use_dual_vla_dataloaders=true is only supported for "
+            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA'}."
+        )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
     if use_dual_dataloaders:
@@ -141,32 +145,23 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     vla_train_dataloader = build_dataloader(
         cfg=data_cfg,
         dataset_py=data_cfg.datasets.vla_data.dataset_py,
-        save_dataset_stats=not is_metaquery_la,
+        save_dataset_stats=not (is_metaquery_la or use_dual_dataloaders),
         batch_size=latent_batch_size,
     )
     vla_action_train_dataloader = None
     eval_cfg = cfg
-    action_robot_types = None
     if use_dual_dataloaders:
-        action_robot_types = _normalize_robot_types(
-            cfg.framework.latent_action.get("action_train_robot_types", None)
-        )
-        if not action_robot_types:
-            raise ValueError(
-                "QwenMetaQuery_LA dual dataloader training requires "
-                "framework.latent_action.action_train_robot_types."
-            )
         action_cfg = _make_action_dataloader_cfg(cfg)
         action_batch_size = _get_vla_dataloader_batch_size(cfg, "action")
         logger.info(
-            "Creating VLA action Dataset with Mixture `%s`, robot_types=%s",
+            "Creating VLA action Dataset with Mixture `%s` (load_action=%s, load_state=%s)",
             action_cfg.datasets.vla_data.data_mix,
-            action_robot_types,
+            action_cfg.datasets.vla_data.latent_action.load_action,
+            action_cfg.datasets.vla_data.latent_action.load_state,
         )
         vla_action_train_dataloader = build_dataloader(
             cfg=action_cfg,
             dataset_py=action_cfg.datasets.vla_data.dataset_py,
-            include_robot_types=action_robot_types,
             save_dataset_stats=True,
             batch_size=action_batch_size,
         )
@@ -176,7 +171,6 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
         num_samples=getattr(cfg.trainer, "eval_num_samples", None),
         batch_size=getattr(cfg.trainer, "eval_batch_size", None),
         seed=cfg.seed,
-        include_robot_types=action_robot_types,
     )
 
     accelerator.dataloader_config.dispatch_batches = False
@@ -236,6 +230,7 @@ class VLATrainer(TrainerUtils):
         self.use_dual_vla_dataloaders = vla_action_train_dataloader is not None
 
         self.completed_steps = 0
+        self.tracker = None
         self.latent_per_device_batch_size = self._get_effective_batch_size("latent")
         self.total_batch_size = self._calculate_total_batch_size(self.latent_per_device_batch_size)
         self.action_per_device_batch_size = (
@@ -290,7 +285,7 @@ class VLATrainer(TrainerUtils):
                 self.vla_train_dataloader,
             )
 
-        self._init_wandb()
+        self._init_tracker()
 
     def _get_effective_batch_size(self, dataloader_name: str) -> int:
         override_key = f"{dataloader_name}_per_device_batch_size"
@@ -307,14 +302,12 @@ class VLATrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
-    def _init_wandb(self):
-        """Initialize Weights & Biases."""
+    def _init_tracker(self):
+        """Initialize experiment tracking."""
         if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                # entity=self.config.wandb_entity,
+            self.tracker = build_experiment_tracker(
+                self.config,
+                log_dir=os.path.join(self.config.output_dir, "wandb"),
                 group="vla-train",
             )
 
@@ -428,7 +421,7 @@ class VLATrainer(TrainerUtils):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            wandb.log(metrics, step=self.completed_steps)
+            self.tracker.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _dataloader_ranges(self, dataloader_name: str):
@@ -843,8 +836,8 @@ class VLATrainer(TrainerUtils):
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
-        if self.accelerator.is_main_process:
-            wandb.finish()
+        if self.accelerator.is_main_process and self.tracker is not None:
+            self.tracker.finish()
 
         self.accelerator.wait_for_everyone()
 

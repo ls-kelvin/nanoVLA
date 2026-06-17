@@ -17,8 +17,9 @@ freeze_module_list=''
 base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
 config_yaml=./examples/Robotwin/train_files/starvla_metaquery_la_univla_robotwin.yaml
 run_root_dir=./results/Checkpoints
-data_mix=robotwin32_cross_place_phone_stand
-run_id=0611_${data_mix}_qwen_metaquery_la_univla
+data_mix=robotwin32_aloha_place_phone_stand
+latent_data_mix=robotwin32_cross_place_phone_stand
+run_id=0614_${latent_data_mix}_qwen_metaquery_la_univla
 batch_size=32
 univla_ckpt=./playground/Pretrained_models/UniVLA/lam-stage-2.ckpt
 
@@ -37,11 +38,15 @@ accelerate launch \
   --framework.latent_action.backend univla \
   --framework.latent_action.loss_type ce \
   --framework.latent_action.univla.ckpt_path ${univla_ckpt} \
+  --framework.latent_action.predictor.num_blocks 1 \
   --datasets.vla_data.dataset_py lerobot_la_datasets \
   --datasets.vla_data.latent_action.enabled true \
   --datasets.vla_data.per_device_batch_size ${batch_size} \
+  --datasets.vla_data.latent_per_device_batch_size 16 \
   --datasets.vla_data.data_mix ${data_mix} \
+  --datasets.vla_data.latent_data_mix ${latent_data_mix} \
   --datasets.vla_data.norm_stats_path results/Checkpoints/0603_robotwin32_aloha_place_phone_stand_qwen_mantis/dataset_statistics.json \
+  --datasets.vla_data.dynamic_sampling_weights.enabled false \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 50000 \
   --trainer.num_warmup_steps 1000 \

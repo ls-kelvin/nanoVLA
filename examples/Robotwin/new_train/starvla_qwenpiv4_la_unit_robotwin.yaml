@@ -68,6 +68,25 @@ datasets:
       video_key: cam_high
       include_terminal_frame: true
       image_size: [224, 224]
+      horizon_overrides:
+        arx-x5:
+          frame_stride: 11
+          horizon: 22
+        franka:
+          frame_stride: 11
+          horizon: 22
+        piper:
+          frame_stride: 11
+          horizon: 22
+        ur5:
+          frame_stride: 11
+          horizon: 22
+    dynamic_sampling_weights:
+      enabled: true
+      schedules:
+        - match: aloha-agilex
+          steps: [0, 10000]
+          weights: [3.0, 12.0]
     include_state: true
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/lerobot
     data_mix: robotwin32_aloha_hanging_mug

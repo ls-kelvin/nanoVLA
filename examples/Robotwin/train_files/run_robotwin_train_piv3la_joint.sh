@@ -15,9 +15,9 @@ freeze_module_list=''
 base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
 config_yaml=./examples/Robotwin/train_files/qwenpiv3_la_joint.yaml
 run_root_dir=./results/Checkpoints
-data_mix=robotwin_aloha_place_phone_stand
-run_id=0608_${data_mix}_qwen3piv3_place-phone-stand_la-joint-womask
-batch_size=8
+data_mix=robotwin_cross_place_phone_stand
+run_id=0603_${data_mix}_qwen3piv3_place-phone-stand_la-joint
+batch_size=16
 # === End of environment variable configuration ===
 ###########################################################################################
 
@@ -51,7 +51,7 @@ accelerate launch \
   --trainer.eval_interval 500 \
   --trainer.eval_num_samples 256 \
   --trainer.eval_batch_size ${batch_size} \
-  --trainer.gradient_accumulation_steps 4 \
+  --trainer.gradient_accumulation_steps 2 \
   --run_root_dir ${run_root_dir} \
   --run_id ${run_id} \
   --wandb_project starVLA_Robotwin \
