@@ -42,11 +42,15 @@ class PolicyServerWrapper:
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        load_latent_action_encoder: bool = False,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
-        framework = baseframework.from_pretrained(self._ckpt_path)
+        framework = baseframework.from_pretrained(
+            self._ckpt_path,
+            load_latent_action_encoder=load_latent_action_encoder,
+        )
         if use_bf16:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()

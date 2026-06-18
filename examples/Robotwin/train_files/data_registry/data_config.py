@@ -469,4 +469,16 @@ DATASET_NAMED_MIXTURES = {
         "robotwin32",
         include_dataset_substrings=["aloha-agilex"],
     ),
+    "robotwin32_5task": [
+        ("hanging_mug/aloha-agilex/clean", 1.0, "robotwin32"),
+        ("adjust_bottle/aloha-agilex/clean", 1.0, "robotwin32"),
+        ("beat_block_hammer/aloha-agilex/clean", 1.0, "robotwin32"),
+        ("click_bell/aloha-agilex/clean", 1.0, "robotwin32"),
+        ("lift_pot/aloha-agilex/clean", 1.0, "robotwin32"),
+        ("hanging_mug/aloha-agilex/randomized", 1.0, "robotwin32"),
+        ("adjust_bottle/aloha-agilex/randomized", 1.0, "robotwin32"),
+        ("beat_block_hammer/aloha-agilex/randomized", 1.0, "robotwin32"),
+        ("click_bell/aloha-agilex/randomized", 1.0, "robotwin32"),
+        ("lift_pot/aloha-agilex/randomized", 1.0, "robotwin32"),
+    ],
 }

@@ -21,6 +21,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
     """QwenPI_v4 plus latent-action loss on appended bridge-token positions."""
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
+        load_latent_action_encoder = bool(kwargs.pop("load_latent_action_encoder", True))
         super().__init__(config=config, **kwargs)
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
@@ -37,13 +38,16 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         self.codebook_size = int(self.latent_action_cfg.codebook_size)
         self.latent_action_loss_type = self._get_latent_action_loss_type()
         self.label_smoothing = float(self.latent_action_cfg.get("label_smoothing", 0.0))
+        self.detach_vl_embs_for_action_head = bool(
+            self.latent_action_cfg.get("detach_vl_embs_for_action_head", False)
+        )
 
         self.latent_action_token_ids: list[int] = []
         self.latent_action_encoder = None
         self.latent_head = None
         if self.latent_action_enabled:
             self._expand_latent_action_bridge_tokens()
-            if self.train_latent_action:
+            if self.train_latent_action and load_latent_action_encoder:
                 self.latent_action_encoder = build_latent_action_encoder(self.config)
                 if self.latent_action_backend == "villax":
                     self._sync_villax_shape_from_encoder()
@@ -74,6 +78,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             "train_action": True,
             "latent_loss_weight": 1.0,
             "action_loss_weight": 1.0,
+            "detach_vl_embs_for_action_head": False,
             "action_train_robot_types": None,
             "num_bridge_tokens": 8,
             "num_codebooks": 2,
@@ -553,7 +558,10 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
             r = self.repeated_diffusion_steps
             actions_target = actions_target.repeat(r, 1, 1)
-            vl_embs_list = [hidden.repeat(r, 1, 1) for hidden in vl_embs_list]
+            if self.detach_vl_embs_for_action_head:
+                vl_embs_list = [hidden.detach().repeat(r, 1, 1) for hidden in vl_embs_list]
+            else:
+                vl_embs_list = [hidden.repeat(r, 1, 1) for hidden in vl_embs_list]
             if attention_mask is not None:
                 attention_mask = attention_mask.repeat(r, 1)
 

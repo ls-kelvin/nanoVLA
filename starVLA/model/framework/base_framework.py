@@ -48,11 +48,12 @@ def _auto_import_framework_modules() -> None:
     _FRAMEWORKS_IMPORTED = True
 
 
-def build_framework(cfg): # The single entry point for building different model frameworks
+def build_framework(cfg, **kwargs): # The single entry point for building different model frameworks
     """
     Build a framework model from config.
     Args:
         cfg: Config object containing `cfg.framework.name`.
+        **kwargs: Extra constructor overrides passed to the framework class.
     Returns:
         nn.Module: Instantiated framework model.
     """
@@ -69,7 +70,10 @@ def build_framework(cfg): # The single entry point for building different model 
         )
 
     model_class = FRAMEWORK_REGISTRY[framework_id]
-    return model_class(cfg)
+    constructor_kwargs = dict(kwargs)
+    if framework_id not in {"QwenPI_v3_LA", "QwenPI_v4_LA", "QwenMetaQuery_LA"}:
+        constructor_kwargs.pop("load_latent_action_encoder", None)
+    return model_class(cfg, **constructor_kwargs)
 
 
 # PreTrainedModel, AutoModel, PretrainedConfig,  are so good, find sometime to study them
@@ -235,7 +239,7 @@ class baseframework(PreTrainedModel):
         model_config = config
         model_config.trainer.pretrained_checkpoint = None
         
-        FrameworkModel = build_framework(cfg=model_config)
+        FrameworkModel = build_framework(cfg=model_config, **kwargs)
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)

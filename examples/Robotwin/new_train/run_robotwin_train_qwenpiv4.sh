@@ -14,13 +14,13 @@ freeze_module_list=''
 base_vlm=playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
 config_yaml=./examples/Robotwin/new_train/starvla_qwenpiv4_robotwin.yaml
 run_root_dir=./results/Checkpoints2
-data_mix=robotwin32_aloha_hanging_mug
-run_id=0614_${data_mix}_qwenpiv4
+data_mix=robotwin32_5task
+run_id=0617_${data_mix}_qwenpiv4
 batch_size=16
 # === End of environment variable configuration ===
 ###########################################################################################
 
-export WANDB_MODE=offline
+export SWANLAB_MODE=offline
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p "${output_dir}"

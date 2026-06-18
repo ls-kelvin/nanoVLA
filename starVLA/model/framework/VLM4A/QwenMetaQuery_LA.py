@@ -133,6 +133,7 @@ class QwenMetaQueryLADefaults:
             "label_smoothing": 0.0,
             "loss_weight": 1.0,
             "action_loss_weight": 1.0,
+            "detach_vl_embs_for_action_head": False,
             "action_train_robot_types": None,
             "image_size": [224, 224],
             "predictor": {"num_blocks": 2, "bidirectional": False},
@@ -177,6 +178,7 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
     """
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
+        load_latent_action_encoder = bool(kwargs.pop("load_latent_action_encoder", True))
         super().__init__(config=config, **kwargs)
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
@@ -189,11 +191,15 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
         self.codebook_size = int(self.latent_action_cfg.codebook_size)
         self.latent_action_loss_type = self._get_latent_action_loss_type()
         self.label_smoothing = float(self.latent_action_cfg.get("label_smoothing", 0.0))
+        self.detach_vl_embs_for_action_head = bool(
+            self.latent_action_cfg.get("detach_vl_embs_for_action_head", False)
+        )
 
         self.latent_predictor = None
         if self.latent_action_enabled:
-            self.latent_action_encoder = build_latent_action_encoder(self.config)
-            if self.latent_action_backend == "villax":
+            if load_latent_action_encoder:
+                self.latent_action_encoder = build_latent_action_encoder(self.config)
+            if self.latent_action_encoder is not None and self.latent_action_backend == "villax":
                 villax_num_tokens = int(self.latent_action_encoder.num_learned_tokens)
                 villax_codebook_size = int(self.latent_action_encoder.n_codes)
                 if self.num_codebooks != villax_num_tokens:
@@ -568,7 +574,10 @@ class Qwen_MetaQuery_LA(Qwen_MetaQuery):
 
             r = self.repeated_diffusion_steps
             actions_target = actions_target.repeat(r, 1, 1)
-            meta_embs_r = [h.repeat(r, 1, 1) for h in meta_embs]
+            if self.detach_vl_embs_for_action_head:
+                meta_embs_r = [h.detach().repeat(r, 1, 1) for h in meta_embs]
+            else:
+                meta_embs_r = [h.repeat(r, 1, 1) for h in meta_embs]
 
             state_repeated = None
             if state is not None:
