@@ -133,6 +133,51 @@ class AgilexData48Config(AgilexDataConfig):
         ])
 
 
+class Robotwin32EefDataConfig:
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    video_keys = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
+    state_keys = ["state.left_endpose", "state.right_endpose", "state.left_gripper", "state.right_gripper"]
+    action_keys = ["action.left_endpose", "action.right_endpose", "action.left_gripper", "action.right_gripper"]
+    state_input_keys = ["state.left_endpose", "state.left_gripper", "state.right_endpose", "state.right_gripper"]
+    action_key_dims = {"action.left_endpose": 7, "action.right_endpose": 7, "action.left_gripper": 1, "action.right_gripper": 1}
+    state_key_dims = {"state.left_endpose": 7, "state.right_endpose": 7, "state.left_gripper": 1, "state.right_gripper": 1}
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    action_indices = list(range(32))
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.video_keys),
+            "state": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.state_keys),
+            "action": ModalityConfig(delta_indices=self.action_indices, modality_keys=self.action_keys),
+            "language": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.language_keys),
+        }
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_endpose": "q99",
+                    "state.right_endpose": "q99",
+                    "state.left_gripper": "min_max",
+                    "state.right_gripper": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.left_endpose": "q99",
+                    "action.right_endpose": "q99",
+                    "action.left_gripper": "min_max",
+                    "action.right_gripper": "min_max",
+                },
+            ),
+        ])
+
+
 # ---------------------------------------------------------------------------
 # DataConfig — ARX X5
 # ---------------------------------------------------------------------------
@@ -181,27 +226,147 @@ _ROBOTWIN2_LEROBOT_ROOT = Path(
     )
 )
 
+_ROBOTWIN2_HDF5_ROOT = Path(
+    os.environ.get(
+        "ROBOTWIN2_HDF5_ROOT",
+        "/inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset",
+    )
+)
+
+
+def _as_filter_set(values) -> set[str] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    return {str(value) for value in values}
+
+
+def _normalize_domains(domains) -> set[str] | None:
+    domains = _as_filter_set(domains)
+    if domains is None:
+        return None
+    aliases = {
+        "random": "randomized",
+        "rand": "randomized",
+        "randomized": "randomized",
+        "clean": "clean",
+    }
+    normalized = set()
+    for domain in domains:
+        key = domain.lower()
+        if key not in aliases:
+            raise ValueError(f"Unknown RoboTwin2 domain {domain!r}; expected clean or randomized.")
+        normalized.add(aliases[key])
+    return normalized
+
+
+def _matches_robotwin2_selection(
+    task: str,
+    embodiment: str,
+    domain: str,
+    tasks: set[str] | None,
+    embodiments: set[str] | None,
+    domains: set[str] | None,
+) -> bool:
+    if tasks is not None and task not in tasks:
+        return False
+    if embodiments is not None and embodiment not in embodiments:
+        return False
+    if domains is not None and domain not in domains:
+        return False
+    return True
+
+
+def _parse_lerobot_dataset_name(dataset_name: str) -> tuple[str, str, str] | None:
+    parts = Path(dataset_name).parts
+    if len(parts) >= 3:
+        task, embodiment, domain = parts[-3], parts[-2], parts[-1]
+        if domain in {"clean", "randomized"}:
+            return task, embodiment, domain
+    if len(parts) == 2:
+        task, split_name = parts
+        for domain in ("clean", "randomized"):
+            suffix = f"_{domain}"
+            if split_name.endswith(suffix):
+                return task, split_name[: -len(suffix)], domain
+    return None
+
+
+def _parse_hdf5_split_dir(split_dir: Path) -> tuple[str, str, str] | None:
+    task = split_dir.parent.name
+    split_name = split_dir.name
+    for domain in ("clean", "randomized"):
+        marker = f"_{domain}_"
+        if marker in split_name:
+            embodiment = split_name.split(marker, 1)[0]
+            return task, embodiment, domain
+    return None
+
 
 def _discover(
     robot_type: str = "robotwin",
     include_dataset_substrings: list[str] | None = None,
+    tasks: list[str] | set[str] | tuple[str, ...] | str | None = None,
+    embodiments: list[str] | set[str] | tuple[str, ...] | str | None = None,
+    domains: list[str] | set[str] | tuple[str, ...] | str | None = None,
+    layout: str = "lerobot",
+    root: Path | str | None = None,
 ) -> list[tuple[str, float, str]]:
-    """Discover dataset subdirs that already have modality metadata.
+    """Discover RoboTwin2 datasets with structured task/embodiment/domain filters.
 
-    The scan is intentional: it keeps the registry in sync with the on-disk
-    conversion output without hard-coding hundreds of paths.
+    Args:
+        robot_type: StarVLA robot_type/DataConfig key placed in mixture entries.
+        include_dataset_substrings: Backward-compatible substring filter.
+        tasks: Task names such as "hanging_mug" or ["place_phone_stand", ...].
+        embodiments: Embodiments such as "aloha-agilex", "arx-x5", "piper", "ur5", "franka".
+        domains: "clean", "randomized", or "random" alias.
+        layout: "lerobot" for <task>/<embodiment>/<domain> with meta/modality.json,
+            or "hdf5" for raw <task>/<embodiment>_<domain>_<count> directories.
+        root: Optional override root. Defaults to ROBOTWIN2_LEROBOT_ROOT or ROBOTWIN2_HDF5_ROOT.
 
-    If include_dataset_substrings is provided, only dataset paths containing at
-    least one of those substrings are returned.
+    Returns:
+        Mixture entries as (dataset_name, weight, robot_type). For hdf5 layout,
+        dataset_name is normalized to <task>/<embodiment>/<domain>.
     """
-    if not _ROBOTWIN2_LEROBOT_ROOT.is_dir():
+    tasks = _as_filter_set(tasks)
+    embodiments = _as_filter_set(embodiments)
+    domains = _normalize_domains(domains)
+    layout = str(layout).lower()
+    if layout not in {"lerobot", "hdf5"}:
+        raise ValueError(f"Unknown RoboTwin2 layout {layout!r}; expected lerobot or hdf5.")
+
+    root = Path(root) if root is not None else (_ROBOTWIN2_HDF5_ROOT if layout == "hdf5" else _ROBOTWIN2_LEROBOT_ROOT)
+    if not root.is_dir():
         return []
 
     mixture: list[tuple[str, float, str]] = []
-    for modality_file in sorted(_ROBOTWIN2_LEROBOT_ROOT.glob("**/meta/modality.json")):
-        dataset_dir = modality_file.parent.parent
-        dataset_name = dataset_dir.relative_to(_ROBOTWIN2_LEROBOT_ROOT).as_posix()
+    if layout == "lerobot":
+        dataset_dirs = sorted(modality_file.parent.parent for modality_file in root.glob("**/meta/modality.json"))
+        for dataset_dir in dataset_dirs:
+            dataset_name = dataset_dir.relative_to(root).as_posix()
+            parsed = _parse_lerobot_dataset_name(dataset_name)
+            if parsed is None:
+                continue
+            task, embodiment, domain = parsed
+            if not _matches_robotwin2_selection(task, embodiment, domain, tasks, embodiments, domains):
+                continue
+            if include_dataset_substrings and not any(substr in dataset_name for substr in include_dataset_substrings):
+                continue
+            mixture.append((dataset_name, 1.0, robot_type))
+        return mixture
+
+    for split_dir in sorted(path for path in root.glob("*/*") if path.is_dir()):
+        parsed = _parse_hdf5_split_dir(split_dir)
+        if parsed is None:
+            continue
+        task, embodiment, domain = parsed
+        dataset_name = f"{task}/{embodiment}/{domain}"
+        if not _matches_robotwin2_selection(task, embodiment, domain, tasks, embodiments, domains):
+            continue
         if include_dataset_substrings and not any(substr in dataset_name for substr in include_dataset_substrings):
+            continue
+        if not (split_dir / "data").is_dir():
             continue
         mixture.append((dataset_name, 1.0, robot_type))
     return mixture
@@ -213,6 +378,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robotwin32": AgilexData32Config(),
     "arx_x5": ArxX5DataConfig(),
     "robotwin48": AgilexData48Config(),
+    "robotwin32_eef": Robotwin32EefDataConfig(),
 }
 
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
@@ -225,6 +391,27 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
 # Mixtures
 # ---------------------------------------------------------------------------
 DATASET_NAMED_MIXTURES = {
+    "hdf5": [
+        ("blocks_ranking_size/aloha-agilex/clean", 1.0, "robotwin32"),
+    ],
+    "hdf5_aloha_clean": _discover(
+        "robotwin32",
+        embodiments=["aloha-agilex"],
+        domains=["clean"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_clean_eef": _discover(
+        "robotwin32_eef",
+        embodiments=["aloha-agilex"],
+        domains=["clean"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_clean_random_eef": _discover(
+        "robotwin32_eef",
+        embodiments=["aloha-agilex"],
+        domains=["clean", "randomized"],
+        layout="hdf5",
+    ),
     "robotwin_all": [
         ("Clean/adjust_bottle", 1.0, "robotwin"), ("Randomized/adjust_bottle", 1.0, "robotwin"),
         ("Clean/beat_block_hammer", 1.0, "robotwin"), ("Randomized/beat_block_hammer", 1.0, "robotwin"),

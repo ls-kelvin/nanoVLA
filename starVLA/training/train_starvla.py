@@ -70,7 +70,7 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
 
 
 def _supports_dual_vla_dataloaders(cfg) -> bool:
-    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA"}
+    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA", "QwenPI_v4_LA"}
 
 
 def _use_dual_vla_dataloaders(cfg) -> bool:
@@ -128,7 +128,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     if use_dual_dataloaders and not _supports_dual_vla_dataloaders(cfg):
         raise ValueError(
             "trainer.use_dual_vla_dataloaders=true is only supported for "
-            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA'}."
+            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA', 'QwenPI_v4_LA'}."
         )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None

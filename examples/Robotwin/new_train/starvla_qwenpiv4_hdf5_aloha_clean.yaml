@@ -1,0 +1,74 @@
+run_id: qwenpiv4_hdf5_aloha_clean_eef
+run_root_dir: results/Checkpoints2
+seed: 42
+wandb_project: starVLA_Robotwin
+is_debug: false
+version_id: "0.21"
+
+# QwenPI_v4 on RoboTwin2.0 raw HDF5 aloha-agilex clean EEF data.
+framework:
+  name: QwenPI_v4
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
+
+  action_model:
+    action_dim: 16
+    state_dim: 16
+    action_horizon: 32
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 20
+    diffusion_model_cfg:
+      input_embedding_dim: 1024
+      attention_head_dim: 32
+      num_attention_heads: 32
+      norm_type: "norm"
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: hdf5_dataset
+    include_state: true
+    data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset
+    data_mix: hdf5_aloha_clean_eef
+    hdf5_action_type: eef
+    action_type: abs_eef
+    action_mode: abs
+    per_device_batch_size: 32
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 1000
+  eval_num_samples: 512
+  eval_batch_size: 32
+  logging_frequency: 10
+  learning_rate:
+    base: 5e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

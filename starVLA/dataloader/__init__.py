@@ -41,9 +41,13 @@ def build_dataloader(
     batch_size=None,
 ): # TODO now here only is get dataset, we need mv dataloader to here
 
-    if dataset_py in {"lerobot_datasets", "lerobot_la_datasets"}:
+    if dataset_py in {"lerobot_datasets", "lerobot_la_datasets", "hdf5_dataset", "hdf5_la_dataset"}:
         if dataset_py == "lerobot_la_datasets":
             from starVLA.dataloader.lerobot_la_datasets import collate_fn, get_vla_dataset
+        elif dataset_py == "hdf5_la_dataset":
+            from starVLA.dataloader.hdf5_la_dataset import collate_fn, get_vla_dataset
+        elif dataset_py == "hdf5_dataset":
+            from starVLA.dataloader.hdf5_dataset import collate_fn, get_vla_dataset
         else:
             from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
         vla_dataset_cfg = cfg.datasets.vla_data
@@ -126,6 +130,10 @@ def build_vla_eval_dataloader(
     dataset_py = getattr(cfg.datasets.vla_data, "dataset_py", "lerobot_datasets")
     if dataset_py == "lerobot_la_datasets":
         from starVLA.dataloader.lerobot_la_datasets import collate_fn, get_vla_dataset
+    elif dataset_py == "hdf5_la_dataset":
+        from starVLA.dataloader.hdf5_la_dataset import collate_fn, get_vla_dataset
+    elif dataset_py == "hdf5_dataset":
+        from starVLA.dataloader.hdf5_dataset import collate_fn, get_vla_dataset
     else:
         from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
 

@@ -258,7 +258,8 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             frames = example.get("la_frames", None)
             if frames is None:
                 raise ValueError(
-                    "QwenPI_v4_LA requires `la_frames`. Use datasets.vla_data.dataset_py=lerobot_la_datasets "
+                    "QwenPI_v4_LA requires `la_frames`. Use "
+                    "datasets.vla_data.dataset_py=lerobot_la_datasets or hdf5_la_dataset "
                     "and enable datasets.vla_data.latent_action."
                 )
             if self.latent_action_backend == "villax":
