@@ -28,6 +28,7 @@ class ModelClient:
         action_mode: str = "abs",
         normalization_mode: str = "min_max",
         infer_every_steps: Optional[int] = None,
+        robotwin_action_type: str = "auto",
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
@@ -69,10 +70,12 @@ class ModelClient:
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
         self.infer_every_steps = self._resolve_infer_every_steps(infer_every_steps)
+        self.robotwin_action_type = self._resolve_robotwin_action_type(robotwin_action_type, server_meta)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
-            f"infer_every_steps: {self.infer_every_steps}, server_meta: {server_meta} ***"
+            f"infer_every_steps: {self.infer_every_steps}, "
+            f"robotwin_action_type: {self.robotwin_action_type}, server_meta: {server_meta} ***"
         )
 
     def reset(self, task_description: str) -> None:
@@ -101,6 +104,18 @@ class ModelClient:
                 f"infer_every_steps ({infer_every_steps}) cannot exceed action_chunk_size ({action_chunk_size})"
             )
         return infer_every_steps
+
+    def _resolve_robotwin_action_type(self, robotwin_action_type: str, server_meta: dict) -> str:
+        requested = str(robotwin_action_type or "auto").lower()
+        if requested in {"qpos", "ee"}:
+            return requested
+        if requested != "auto":
+            raise ValueError("robotwin_action_type must be one of: auto, qpos, ee")
+
+        action_keys = [str(key) for key in server_meta.get("action_keys", [])]
+        if any("endpose" in key for key in action_keys):
+            return "ee"
+        return "qpos"
 
     def step(
         self,
@@ -183,8 +198,18 @@ class ModelClient:
         if self.action_mode == "delta":
             self.prev_action = current_action.copy()
 
-        current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
+        current_action = self._to_robotwin_action(current_action)
         return current_action
+
+    def _to_robotwin_action(self, action: np.ndarray) -> np.ndarray:
+        if self.robotwin_action_type == "ee":
+            if action.shape[-1] != 16:
+                raise ValueError(f"RoboTwin ee action expects 16 dims, got {action.shape[-1]}")
+            return action[[0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]]
+
+        if action.shape[-1] != 14:
+            raise ValueError(f"RoboTwin qpos action expects 14 dims, got {action.shape[-1]}")
+        return action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
 
     def _delta_to_absolute(self, delta_actions: np.ndarray, current_state: np.ndarray) -> np.ndarray:
         """Convert delta actions to absolute actions."""
@@ -210,6 +235,7 @@ def get_model(usr_args):
         usr_args.get("normalization_mode", "min_max"),
     )
     infer_every_steps = usr_args.get("infer_every_steps", None)
+    robotwin_action_type = usr_args.get("robotwin_action_type", "auto")
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -222,6 +248,7 @@ def get_model(usr_args):
         action_mode=action_mode,
         normalization_mode=normalization_mode,
         infer_every_steps=infer_every_steps,
+        robotwin_action_type=robotwin_action_type,
     )
 
 
@@ -241,7 +268,23 @@ def eval(TASK_ENV, model, observation):
     # Order: [head, left, right] to match training order
     images = [head_img, left_img, right_img]
 
-    state = observation["joint_action"]["vector"]
+    if model.robotwin_action_type == "ee":
+        if "endpose" not in observation:
+            raise KeyError(
+                "RoboTwin ee eval requires observation['endpose']. "
+                "Enable endpose in the RoboTwin task config."
+            )
+        endpose = observation["endpose"]
+        state = np.concatenate(
+            [
+                np.asarray(endpose["left_endpose"], dtype=np.float32),
+                np.asarray([endpose["left_gripper"]], dtype=np.float32),
+                np.asarray(endpose["right_endpose"], dtype=np.float32),
+                np.asarray([endpose["right_gripper"]], dtype=np.float32),
+            ]
+        )
+    else:
+        state = observation["joint_action"]["vector"]
     example = {
         "lang": str(instruction),
         "image": images,
@@ -251,4 +294,4 @@ def eval(TASK_ENV, model, observation):
     action = model.step(example, step=TASK_ENV.take_action_cnt)
 
     # Execute action
-    TASK_ENV.take_action(action)
+    TASK_ENV.take_action(action, action_type=model.robotwin_action_type)

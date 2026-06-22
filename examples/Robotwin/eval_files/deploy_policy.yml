@@ -10,6 +10,8 @@ host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
+# auto selects qpos for joint checkpoints and ee for endpose/eef checkpoints.
+robotwin_action_type: "auto"
 # null keeps the legacy behavior: refresh inference every action_chunk_size steps.
 infer_every_steps: null
 
