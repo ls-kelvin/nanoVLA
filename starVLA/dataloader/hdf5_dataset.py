@@ -69,6 +69,13 @@ def _normalize_action_mode_state_map(action_mode_state_map) -> dict[str, str]:
     return {str(action_key): str(state_key) for action_key, state_key in (action_mode_state_map or {}).items()}
 
 
+def _normalize_image_channel_order(channel_order: str) -> str:
+    channel_order = str(channel_order).lower()
+    if channel_order not in {"rgb", "bgr"}:
+        raise ValueError(f"image channel order must be 'rgb' or 'bgr', got {channel_order!r}")
+    return channel_order
+
+
 def _resolve_hdf5_dataset_path(data_root_dir: Path, data_name: str) -> Path:
     direct = data_root_dir / data_name
     if direct.is_dir():
@@ -165,6 +172,9 @@ class HDF5SingleDataset(Dataset):
         self.hdf5_action_type = str(_cfg_get(data_cfg, "hdf5_action_type", "qpos")).lower()
         if self.hdf5_action_type not in {"qpos", "eef"}:
             raise ValueError(f"hdf5_action_type must be 'qpos' or 'eef', got {self.hdf5_action_type!r}")
+        self.hdf5_image_channel_order = _normalize_image_channel_order(
+            _cfg_get(data_cfg, "hdf5_image_channel_order", "rgb")
+        )
 
         self.tag = embodiment_tag.value if isinstance(embodiment_tag, EmbodimentTag) else str(embodiment_tag)
         self._episode_files = _episode_files(self._dataset_path)
@@ -453,13 +463,15 @@ class HDF5SingleDataset(Dataset):
         right_gripper = np.asarray(h5_file["endpose/right_gripper"], dtype=np.float32).reshape(-1, 1)
         return np.concatenate([left_endpose, left_gripper, right_endpose, right_gripper], axis=1)
 
-    @staticmethod
-    def _decode_image(raw) -> Image.Image:
+    def _decode_image(self, raw) -> Image.Image:
         if isinstance(raw, np.ndarray):
             raw = raw.tobytes()
         else:
             raw = bytes(raw)
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+        if self.hdf5_image_channel_order == "bgr":
+            image = Image.fromarray(np.asarray(image)[:, :, ::-1])
+        return image
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         with open(self._cache_dir / "modality.json", "r", encoding="utf-8") as f:

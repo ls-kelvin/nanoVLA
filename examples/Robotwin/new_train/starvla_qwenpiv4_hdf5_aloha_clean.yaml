@@ -42,6 +42,7 @@ datasets:
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
     hdf5_action_type: eef
+    hdf5_image_channel_order: bgr
     action_type: abs_eef
     action_mode: abs
     per_device_batch_size: 32

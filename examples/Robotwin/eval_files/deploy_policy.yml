@@ -12,6 +12,8 @@ unnorm_key: "new_embodiment"
 action_mode: "abs"
 # auto selects qpos for joint checkpoints and ee for endpose/eef checkpoints.
 robotwin_action_type: "auto"
+# Use "bgr" only for checkpoints trained on legacy HDF5 images encoded with swapped RGB/BGR channels.
+image_channel_order: "rgb"
 # null keeps the legacy behavior: refresh inference every action_chunk_size steps.
 infer_every_steps: null
 

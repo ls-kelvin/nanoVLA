@@ -29,6 +29,7 @@ class ModelClient:
         normalization_mode: str = "min_max",
         infer_every_steps: Optional[int] = None,
         robotwin_action_type: str = "auto",
+        image_channel_order: str = "rgb",
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
@@ -71,11 +72,13 @@ class ModelClient:
         self.action_chunk_size = server_meta["action_chunk_size"]
         self.infer_every_steps = self._resolve_infer_every_steps(infer_every_steps)
         self.robotwin_action_type = self._resolve_robotwin_action_type(robotwin_action_type, server_meta)
+        self.image_channel_order = self._resolve_image_channel_order(image_channel_order)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
             f"infer_every_steps: {self.infer_every_steps}, "
-            f"robotwin_action_type: {self.robotwin_action_type}, server_meta: {server_meta} ***"
+            f"robotwin_action_type: {self.robotwin_action_type}, "
+            f"image_channel_order: {self.image_channel_order}, server_meta: {server_meta} ***"
         )
 
     def reset(self, task_description: str) -> None:
@@ -116,6 +119,18 @@ class ModelClient:
         if any("endpose" in key for key in action_keys):
             return "ee"
         return "qpos"
+
+    def _resolve_image_channel_order(self, image_channel_order: str) -> str:
+        image_channel_order = str(image_channel_order or "rgb").lower()
+        if image_channel_order not in {"rgb", "bgr"}:
+            raise ValueError("image_channel_order must be one of: rgb, bgr")
+        return image_channel_order
+
+    def _prepare_image(self, image: np.ndarray) -> np.ndarray:
+        image = np.asarray(image)
+        if self.image_channel_order == "bgr":
+            return image[..., ::-1].copy()
+        return image
 
     def step(
         self,
@@ -236,6 +251,7 @@ def get_model(usr_args):
     )
     infer_every_steps = usr_args.get("infer_every_steps", None)
     robotwin_action_type = usr_args.get("robotwin_action_type", "auto")
+    image_channel_order = usr_args.get("image_channel_order", "rgb")
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -249,6 +265,7 @@ def get_model(usr_args):
         normalization_mode=normalization_mode,
         infer_every_steps=infer_every_steps,
         robotwin_action_type=robotwin_action_type,
+        image_channel_order=image_channel_order,
     )
 
 
@@ -261,9 +278,9 @@ def eval(TASK_ENV, model, observation):
     instruction = TASK_ENV.get_instruction()
 
     # Prepare images
-    head_img = observation["observation"]["head_camera"]["rgb"]
-    left_img = observation["observation"]["left_camera"]["rgb"]
-    right_img = observation["observation"]["right_camera"]["rgb"]
+    head_img = model._prepare_image(observation["observation"]["head_camera"]["rgb"])
+    left_img = model._prepare_image(observation["observation"]["left_camera"]["rgb"])
+    right_img = model._prepare_image(observation["observation"]["right_camera"]["rgb"])
 
     # Order: [head, left, right] to match training order
     images = [head_img, left_img, right_img]
