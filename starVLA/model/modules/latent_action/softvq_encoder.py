@@ -8,6 +8,7 @@ from PIL import Image
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.modules.latent_action.interface import BaseLatentActionEncoder
+from starVLA.model.modules.latent_action.softvq_joint.joint_autoencoder_multi import MultiJointTokenizer
 
 
 DEFAULT_SOFTVQ_CONFIG_PATH = Path(__file__).resolve().parent / "softvq_joint" / "0614_joint_aloha_xrecon_scratch.yaml"
@@ -18,7 +19,7 @@ DEFAULT_SOFTVQ_CKPT_PATH = (
 
 
 class SoftVQLatentActionEncoder(BaseLatentActionEncoder):
-    """Frozen JointTokenizer vision encoder returning ``weights_v`` distributions."""
+    """Frozen MultiJointTokenizer vision encoder returning ``weights_v`` distributions."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -33,11 +34,9 @@ class SoftVQLatentActionEncoder(BaseLatentActionEncoder):
         if not ckpt_path.exists():
             raise FileNotFoundError(f"SoftVQ JointTokenizer checkpoint must be a local path: {ckpt_path}")
 
-        from starVLA.model.modules.latent_action.softvq_joint.joint_autoencoder import JointTokenizer
-
         cfg = OmegaConf.load(str(config_path))
         self.image_size = tuple(softvq_cfg.get("image_size", [224, 224]))
-        self.model = JointTokenizer(cfg.model)
+        self.model = MultiJointTokenizer(cfg.model)
         ckpt = self._load_checkpoint(str(ckpt_path))
         state_dict = ckpt.get("state_dict", ckpt)
         state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
@@ -68,7 +67,11 @@ class SoftVQLatentActionEncoder(BaseLatentActionEncoder):
         instructions: Sequence[str] | None = None,
     ) -> torch.Tensor:
         if not frame_pairs:
-            return torch.empty((0, 1, 0), dtype=torch.float32, device=self.device)
+            return torch.empty(
+                (0, self.model.vision.num_latent_tokens, self.model.vision.quantizer.codebook_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         frame_cur = []
         frame_future = []
@@ -82,9 +85,9 @@ class SoftVQLatentActionEncoder(BaseLatentActionEncoder):
         ff = torch.stack(frame_future, dim=0).to(self.device)
         self.model.eval()
         weights_v, _, _, _, _, _ = self.model.vision.encode(fc, ff)
-        if weights_v.ndim != 2:
-            raise RuntimeError(f"JointTokenizer vision.encode weights_v must be [B, K], got {tuple(weights_v.shape)}.")
-        return weights_v.float().unsqueeze(1)
+        if weights_v.ndim != 3:
+            raise RuntimeError(f"MultiJointTokenizer vision.encode weights_v must be [B, T, K], got {tuple(weights_v.shape)}.")
+        return weights_v.float()
 
     @torch.inference_mode()
     def encode(

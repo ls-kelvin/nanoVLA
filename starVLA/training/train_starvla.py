@@ -708,17 +708,12 @@ class VLATrainer(TrainerUtils):
             global_squared_error, global_elements, global_samples, global_batches = eval_totals.tolist()
             if int(eval_error_flag.item()) > 0:
                 step_metrics["validation/skipped_action_mse"] = 1
-                step_metrics["validation/error"] = (
-                    str(eval_error) if eval_error is not None else "validation failed on another rank"
-                )
             elif global_elements > 0:
                 step_metrics["mse_score"] = global_squared_error / global_elements
             else:
                 step_metrics["validation/skipped_action_mse"] = 1
             step_metrics["validation/num_samples"] = int(global_samples)
             step_metrics["validation/num_batches"] = int(global_batches)
-            if action_eval_robot_types is not None:
-                step_metrics["validation/action_eval_robot_types"] = ",".join(sorted(action_eval_robot_types))
 
         if dist.is_initialized():
             dist.barrier()

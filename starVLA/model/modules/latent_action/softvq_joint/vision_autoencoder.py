@@ -34,7 +34,9 @@ Decoder (FDM, AdaLN-Zero):
     near-identity reconstruction shortcut that drives latent collapse).
 
 Loss (single-coefficient dual-entropy regulariser):
-    recon_loss   MSE against tgt_frame_tokens (feature) or frame_future (pixel)
+    recon_loss   cosine distance (1 - cos-sim) against tgt DINO patch tokens when
+                 reconstruction_target=feature & feature_loss=cosine (UniT DINO mode),
+                 else MSE against tgt_frame_tokens (feature) or frame_future (pixel)
     entropy_loss = mi_beta * (H(z|x) - H(z))   [computed in SoftVectorQuantizer,
                    on a separate sharper temperature]
     total = recon_loss + entropy_loss = recon_loss - mi_beta * I(z; x)
@@ -80,6 +82,9 @@ class CNNFrameEncoder(nn.Module):
 class DINOFrameEncoder(nn.Module):
     """Frozen DINOv2 loaded from a local HuggingFace checkpoint directory.
 
+    Matches UniT ``DINOv2Wrapper``: ImageNet-normalised inputs, patch tokens
+    from a selectable transformer layer (default ``-2`` = second-to-last).
+
     Parameters
     ----------
     pretrained_path : str
@@ -87,9 +92,15 @@ class DINOFrameEncoder(nn.Module):
         from HuggingFace (facebook/dinov2-small / facebook/dinov2-base /
         facebook/dinov2-large).  No network access is performed; the path must
         exist on disk.
+    layer_index : int
+        Which transformer layer to read patch features from.
+        ``-1`` = last layer, ``-2`` = second-to-last (UniT default), etc.
     """
 
-    def __init__(self, pretrained_path: str) -> None:
+    _IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    _IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+    def __init__(self, pretrained_path: str, layer_index: int = -2) -> None:
         super().__init__()
         if not os.path.exists(pretrained_path):
             raise FileNotFoundError(
@@ -103,17 +114,42 @@ class DINOFrameEncoder(nn.Module):
         self.model = AutoModel.from_pretrained(pretrained_path)
         self.model.requires_grad_(False)
         self.model.eval()
+        self.layer_index = int(layer_index)
         # Both attributes come from the pretrained model's own config; the
         # user-supplied config value (if any) is intentionally ignored here.
         self.token_dim:  int = self.model.config.hidden_size
         self.patch_size: int = self.model.config.patch_size
+        self.register_buffer(
+            "_imagenet_mean",
+            torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_imagenet_std",
+            torch.tensor(self._IMAGENET_STD).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _preprocess(self, images: torch.Tensor) -> torch.Tensor:
+        """Convert dataset images in [0, 1] to ImageNet-normalised DINO inputs."""
+        mean = self._imagenet_mean.to(device=images.device, dtype=images.dtype)
+        std = self._imagenet_std.to(device=images.device, dtype=images.dtype)
+        return (images - mean) / std
 
     def forward(self, images: torch.Tensor):
-        """(B,3,H,W) → tokens (B,N,D), grid (h,w)."""
+        """(B,3,H,W) in [0,1] → tokens (B,N,D), grid (h,w)."""
+        pixel_values = self._preprocess(images)
+        model_kwargs: dict = {}
+        if self.layer_index != -1:
+            model_kwargs["output_hidden_states"] = True
         with torch.no_grad():
-            out = self.model(pixel_values=images)
-        # last_hidden_state: (B, 1+N, D); drop the CLS token at index 0
-        tokens = out.last_hidden_state[:, 1:]              # (B, N, D)
+            out = self.model(pixel_values=pixel_values, **model_kwargs)
+        if self.layer_index == -1:
+            hidden_state = out.last_hidden_state
+        else:
+            hidden_state = out.hidden_states[self.layer_index]
+        # DINO output: (B, 1+N, D); drop CLS token at index 0
+        tokens = hidden_state[:, 1:]
         h = images.shape[2] // self.patch_size
         w = images.shape[3] // self.patch_size
         return tokens, (h, w)
@@ -129,7 +165,8 @@ def build_frame_encoder(cfg) -> tuple[nn.Module, int]:
         return enc, token_dim
     elif enc_type == "dino":
         pretrained_path = str(cfg.pretrained_path)
-        enc = DINOFrameEncoder(pretrained_path=pretrained_path)
+        layer_index = int(cfg.get("layer_index", -2))
+        enc = DINOFrameEncoder(pretrained_path=pretrained_path, layer_index=layer_index)
         return enc, enc.token_dim
     else:
         raise ValueError(f"Unknown frame_encoder type: {enc_type!r}. Choose 'cnn' or 'dino'.")
@@ -351,7 +388,14 @@ class VisionAutoencoder(nn.Module):
                                      I(z;x) regulariser; = entropy_loss_ratio)
         src_mask_ratio      : float (fraction of source tokens masked at decode)
         reconstruction_target : "feature" | "pixel"  (default "feature")
-        adv_beta            : float (placeholder, currently unused; set 0)
+        feature_loss        : "cosine" | "mse"
+                              cosine = 1 - mean cos-sim per patch (UniT DINO mode)
+                              mse    = plain MSE on patch features
+                              default: cosine when reconstruction_target=feature, else mse
+        num_latent_tokens : int  (number of learnable latent queries M,
+                                     default 1; M>1 gives M parallel soft-VQ
+                                     slots whose embeddings serve as decoder
+                                     prefix tokens)
     """
 
     def __init__(self, cfg) -> None:
@@ -362,6 +406,8 @@ class VisionAutoencoder(nn.Module):
         E  = int(cfg.embedding_dim)
         recon_target = str(getattr(cfg, "reconstruction_target", "feature"))
         self.reconstruction_target = recon_target
+        default_feature_loss = "cosine" if recon_target == "feature" else "mse"
+        self.feature_loss = str(getattr(cfg, "feature_loss", default_feature_loss))
 
         # ---- Frame encoder ------------------------------------------------
         self.frame_encoder, frame_dim = build_frame_encoder(cfg.frame_encoder)
@@ -373,7 +419,11 @@ class VisionAutoencoder(nn.Module):
         self.type_embed_src = nn.Parameter(torch.randn(1, 1, H) * 0.02)
         self.type_embed_tgt = nn.Parameter(torch.randn(1, 1, H) * 0.02)
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, H) * 0.02)
+        # Multiple learnable latent queries (M slots); M=1 collapses to the
+        # original single-CLS-token design but still returns (B, 1, K)/(B, 1, E).
+        M = int(getattr(cfg, "num_latent_tokens", 1))
+        self.num_latent_tokens = M
+        self.latent_tokens = nn.Parameter(torch.randn(1, M, H) * 0.02)
         # Positional embedding is allocated for a max of 1024 tokens; actual
         # length is capped at runtime to the number of patch tokens N.
         self.enc_pos_embed = nn.Parameter(torch.randn(1, 1024, H) * 0.02)
@@ -405,7 +455,13 @@ class VisionAutoencoder(nn.Module):
             l2_norm             = bool(getattr(cfg, "l2_norm", True)),
         )
 
-        # ---- Decoder (FDM, AdaLN-Zero) ------------------------------------
+        # ---- Decoder (FDM, AdaLN-Zero + latent prefix) --------------------
+        # prefix_proj  : projects each of the M quantized embeddings (E) to a
+        #                prefix token (H) that is prepended to the src-token
+        #                sequence before the AdaLN decoder blocks.
+        # latent_proj  : projects the mean of M embeddings → global AdaLN
+        #                condition vector (H).  For M=1 identical to old code.
+        self.prefix_proj  = nn.Linear(E, H)
         self.latent_proj  = nn.Linear(E, H)
         self.dec_pos_embed = nn.Parameter(torch.randn(1, 1024, H) * 0.02)
 
@@ -463,8 +519,8 @@ class VisionAutoencoder(nn.Module):
         self,
         frame_cur: torch.Tensor,
         frame_future: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
-        """Encode a frame pair into categorical weights and latent embedding.
+    ) -> tuple[torch.Tensor, torch.Tensor, dict, torch.Tensor, torch.Tensor, tuple]:
+        """Encode a frame pair into categorical weights and latent embeddings.
 
         Parameters
         ----------
@@ -473,12 +529,12 @@ class VisionAutoencoder(nn.Module):
 
         Returns
         -------
-        weights      : (B, K)      soft categorical weights (sums to 1)
-        embedding    : (B, E)      quantized latent embedding
-        q            : dict        quantizer outputs (entropy terms, max_prob)
-        src_tokens_h : (B, N, H)   projected src patch tokens (for decoder)
+        weights      : (B, M, K)    soft categorical weights per slot (each sums to 1)
+        embedding    : (B, M, E)    quantized latent embeddings per slot
+        q            : dict         aggregated quantizer outputs (entropy terms, max_prob)
+        src_tokens_h : (B, N, H)    projected src patch tokens (for decoder)
         tgt_tokens   : (B, N, D_frame)  raw tgt patch tokens (for feature-mode loss)
-        grid         : (h, w)      spatial grid of patch tokens
+        grid         : (h, w)       spatial grid of patch tokens
         """
         # --- frame encoding (shared encoder) --------------------------------
         src_tokens, grid = self.frame_encoder(frame_cur)    # (B,N,D_frame)
@@ -487,26 +543,51 @@ class VisionAutoencoder(nn.Module):
         src_h = self.frame_to_hidden(src_tokens)  # (B,N,H)
         tgt_h = self.frame_to_hidden(tgt_tokens)  # (B,N,H)
 
-        B, N, H = src_h.shape
+        B, N, _ = src_h.shape
+        M = self.num_latent_tokens
 
         # --- positional + type embeddings ----------------------------------
         pos = self.enc_pos_embed[:, :N]             # (1,N,H)
         src_in = src_h + pos + self.type_embed_src  # (B,N,H)
         tgt_in = tgt_h + pos + self.type_embed_tgt  # (B,N,H)
 
-        cls = self.cls_token.expand(B, -1, -1)      # (B,1,H)
-        x   = torch.cat([cls, src_in, tgt_in], dim=1)  # (B, 1+2N, H)
+        latent = self.latent_tokens.expand(B, -1, -1)      # (B, M, H)
+        x      = torch.cat([latent, src_in, tgt_in], dim=1)  # (B, M+2N, H)
 
         # --- transformer encoder -------------------------------------------
-        x       = self.encoder(x)                   # (B, 1+2N, H)
-        cls_out = x[:, 0]                           # (B,H)
+        x          = self.encoder(x)              # (B, M+2N, H)
+        latent_out = x[:, :M]                     # (B, M, H)
 
-        # cosine soft-VQ: bounded logits → no saturation collapse
-        q = self.quantizer(cls_out)
-        weights   = q["weights"]                     # (B,K) soft assignment
-        embedding = q["quantized"]                   # (B,E) latent for decoder
+        # --- per-slot cosine soft-VQ ---------------------------------------
+        weights_list: list[torch.Tensor] = []
+        emb_list:     list[torch.Tensor] = []
+        entropy_loss   = latent_out.new_zeros(())
+        sample_entropy = latent_out.new_zeros(())
+        avg_entropy    = latent_out.new_zeros(())
+        max_prob       = latent_out.new_zeros(())
 
-        return weights, embedding, q, src_h, tgt_tokens, grid
+        for i in range(M):
+            q_i = self.quantizer(latent_out[:, i])   # (B, H) → quantizer
+            weights_list.append(q_i["weights"])       # (B, K)
+            emb_list.append(q_i["quantized"])         # (B, E)
+            entropy_loss   = entropy_loss   + q_i["entropy_loss"]
+            sample_entropy = sample_entropy + q_i["sample_entropy"]
+            avg_entropy    = avg_entropy    + q_i["avg_entropy"]
+            max_prob       = max_prob       + q_i["max_prob"]
+
+        weights   = torch.stack(weights_list, dim=1)   # (B, M, K)
+        embedding = torch.stack(emb_list,     dim=1)   # (B, M, E)
+
+        q_agg: dict = {
+            "quantized":      embedding,
+            "weights":        weights,
+            "entropy_loss":   entropy_loss   / M,
+            "sample_entropy": sample_entropy / M,
+            "avg_entropy":    avg_entropy    / M,
+            "max_prob":       max_prob       / M,
+        }
+
+        return weights, embedding, q_agg, src_h, tgt_tokens, grid
 
     # ------------------------------------------------------------------
     # Decode
@@ -545,11 +626,11 @@ class VisionAutoencoder(nn.Module):
         src_tokens_h: torch.Tensor,
         grid: tuple[int, int],
     ) -> dict:
-        """FDM decode: reconstruct target from source + latent.
+        """FDM decode: reconstruct target from source + latent prefix.
 
         Parameters
         ----------
-        embedding    : (B, E)
+        embedding    : (B, M, E)
         src_tokens_h : (B, N, H)   projected src patch tokens
         grid         : (h, w)
 
@@ -559,30 +640,40 @@ class VisionAutoencoder(nn.Module):
           'recon_frame_tokens' (B,N,D_frame)  for feature mode
           'recon_image'        (B,3,H,W)      for pixel mode
         """
-        B, N, H = src_tokens_h.shape
-        c = self.latent_proj(embedding)             # (B,H)
+        B, N, _ = src_tokens_h.shape
+        M = self.num_latent_tokens
 
-        # MAE-style masking (train only): drop a fraction of source tokens so
-        # those positions carry no current-frame info; the decoder must use the
-        # latent to reconstruct them. Mask token keeps positional embedding.
+        # M prefix tokens: project quantized embeddings (E) → hidden space (H)
+        prefix = self.prefix_proj(embedding)                # (B, M, H)
+
+        # Global AdaLN condition: mean of M embeddings, projected to H
+        c = self.latent_proj(embedding.mean(dim=1))         # (B, H)
+
+        # MAE-style masking (train only)
         query = src_tokens_h
         if self.training and self.src_mask_ratio > 0.0:
             query = self._mask_source_tokens(query)
 
-        # Query: source tokens + positional embedding (latent injected via AdaLN)
-        x = query + self.dec_pos_embed[:, :N]       # (B,N,H)
+        # Source tokens + positional embedding
+        x = query + self.dec_pos_embed[:, :N]               # (B, N, H)
+
+        # Prepend M prefix tokens → (B, M+N, H)
+        x = torch.cat([prefix, x], dim=1)
 
         for block in self.decoder_blocks:
             x = block(x, c)
-        x = self.dec_norm(x)                        # (B,N,H)
+        x = self.dec_norm(x)
+
+        # Drop prefix tokens; keep only the N source-aligned output tokens
+        x = x[:, M:]                                        # (B, N, H)
 
         out: dict = {"recon_tokens": x}
         if self.reconstruction_target == "pixel":
-            frame_tokens = self.hidden_to_frame(x)  # (B,N,D_frame)
+            frame_tokens = self.hidden_to_frame(x)          # (B,N,D_frame)
             out["recon_frame_tokens"] = frame_tokens
             out["recon_image"] = self.pixel_head(frame_tokens, grid)
         else:
-            out["recon_frame_tokens"] = self.output_head(x)  # (B,N,D_frame)
+            out["recon_frame_tokens"] = self.output_head(x) # (B,N,D_frame)
 
         return out
 
@@ -603,8 +694,13 @@ class VisionAutoencoder(nn.Module):
     ) -> torch.Tensor:
         if self.reconstruction_target == "pixel":
             return F.mse_loss(dec_out["recon_image"], frame_future)
-        else:
-            return F.mse_loss(dec_out["recon_frame_tokens"], tgt_frame_tokens.detach())
+        pred = dec_out["recon_frame_tokens"]
+        target = tgt_frame_tokens.detach()
+        if self.feature_loss == "cosine":
+            # UniT DINO mode: 1 - mean cosine similarity over patch tokens
+            cos_sim = F.cosine_similarity(pred, target, dim=-1)
+            return (1.0 - cos_sim).mean()
+        return F.mse_loss(pred, target)
 
     def compute_loss(
         self,
@@ -649,7 +745,7 @@ class VisionAutoencoder(nn.Module):
 
         Returns
         -------
-        dict with keys: weights, embedding, loss, recon, mi_zx, h_cond,
+        dict with keys: weights (B,M,K), embedding (B,M,E), loss, recon, mi_zx, h_cond,
                         h_marginal, max_prob, recon_frame_tokens (always),
                         recon_image (pixel mode only)
         """
@@ -707,7 +803,8 @@ if __name__ == "__main__":
     fi  = torch.randn(B, 3, 224, 224, device=device)
     fik = torch.randn(B, 3, 224, 224, device=device)
     out = model(fi, fik)
-    print(f"  weights     : {tuple(out['weights'].shape)}  sum={out['weights'][0].sum():.4f}")
+    M = cfg_cnn.get("num_latent_tokens", 1)
+    print(f"  weights     : {tuple(out['weights'].shape)}  sum_slot0={out['weights'][0, 0].sum():.4f}")
     print(f"  embedding   : {tuple(out['embedding'].shape)}")
     print(f"  recon_frame : {tuple(out['recon_frame_tokens'].shape)}")
     print(f"  loss={out['loss'].item():.4f}  recon={out['recon'].item():.4f}  mi={out['mi_zx'].item():.4f}")
@@ -715,6 +812,35 @@ if __name__ == "__main__":
     print("  [OK] backward passed")
     n = sum(p.numel() for p in model.parameters())
     print(f"  params: {n:,}")
+
+    # ------------------------------------------------------------------ Multi-latent
+    print()
+    print("=" * 60)
+    print("TEST 1b: num_latent_tokens=4, type=cnn, feature mode")
+    print("=" * 60)
+    cfg_multi = OmegaConf.create({
+        "frame_encoder": {"type": "cnn", "token_dim": 64, "patch_size": 16},
+        "hidden_dim": 128,
+        "embedding_dim": 128,
+        "codebook_size": 64,
+        "enc_layers": 2,
+        "enc_heads": 4,
+        "dec_layers": 2,
+        "dec_heads": 4,
+        "dropout": 0.0,
+        "mi_beta": 0.001,
+        "reconstruction_target": "feature",
+        "adv_beta": 0.0,
+        "num_latent_tokens": 4,
+    })
+    model_m = VisionAutoencoder(cfg_multi).to(device)
+    out_m = model_m(fi, fik)
+    print(f"  weights     : {tuple(out_m['weights'].shape)}  (B, M=4, K)")
+    print(f"  embedding   : {tuple(out_m['embedding'].shape)}  (B, M=4, E)")
+    print(f"  recon_frame : {tuple(out_m['recon_frame_tokens'].shape)}")
+    print(f"  loss={out_m['loss'].item():.4f}")
+    out_m["loss"].backward()
+    print("  [OK] backward passed")
 
     # ------------------------------------------------------------------ CNN pixel
     print()

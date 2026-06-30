@@ -392,8 +392,6 @@ class VLAMTrainer(TrainerUtils):
                 step_metrics["validation/skipped_action_mse"] = 1
             step_metrics["validation/num_samples"] = int(global_samples)
             step_metrics["validation/num_batches"] = int(global_batches)
-            if action_eval_robot_types is not None:
-                step_metrics["validation/action_eval_robot_types"] = ",".join(sorted(action_eval_robot_types))
 
         if dist.is_initialized():
             dist.barrier()
