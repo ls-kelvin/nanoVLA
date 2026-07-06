@@ -30,6 +30,8 @@ class ModelClient:
         infer_every_steps: Optional[int] = None,
         robotwin_action_type: str = "auto",
         image_channel_order: str = "rgb",
+        history_frame_offset: int = 0,
+        history_frame_key_index: int = 0,
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
@@ -73,17 +75,26 @@ class ModelClient:
         self.infer_every_steps = self._resolve_infer_every_steps(infer_every_steps)
         self.robotwin_action_type = self._resolve_robotwin_action_type(robotwin_action_type, server_meta)
         self.image_channel_order = self._resolve_image_channel_order(image_channel_order)
+
+        self.history_frame_offset = max(0, int(history_frame_offset))
+        self.history_frame_key_index = int(history_frame_key_index)
+        self._hf_buffer: deque = deque(maxlen=self.history_frame_offset if self.history_frame_offset > 0 else 1)
+
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
             f"infer_every_steps: {self.infer_every_steps}, "
             f"robotwin_action_type: {self.robotwin_action_type}, "
-            f"image_channel_order: {self.image_channel_order}, server_meta: {server_meta} ***"
+            f"image_channel_order: {self.image_channel_order}, "
+            f"history_frame_offset: {self.history_frame_offset}, "
+            f"history_frame_key_index: {self.history_frame_key_index}, "
+            f"server_meta: {server_meta} ***"
         )
 
     def reset(self, task_description: str) -> None:
         self.task_description = task_description
         self.image_history.clear()
+        self._hf_buffer.clear()
         if self.action_ensemble:
             self.action_ensembler.reset()
         self.num_image_history = 0
@@ -157,6 +168,16 @@ class ModelClient:
                 # Re-store initial state after reset if in delta/rel mode
                 if self.action_mode in ["delta", "rel"] and state is not None:
                     self.initial_state = np.array(state).copy()
+
+        if self.history_frame_offset > 0:
+            images = example["image"]
+            current_frame = images[self.history_frame_key_index]
+            if len(self._hf_buffer) > 0:
+                history_frame = self._hf_buffer[0]
+            else:
+                history_frame = current_frame
+            example["image"] = [history_frame] + list(images)
+            self._hf_buffer.append(current_frame)
 
         example_copy = example.copy()
         if state is not None:
@@ -252,6 +273,8 @@ def get_model(usr_args):
     infer_every_steps = usr_args.get("infer_every_steps", None)
     robotwin_action_type = usr_args.get("robotwin_action_type", "auto")
     image_channel_order = usr_args.get("image_channel_order", "rgb")
+    history_frame_offset = int(usr_args.get("history_frame_offset", 0))
+    history_frame_key_index = int(usr_args.get("history_frame_key_index", 0))
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -266,6 +289,8 @@ def get_model(usr_args):
         infer_every_steps=infer_every_steps,
         robotwin_action_type=robotwin_action_type,
         image_channel_order=image_channel_order,
+        history_frame_offset=history_frame_offset,
+        history_frame_key_index=history_frame_key_index,
     )
 
 

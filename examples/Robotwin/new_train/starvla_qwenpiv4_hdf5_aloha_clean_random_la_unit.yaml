@@ -16,6 +16,7 @@ framework:
   latent_action:
     enabled: true
     backend: unit
+    cached_indices_path: playground/cache/unit_clean_random
     loss_type: ce
     train_latent: true
     train_action: true
@@ -69,7 +70,11 @@ datasets:
       video_keys: [cam_high, cam_left_wrist, cam_right_wrist]
       include_terminal_frame: true
       image_size: [224, 224]
-      cached_indices_path: null
+      cached_indices_path: playground/cache/unit_clean_random
+    history_frame:
+      enabled: true
+      offset: 8
+      video_keys: [cam_high]
     include_state: true
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
