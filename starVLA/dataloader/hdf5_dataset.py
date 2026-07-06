@@ -173,7 +173,7 @@ class HDF5SingleDataset(Dataset):
         if self.hdf5_action_type not in {"qpos", "eef"}:
             raise ValueError(f"hdf5_action_type must be 'qpos' or 'eef', got {self.hdf5_action_type!r}")
         self.hdf5_image_channel_order = _normalize_image_channel_order(
-            _cfg_get(data_cfg, "hdf5_image_channel_order", "rgb")
+            _cfg_get(data_cfg, "hdf5_image_channel_order", "bgr")
         )
 
         self.tag = embodiment_tag.value if isinstance(embodiment_tag, EmbodimentTag) else str(embodiment_tag)

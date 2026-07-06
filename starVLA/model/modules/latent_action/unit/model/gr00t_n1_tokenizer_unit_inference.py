@@ -179,7 +179,7 @@ class GR00T_Tokenizer(PreTrainedModel):
                 f"Resolved dinov2_path={dinov2_path!r}."
             )
         dinov2_layer_index = config.backbone_cfg.get('dinov2_layer_index', -2)
-        dinov2_model = Dinov2Model.from_pretrained(dinov2_path, local_files_only=True)
+        dinov2_model = Dinov2Model.from_pretrained(dinov2_path, local_files_only=True, attn_implementation="sdpa")
         vision_model = DINOv2Wrapper(dinov2_model, layer_index=dinov2_layer_index)
 
         tune_visual = config.backbone_cfg.get('tune_visual', False)

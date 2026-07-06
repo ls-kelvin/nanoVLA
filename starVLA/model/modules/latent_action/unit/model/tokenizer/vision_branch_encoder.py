@@ -29,6 +29,26 @@ from transformers.models.vit.modeling_vit import ViTConfig
 from .m_former import MFormer
 
 
+def _encode_tensor_images(
+    vision_model: nn.Module,
+    pixel_values: torch.Tensor,
+    batch_size: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Run a 4D vision tower over tensors with optional leading image axes."""
+    if pixel_values.dim() < 4:
+        raise ValueError(
+            f"Expected image tensor with at least 4 dims (..., C, H, W), got {tuple(pixel_values.shape)}"
+        )
+
+    if pixel_values.dim() == 4:
+        flat_pixel_values = pixel_values
+    else:
+        flat_pixel_values = pixel_values.reshape(-1, *pixel_values.shape[-3:])
+
+    return vision_model(flat_pixel_values).reshape(batch_size, -1, hidden_size)
+
+
 @dataclass
 class VisionBranchEncoderConfig(PretrainedConfig):
     """Configuration for Vision Branch Encoder"""
@@ -114,12 +134,12 @@ class VisionBranchEncoder(nn.Module):
                 obs_features = self.vision_model(*obs_input.values()).reshape(batch_size, -1, self.hidden_size)
                 goal_features = self.vision_model(*goal_input.values()).reshape(batch_size, -1, self.hidden_size)
             else:
-                if obs_input.dim() == 5:
-                    obs_input = obs_input.squeeze(1)
-                if goal_input.dim() == 5:
-                    goal_input = goal_input.squeeze(1)
-                obs_features = self.vision_model(obs_input).reshape(batch_size, -1, self.hidden_size)
-                goal_features = self.vision_model(goal_input).reshape(batch_size, -1, self.hidden_size)
+                obs_features = _encode_tensor_images(
+                    self.vision_model, obs_input, batch_size, self.hidden_size
+                )
+                goal_features = _encode_tensor_images(
+                    self.vision_model, goal_input, batch_size, self.hidden_size
+                )
 
         # M-Former layout: [query_tokens, cond, sep, target] -- take the first query_num tokens.
         m_former_output = self.m_former(

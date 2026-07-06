@@ -23,7 +23,7 @@ framework:
     action_loss_weight: 1.0
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
-    groot_tokenizer_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/third_party/UniT/outputs/robotwin_tokenizer/checkpoint-80000
+    groot_tokenizer_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/third_party/UniT/outputs/robotwin_hdf5_multiview_endpose_tokenizer_robomind_replace_aloha_random
     dinov2_path_override: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/models/dinov2-large
     num_bridge_tokens: 8
     num_codebooks: 2

@@ -45,12 +45,16 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         self.latent_action_token_ids: list[int] = []
         self.latent_action_encoder = None
         self.latent_head = None
+        cached_indices_path = self.latent_action_cfg.get("cached_indices_path", None)
+        self.use_cached_indices = cached_indices_path is not None and str(cached_indices_path) not in ("", "null", "None")
         if self.latent_action_enabled:
             self._expand_latent_action_bridge_tokens()
-            if self.train_latent_action and load_latent_action_encoder:
+            if self.train_latent_action and load_latent_action_encoder and not self.use_cached_indices:
                 self.latent_action_encoder = build_latent_action_encoder(self.config)
                 if self.latent_action_backend == "villax":
                     self._sync_villax_shape_from_encoder()
+            elif self.use_cached_indices:
+                logger.info("Using cached latent-action indices from: %s", cached_indices_path)
             hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
             dropout = float(self.latent_action_private_cfg.get("head_dropout", 0.0))
             self.latent_head = nn.Sequential(
@@ -89,6 +93,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             "groot_tokenizer_path": None,
             "dinov2_path_override": None,
             "image_size": [224, 224],
+            "cached_indices_path": None,
             "qwenpi_v4_la": {
                 "token_format": "<latent_action_{i}>",
                 "head_dropout": 0.0,
@@ -341,6 +346,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         return vl_embs_list, attention_mask, latent_hidden, inputs
 
     def _make_discrete_targets(self, examples: List[dict], instructions: list[str]) -> torch.LongTensor:
+        if self.use_cached_indices and "la_cached_indices" in examples[0]:
+            return self._load_cached_targets(examples)
+
         if self.latent_action_encoder is None:
             raise RuntimeError("Latent-action encoder is not initialized.")
 
@@ -366,6 +374,22 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         return indices.reshape(len(examples), pair_count * self.num_bridge_tokens, self.num_codebooks).to(
             self.latent_action_bridge_token_ids.device
         )
+
+    def _load_cached_targets(self, examples: List[dict]) -> torch.LongTensor:
+        """Load pre-computed latent-action indices from cached data."""
+        cached_list = []
+        for example in examples:
+            cached = example.get("la_cached_indices", None)
+            if cached is None:
+                raise RuntimeError(
+                    "use_cached_indices is enabled but sample is missing 'la_cached_indices'. "
+                    "Ensure datasets.vla_data.latent_action.cached_indices_path is set correctly."
+                )
+            if not isinstance(cached, torch.Tensor):
+                cached = torch.tensor(cached, dtype=torch.long)
+            cached_list.append(cached)
+        indices = torch.stack(cached_list, dim=0)
+        return indices.to(self.latent_action_bridge_token_ids.device)
 
     def _make_villax_targets(self, examples: List[dict]) -> torch.LongTensor:
         all_clips = []
