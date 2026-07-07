@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -70,7 +71,19 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
 
 
 def _supports_dual_vla_dataloaders(cfg) -> bool:
-    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA", "QwenPI_v4_LA"}
+    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA", "QwenPI_v4_LA", "QwenWM_LA"}
+
+
+def _dataloader_loss_modes(cfg) -> dict:
+    """Per-dataloader forward loss modes; defaults preserve legacy latent/action split."""
+    modes = {"latent": "latent", "action": "action"}
+    configured = cfg.trainer.get("dataloader_loss_modes", None)
+    if configured:
+        for key in ("latent", "action"):
+            value = configured.get(key, None)
+            if value is not None and str(value).strip() != "":
+                modes[key] = str(value).strip().lower()
+    return modes
 
 
 def _use_dual_vla_dataloaders(cfg) -> bool:
@@ -84,7 +97,11 @@ def _make_action_dataloader_cfg(cfg):
     if latent_action_cfg is None:
         action_cfg.datasets.vla_data.latent_action = OmegaConf.create({})
         latent_action_cfg = action_cfg.datasets.vla_data.latent_action
-    latent_action_cfg.enabled = False
+    # When the action dataloader runs a joint/latent forward (e.g. QwenWM_LA), it
+    # needs `la_frames`, so keep latent-action frame packing enabled. Otherwise the
+    # action loader only forwards actions and latent packing is skipped for speed.
+    action_loss_mode = _dataloader_loss_modes(cfg)["action"]
+    latent_action_cfg.enabled = action_loss_mode in {"joint", "latent"}
     latent_action_cfg.load_action = True
     latent_action_cfg.load_state = True
     return action_cfg
@@ -228,6 +245,7 @@ class VLATrainer(TrainerUtils):
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
         self.use_dual_vla_dataloaders = vla_action_train_dataloader is not None
+        self.dataloader_loss_modes = _dataloader_loss_modes(cfg)
 
         self.completed_steps = 0
         self.tracker = None
@@ -285,6 +303,7 @@ class VLATrainer(TrainerUtils):
                 self.vla_train_dataloader,
             )
 
+        self._resume_full_state_if_needed()
         self._init_tracker()
 
     def _get_effective_batch_size(self, dataloader_name: str) -> int:
@@ -336,12 +355,23 @@ class VLATrainer(TrainerUtils):
         """Initialize checkpoint directory and handle checkpoint loading."""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self._full_state_resume_path = None
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
+            full_state_path, full_state_step = self._find_latest_full_state()
+            if full_state_path is not None:
+                self._full_state_resume_path = full_state_path
+                self.completed_steps = full_state_step
+                logger.info(
+                    f"Will resume from full training state: {full_state_path}, step={full_state_step} "
+                    "(actual load happens after accelerator.prepare)"
+                )
+                return
+
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
@@ -370,7 +400,14 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Loaded extra weight checkpoint: {extra_weight_checkpoint}")
 
     def _adjust_lr_scheduler_for_resume(self):
-        """Adjust LR scheduler state after resuming from non-zero steps."""
+        """Adjust LR scheduler state after resuming from non-zero steps.
+
+        Skipped when resuming from a full training state because
+        accelerator.load_state() restores the scheduler state directly.
+        """
+        if self._full_state_resume_path is not None:
+            logger.info("Skipping manual LR scheduler adjustment (full state resume will restore scheduler)")
+            return
         if self.completed_steps > 0:
             logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
             for _ in range(self.completed_steps):
@@ -383,6 +420,50 @@ class VLATrainer(TrainerUtils):
         """Load checkpoint."""
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+
+    def _find_latest_full_state(self):
+        """Find the latest full training state directory.
+
+        Returns:
+            (path, step) if found, (None, 0) otherwise.
+        """
+        states_dir = os.path.join(self.config.output_dir, "training_states")
+        if not os.path.exists(states_dir):
+            return None, 0
+
+        state_dirs = []
+        for d in os.listdir(states_dir):
+            if not d.startswith("state_"):
+                continue
+            full_path = os.path.join(states_dir, d)
+            if not os.path.isdir(full_path):
+                continue
+            try:
+                step = int(d.split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            state_dirs.append((full_path, step))
+
+        if not state_dirs:
+            return None, 0
+
+        state_dirs.sort(key=lambda x: x[1])
+        latest_path, latest_step = state_dirs[-1]
+
+        trainer_state_file = os.path.join(latest_path, "trainer_state.json")
+        if os.path.exists(trainer_state_file):
+            with open(trainer_state_file) as f:
+                trainer_state = json.load(f)
+            latest_step = trainer_state.get("completed_steps", latest_step)
+
+        return latest_path, latest_step
+
+    def _resume_full_state_if_needed(self):
+        """Load full training state after accelerator.prepare() if flagged during init."""
+        if self._full_state_resume_path is None:
+            return
+        self.accelerator.load_state(self._full_state_resume_path)
+        logger.info(f"✅ Full training state loaded from {self._full_state_resume_path}, step={self.completed_steps}")
 
     def _save_checkpoint(self):
         """Save current training state."""
@@ -412,6 +493,59 @@ class VLATrainer(TrainerUtils):
                 logger.info("✅ Configuration files saved")
 
         self.accelerator.wait_for_everyone()
+
+    def _save_full_state(self):
+        """Save full training state (model, optimizer, scheduler, RNG) via accelerator.
+
+        Controlled by ``trainer.save_full_state`` (bool, default False).
+        All ranks must participate because DeepSpeed/FSDP shards are per-rank.
+        """
+        if not getattr(self.config.trainer, "save_full_state", True):
+            return
+
+        states_dir = os.path.join(self.config.output_dir, "training_states")
+        state_dir = os.path.join(states_dir, f"state_{self.completed_steps}")
+
+        self.accelerator.save_state(state_dir)
+
+        if self.accelerator.is_main_process:
+            with open(os.path.join(state_dir, "trainer_state.json"), "w") as f:
+                json.dump({"completed_steps": self.completed_steps}, f)
+            logger.info(f"✅ Full training state saved at {state_dir}")
+            self._cleanup_old_full_states()
+
+        self.accelerator.wait_for_everyone()
+
+    def _cleanup_old_full_states(self):
+        """Remove oldest full-state directories when exceeding max_full_state_checkpoints."""
+        max_ckpts = getattr(self.config.trainer, "max_full_state_checkpoints", 2)
+        if max_ckpts is None or int(max_ckpts) <= 0:
+            return
+        max_ckpts = int(max_ckpts)
+
+        states_dir = os.path.join(self.config.output_dir, "training_states")
+        if not os.path.exists(states_dir):
+            return
+
+        state_dirs = []
+        for d in os.listdir(states_dir):
+            if not d.startswith("state_"):
+                continue
+            full_path = os.path.join(states_dir, d)
+            if not os.path.isdir(full_path):
+                continue
+            try:
+                step = int(d.split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            state_dirs.append((full_path, step))
+
+        state_dirs.sort(key=lambda x: x[1])
+
+        while len(state_dirs) > max_ckpts:
+            oldest_path, oldest_step = state_dirs.pop(0)
+            shutil.rmtree(oldest_path, ignore_errors=True)
+            logger.info(f"🗑️ Removed old training state: {oldest_path} (step {oldest_step})")
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
@@ -613,6 +747,7 @@ class VLATrainer(TrainerUtils):
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
+                self._save_full_state()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
@@ -745,12 +880,16 @@ class VLATrainer(TrainerUtils):
                     action_dit_loss = None
 
                     if active_dataloaders.get("latent", False):
-                        latent_output = self.model.forward(batch_vla["latent"], loss_mode="latent")
+                        latent_output = self.model.forward(
+                            batch_vla["latent"], loss_mode=self.dataloader_loss_modes["latent"]
+                        )
                         total_loss = latent_output["total_loss"]
                         output_dict.update(latent_output)
 
                     if active_dataloaders.get("action", False):
-                        action_output = self.model.forward(batch_vla["action"], loss_mode="action")
+                        action_output = self.model.forward(
+                            batch_vla["action"], loss_mode=self.dataloader_loss_modes["action"]
+                        )
                         total_loss = (
                             action_output["total_loss"]
                             if total_loss is None

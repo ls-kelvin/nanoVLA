@@ -87,8 +87,6 @@ class MFormerEmbeddings(nn.Module):
 
 class MFormer(ViTPreTrainedModel):
     def __init__(self, config: ViTConfig):
-        if not hasattr(config, "_attn_implementation") or config._attn_implementation is None:
-            config._attn_implementation = "sdpa"
         super().__init__(config)
         self.config = config
         self.query_num = config.query_num

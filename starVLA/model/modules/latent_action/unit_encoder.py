@@ -44,10 +44,7 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
         )
         self.model.eval()
         self.model.requires_grad_(False)
-
-        self.model.vision_branch = torch.compile(self.model.vision_branch)
-        self.model.fusion = torch.compile(self.model.fusion)
-
+        
     @property
     def device(self):
         return self.model.device
@@ -55,6 +52,16 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
     @property
     def dtype(self):
         return self.model.dtype
+
+    @property
+    def query_num(self) -> int:
+        """Number of UniT motion query tokens per frame pair (== VQ tokens)."""
+        return int(self.model.query_num)
+
+    @property
+    def latent_dim(self) -> int:
+        """Continuous latent dimension before quantization (VQ ``e_dim``)."""
+        return int(self.model.config.vq_cfg["e_dim"])
 
     @staticmethod
     def imagenet_tensor_from_pil(image: Image.Image, image_size: tuple[int, int]) -> torch.Tensor:
@@ -78,8 +85,11 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
             return False
         return isinstance(pair[0], (list, tuple))
 
-    def _encode_vq(self, obs_input: torch.Tensor, goal_input: torch.Tensor) -> torch.LongTensor:
-        """Run vision branch -> fusion -> VQ and return indices."""
+    def _fuse_unit_tokens_down(self, obs_input: torch.Tensor, goal_input: torch.Tensor) -> torch.Tensor:
+        """Run vision branch -> fusion -> vq_down_resampler; return continuous pre-VQ tokens.
+
+        Returns tensor shaped ``[B, query_num, e_dim]`` (the ``before_quant`` embedding).
+        """
         batch_size = obs_input.shape[0]
         self.model.eval()
         visual_tokens, _, _ = self.model.vision_branch(
@@ -96,7 +106,11 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
             pv=pv,
             pa=pa,
         )
-        unit_tokens_down = self.model.vq_down_resampler(unit_tokens)
+        return self.model.vq_down_resampler(unit_tokens)
+
+    def _encode_vq(self, obs_input: torch.Tensor, goal_input: torch.Tensor) -> torch.LongTensor:
+        """Run vision branch -> fusion -> VQ and return indices."""
+        unit_tokens_down = self._fuse_unit_tokens_down(obs_input, goal_input)
         _, vq_indices, _ = self.model.vq(unit_tokens_down)
 
         if vq_indices.ndim == 2:
@@ -117,7 +131,9 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
             return self._encode_multiview(frame_pairs)
         return self._encode_single_view(frame_pairs)
 
-    def _encode_single_view(self, frame_pairs: Sequence[Sequence[Image.Image]]) -> torch.LongTensor:
+    def _build_single_view_tensors(
+        self, frame_pairs: Sequence[Sequence[Image.Image]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         obs_images = []
         goal_images = []
         for pair in frame_pairs:
@@ -128,10 +144,10 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
 
         obs_input = torch.stack(obs_images, dim=0).unsqueeze(1).to(device=self.device, dtype=self.dtype)
         goal_input = torch.stack(goal_images, dim=0).unsqueeze(1).to(device=self.device, dtype=self.dtype)
-        return self._encode_vq(obs_input, goal_input)
+        return obs_input, goal_input
 
-    def _encode_multiview(self, frame_pairs: Sequence[Sequence]) -> torch.LongTensor:
-        """Encode multi-view frame pairs. Each pair is (obs_views, goal_views) where
+    def _build_multiview_tensors(self, frame_pairs: Sequence[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build multi-view frame-pair tensors. Each pair is (obs_views, goal_views) where
         obs_views/goal_views are lists of V PIL images."""
         obs_batch = []
         goal_batch = []
@@ -152,4 +168,33 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
 
         obs_input = torch.stack(obs_batch, dim=0).to(device=self.device, dtype=self.dtype)
         goal_input = torch.stack(goal_batch, dim=0).to(device=self.device, dtype=self.dtype)
+        return obs_input, goal_input
+
+    def _prepare_pair_tensors(self, frame_pairs: Sequence[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._is_multiview_pair(frame_pairs[0]):
+            return self._build_multiview_tensors(frame_pairs)
+        return self._build_single_view_tensors(frame_pairs)
+
+    def _encode_single_view(self, frame_pairs: Sequence[Sequence[Image.Image]]) -> torch.LongTensor:
+        obs_input, goal_input = self._build_single_view_tensors(frame_pairs)
         return self._encode_vq(obs_input, goal_input)
+
+    def _encode_multiview(self, frame_pairs: Sequence[Sequence]) -> torch.LongTensor:
+        obs_input, goal_input = self._build_multiview_tensors(frame_pairs)
+        return self._encode_vq(obs_input, goal_input)
+
+    @torch.no_grad()
+    def encode_continuous(
+        self,
+        frame_pairs: Sequence[Sequence],
+        instructions: Sequence[str] | None = None,
+    ) -> torch.Tensor:
+        """Encode frame pairs into continuous pre-quantization embeddings.
+
+        Returns tensor shaped ``[num_pairs, query_num, e_dim]`` (the UniT
+        ``before_quant`` / ``unit_tokens_down`` motion embedding).
+        """
+        if not frame_pairs:
+            return torch.empty((0, 0, 0), dtype=self.dtype, device=self.device)
+        obs_input, goal_input = self._prepare_pair_tensors(frame_pairs)
+        return self._fuse_unit_tokens_down(obs_input, goal_input)
