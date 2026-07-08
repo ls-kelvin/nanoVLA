@@ -16,7 +16,7 @@ framework:
   latent_action:
     enabled: true
     backend: unit
-    cached_indices_path: playground/cache/unit_clean_random
+    cached_indices_path: null
     loss_type: ce
     train_latent: true
     train_action: true
@@ -55,7 +55,7 @@ framework:
       attention_head_dim: 32
       num_attention_heads: 32
       norm_type: "norm"
-      dropout: 0.2
+      dropout: 0.0
       final_dropout: true
       interleave_self_attention: true
       positional_embeddings: null
@@ -70,9 +70,9 @@ datasets:
       video_keys: [cam_high, cam_left_wrist, cam_right_wrist]
       include_terminal_frame: true
       image_size: [224, 224]
-      cached_indices_path: playground/cache/unit_clean_random
+      cached_indices_path: null
     history_frame:
-      enabled: true
+      enabled: false
       offset: 8
       video_keys: [cam_high]
     include_state: true
@@ -105,6 +105,8 @@ trainer:
   logging_frequency: 50
   learning_rate:
     base: 5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-06

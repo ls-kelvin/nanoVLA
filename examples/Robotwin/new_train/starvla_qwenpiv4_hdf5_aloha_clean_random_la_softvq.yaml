@@ -55,7 +55,7 @@ framework:
       attention_head_dim: 32
       num_attention_heads: 32
       norm_type: "norm"
-      dropout: 0.2
+      dropout: 0.0
       final_dropout: true
       interleave_self_attention: true
       positional_embeddings: null

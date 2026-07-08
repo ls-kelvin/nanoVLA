@@ -21,7 +21,7 @@ framework:
     backend: unit
     train_latent: true
     train_action: true
-    latent_loss_weight: 0.1
+    latent_loss_weight: 1.0
     action_loss_weight: 1.0
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
@@ -47,7 +47,7 @@ framework:
       attention_head_dim: 32
       num_attention_heads: 32
       norm_type: "norm"
-      dropout: 0.2
+      dropout: 0.0
       final_dropout: true
       interleave_self_attention: true
       positional_embeddings: null
@@ -59,11 +59,11 @@ datasets:
       enabled: true
       stride: 16
       horizon: 32
-      video_keys: [cam_high, cam_left_wrist, cam_right_wrist]
+      video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
     history_frame:
-      enabled: true
+      enabled: false
       offset: 8
       video_keys: [cam_high]
     include_state: true
@@ -99,6 +99,8 @@ trainer:
   logging_frequency: 50
   learning_rate:
     base: 5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-06
