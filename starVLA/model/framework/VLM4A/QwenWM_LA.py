@@ -20,6 +20,11 @@ import torch
 import torch.distributed as dist
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
+from starVLA.dataloader.lerobot_la_datasets import (
+    _cfg_get,
+    _resolve_latent_action_horizon,
+    _resolve_latent_action_stride,
+)
 from starVLA.model.framework.VLM4A.QwenPI_v4 import Qwen_PI_v4
 from starVLA.model.framework.share_tools import load_state_dict_ignore_pretrained_latent_encoder
 from starVLA.model.modules.action_model.LayerwiseMetaqueryWM_ActionHeader import (
@@ -221,17 +226,26 @@ class Qwen_WM_LA(Qwen_PI_v4):
             len(examples), pair_count * self.latent_query_num, embeddings.shape[2]
         ).to(device=device, dtype=dtype)
 
+    def _compute_latent_window_count(self, robot_type: str | None) -> int:
+        """Mirror hdf5_la_dataset offset packing: window_count = len(offsets) - 1."""
+        la_cfg = getattr(self.config.datasets.vla_data, "latent_action", None)
+        if la_cfg is None:
+            raise ValueError(
+                "QwenWM_LA requires datasets.vla_data.latent_action in config to size the latent stream."
+            )
+        stride = _resolve_latent_action_stride(la_cfg, robot_type)
+        la_horizon = _resolve_latent_action_horizon(la_cfg, robot_type, self.action_horizon)
+        offsets = list(range(0, la_horizon + 1, stride))
+        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != la_horizon:
+            offsets.append(la_horizon)
+        return len(offsets) - 1
+
     def _infer_num_latent_tokens(self, examples: List[dict]) -> int:
         if not self.train_latent_action:
             return 0
-        frames = examples[0].get("la_frames", None)
-        if frames is None or len(frames) < 2:
-            raise ValueError(
-                "QwenWM_LA.predict_action requires `la_frames` to size the latent stream. "
-                "Enable datasets.vla_data.latent_action for the eval dataset."
-            )
-        window_count = len(frames) - 1
-        return window_count * self.latent_query_num
+        robot_type = examples[0].get("robot_type", None)
+        robot_type = str(robot_type) if robot_type is not None else None
+        return self._compute_latent_window_count(robot_type) * self.latent_query_num
 
     # ------------------------------------------------------------------ #
     # Head invocation
@@ -421,7 +435,9 @@ class Qwen_WM_LA(Qwen_PI_v4):
             if state is not None
             else None
         )
-        num_latent_tokens = self._infer_num_latent_tokens(examples)
+        num_latent_tokens = kwargs.pop("num_latent_tokens", None)
+        if num_latent_tokens is None:
+            num_latent_tokens = self._infer_num_latent_tokens(examples)
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
                 vl_embs_list,

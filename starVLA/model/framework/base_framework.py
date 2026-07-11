@@ -71,7 +71,7 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
 
     model_class = FRAMEWORK_REGISTRY[framework_id]
     constructor_kwargs = dict(kwargs)
-    if framework_id not in {"QwenPI_v3_LA", "QwenPI_v4_LA", "QwenMetaQuery_LA"}:
+    if framework_id not in {"QwenPI_v3_LA", "QwenPI_v4_LA", "QwenMetaQuery_LA", "QwenWM_LA"}:
         constructor_kwargs.pop("load_latent_action_encoder", None)
     return model_class(cfg, **constructor_kwargs)
 
