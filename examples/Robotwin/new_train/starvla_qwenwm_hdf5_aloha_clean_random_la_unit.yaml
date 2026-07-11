@@ -26,7 +26,7 @@ framework:
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
     groot_tokenizer_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/third_party/UniT/outputs/robotwin_tokenizer/checkpoint-80000
-    dinov2_path_override: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/models/dinov2-large
+    dinov2_path_override: /mnt/netdata/Team/Personal/zzt/models/dinov2-large
     image_size: [224, 224]
 
   action_model:

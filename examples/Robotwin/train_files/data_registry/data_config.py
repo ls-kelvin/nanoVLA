@@ -229,7 +229,7 @@ _ROBOTWIN2_LEROBOT_ROOT = Path(
 _ROBOTWIN2_HDF5_ROOT = Path(
     os.environ.get(
         "ROBOTWIN2_HDF5_ROOT",
-        "/inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset",
+        "/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset",
     )
 )
 
@@ -404,6 +404,12 @@ DATASET_NAMED_MIXTURES = {
         "robotwin32_eef",
         embodiments=["aloha-agilex"],
         domains=["clean"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_random_eef": _discover(
+        "robotwin32_eef",
+        embodiments=["aloha-agilex"],
+        domains=["randomized"],
         layout="hdf5",
     ),
     "hdf5_aloha_clean_random_eef": _discover(
