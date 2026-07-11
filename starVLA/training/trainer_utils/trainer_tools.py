@@ -21,6 +21,29 @@ from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
 
+_TORCH_LOAD_LEGACY_PATCHED = False
+_ORIGINAL_TORCH_LOAD = None
+
+
+def enable_torch_load_legacy_pickle() -> None:
+    """Allow loading trusted legacy checkpoints under PyTorch >= 2.6.
+
+    PyTorch 2.6+ defaults ``torch.load(..., weights_only=True)``. DeepSpeed
+    training-state checkpoints pickle optimizer objects (e.g. ``LossScaler``)
+    that are rejected unless ``weights_only=False``.
+    """
+    global _TORCH_LOAD_LEGACY_PATCHED, _ORIGINAL_TORCH_LOAD
+    if _TORCH_LOAD_LEGACY_PATCHED:
+        return
+    _ORIGINAL_TORCH_LOAD = torch.load
+
+    def _torch_load_compat(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _ORIGINAL_TORCH_LOAD(*args, **kwargs)
+
+    torch.load = _torch_load_compat
+    _TORCH_LOAD_LEGACY_PATCHED = True
+
 
 # === Define Tracker Interface ===
 #
@@ -449,7 +472,7 @@ class TrainerUtils:
 
                 checkpoint = load_file(checkpoint_path)
             else:
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
 
@@ -515,7 +538,7 @@ class TrainerUtils:
 
             checkpoint = load_file(checkpoint_path)
         else:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         if not isinstance(checkpoint, Mapping):
             raise TypeError(f"checkpoint must be a state_dict-like mapping, got {type(checkpoint).__name__}")

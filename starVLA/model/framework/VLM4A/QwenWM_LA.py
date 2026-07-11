@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenPI_v4 import Qwen_PI_v4
+from starVLA.model.framework.share_tools import load_state_dict_ignore_pretrained_latent_encoder
 from starVLA.model.modules.action_model.LayerwiseMetaqueryWM_ActionHeader import (
     LayerwiseMetaqueryWMFlowmatchingActionHead,
 )
@@ -112,6 +113,11 @@ class Qwen_WM_LA(Qwen_PI_v4):
         for key in keys_to_remove:
             del state_dict[key]
         return state_dict
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        return load_state_dict_ignore_pretrained_latent_encoder(
+            self, state_dict, strict=strict, assign=assign
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers (mirrored from Qwen_PI_v4_LA)

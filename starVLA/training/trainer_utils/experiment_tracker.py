@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from omegaconf import OmegaConf
+
+from starVLA.training.trainer_utils.metrics_jsonl import append_metrics_jsonl
+
+logger = logging.getLogger(__name__)
 
 
 def _unwrap_config(cfg: Any) -> Any:
@@ -39,12 +45,19 @@ def _select_tracker_backend(cfg: Any) -> str:
 class ExperimentTracker:
     backend: str
     module: Any
+    metrics_jsonl_path: Optional[Path] = None
 
     def log(self, metrics, step=None):
-        if step is None:
-            self.module.log(metrics)
-        else:
-            self.module.log(metrics, step=step)
+        if self.metrics_jsonl_path is not None and step is not None:
+            append_metrics_jsonl(self.metrics_jsonl_path, step, metrics)
+
+        try:
+            if step is None:
+                self.module.log(metrics)
+            else:
+                self.module.log(metrics, step=step)
+        except Exception as exc:
+            logger.warning("Experiment tracker log failed at step %s: %s", step, exc)
 
     def finish(self):
         finish = getattr(self.module, "finish", None)
@@ -52,11 +65,17 @@ class ExperimentTracker:
             finish()
 
 
-def build_experiment_tracker(cfg: Any, log_dir: str, group: str = "vla-train") -> ExperimentTracker:
+def build_experiment_tracker(
+    cfg: Any,
+    log_dir: str,
+    group: str = "vla-train",
+    metrics_jsonl_path: str | Path | None = None,
+) -> ExperimentTracker:
     backend = _select_tracker_backend(cfg)
     run_name = getattr(cfg, "run_id", None)
     project_name = getattr(cfg, "wandb_project", None)
     workspace_name = getattr(cfg, "wandb_entity", None)
+    jsonl_path = Path(metrics_jsonl_path) if metrics_jsonl_path is not None else None
 
     if backend == "wandb":
         module = importlib.import_module("wandb")
@@ -67,7 +86,7 @@ def build_experiment_tracker(cfg: Any, log_dir: str, group: str = "vla-train") -
             entity=workspace_name,
             group=group,
         )
-        return ExperimentTracker(backend=backend, module=module)
+        return ExperimentTracker(backend=backend, module=module, metrics_jsonl_path=jsonl_path)
 
     if backend == "swanlab":
         module = importlib.import_module("swanlab")
@@ -79,7 +98,7 @@ def build_experiment_tracker(cfg: Any, log_dir: str, group: str = "vla-train") -
             workspace=workspace_name,
             config=_to_plain_config(cfg),
         )
-        return ExperimentTracker(backend=backend, module=module)
+        return ExperimentTracker(backend=backend, module=module, metrics_jsonl_path=jsonl_path)
 
     raise ValueError(
         f"Unsupported tracker_backend `{backend}`. "
