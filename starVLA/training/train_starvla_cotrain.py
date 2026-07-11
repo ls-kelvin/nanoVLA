@@ -35,6 +35,7 @@ from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.experiment_tracker import build_experiment_tracker
+from starVLA.training.trainer_utils.metrics_jsonl import metrics_jsonl_path
 from starVLA.training.trainer_utils.trainer_tools import (
     TrainerUtils,
     create_accelerator_from_config,
@@ -187,6 +188,7 @@ class VLAMTrainer(TrainerUtils):
                 self.config,
                 log_dir=os.path.join(self.config.output_dir, "wandb"),
                 group="vla-train",
+                metrics_jsonl_path=metrics_jsonl_path(self.config.output_dir),
             )
 
     def _init_checkpointing(self):

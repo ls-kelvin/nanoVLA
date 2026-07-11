@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import torch
 from omegaconf import OmegaConf
 
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -529,6 +530,35 @@ def apply_config_compat(cfg, *, strict: bool = False):
         overwatch.info(f"[apply_config_compat] normalised config from version_id={src_version!r} to {CONFIG_VERSION!r}")
 
     return cfg
+
+
+PRETRAINED_LATENT_ACTION_ENCODER_PREFIX = "latent_action_encoder."
+
+
+def load_state_dict_ignore_pretrained_latent_encoder(module, state_dict, strict=True, assign=False):
+    """Load weights while tolerating missing top-level ``latent_action_encoder.*`` keys.
+
+    LA frameworks exclude the frozen/pretrained UniT encoder from ``state_dict``; on
+    resume those weights come from ``groot_tokenizer_path`` at init and/or DeepSpeed
+    ``frozen_param_fragments``. Action-head keys such as
+    ``action_model.latent_action_encoder.*`` are still required.
+    """
+    from torch.nn.modules.module import _IncompatibleKeys
+
+    incompatible = torch.nn.Module.load_state_dict(module, state_dict, strict=False, assign=assign)
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(PRETRAINED_LATENT_ACTION_ENCODER_PREFIX)
+    ]
+    unexpected = list(incompatible.unexpected_keys)
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {type(module).__name__}:\n"
+            f"\tMissing key(s) in state_dict: {missing}\n"
+            f"\tUnexpected key(s) in state_dict: {unexpected}"
+        )
+    return _IncompatibleKeys(missing, unexpected)
 
 
 # ──────────────────────────────────────────────────────────────────────
