@@ -123,6 +123,13 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 "strict_load": True,
                 "kl_eps": 1e-8,
             },
+            "sharla": {
+                "config_path": None,
+                "ckpt_path": None,
+                "image_size": [224, 224],
+                "strict_load": True,
+                "kl_eps": 1e-8,
+            },
             "villax": {
                 "ckpt_path": None,
                 "image_size": [224, 224],
@@ -148,6 +155,14 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 "codebook_size": 64,
                 "strict_num_bridge_tokens": True,
             }
+        elif backend == "sharla":
+            backend_defaults = {
+                "loss_type": "soft_kl",
+                "num_bridge_tokens": 8,
+                "num_codebooks": 1,
+                "codebook_size": 256,
+                "strict_num_bridge_tokens": True,
+            }
         elif backend in {"unit", "groot_unit"}:
             backend_defaults = {"loss_type": "ce"}
         elif backend == "villax":
@@ -168,11 +183,13 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
     def _get_latent_action_loss_type(self) -> str:
         loss_type = str(self.latent_action_cfg.get("loss_type", "auto")).lower()
         if loss_type == "auto":
-            loss_type = "soft_kl" if self.latent_action_backend == "softvq" else "ce"
+            loss_type = "soft_kl" if self.latent_action_backend in {"softvq", "sharla"} else "ce"
         if loss_type not in {"ce", "soft_kl"}:
             raise ValueError(f"latent_action.loss_type must be 'ce' or 'soft_kl', got {loss_type!r}.")
-        if loss_type == "soft_kl" and self.latent_action_backend != "softvq":
-            raise ValueError("Use latent_action.backend='softvq' with latent_action.loss_type='soft_kl'.")
+        if loss_type == "soft_kl" and self.latent_action_backend not in {"softvq", "sharla"}:
+            raise ValueError(
+                "Use latent_action.backend='softvq' or 'sharla' with latent_action.loss_type='soft_kl'."
+            )
         return loss_type
 
     def _expand_latent_action_bridge_tokens(self) -> None:
@@ -447,29 +464,35 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 f"Latent-action indices must be in [0, {self.codebook_size}), got min={min_idx}, max={max_idx}."
             )
 
-    def _make_softvq_targets(self, examples: List[dict]) -> torch.Tensor:
+    def _make_soft_targets(self, examples: List[dict]) -> torch.Tensor:
         if self.latent_action_encoder is None:
             raise RuntimeError("Latent-action encoder is not initialized.")
         if not hasattr(self.latent_action_encoder, "encode_distribution"):
-            raise RuntimeError("SoftVQ latent-action encoder must implement encode_distribution().")
+            raise RuntimeError(
+                f"{self.latent_action_backend} latent-action encoder must implement encode_distribution()."
+            )
 
         frame_pairs, counts = self._build_latent_frame_pairs(examples)
         distributions = self.latent_action_encoder.encode_distribution(frame_pairs)
         if distributions.ndim != 3:
-            raise ValueError(f"SoftVQ encoder must return [pairs,tokens,codebook], got {tuple(distributions.shape)}.")
+            raise ValueError(
+                f"{self.latent_action_backend} encoder must return [pairs,tokens,codebook], "
+                f"got {tuple(distributions.shape)}."
+            )
         if distributions.shape[0] != len(frame_pairs):
             raise ValueError(
-                f"SoftVQ encoder returned {distributions.shape[0]} frame pairs, but {len(frame_pairs)} were provided."
+                f"{self.latent_action_backend} encoder returned {distributions.shape[0]} frame pairs, "
+                f"but {len(frame_pairs)} were provided."
             )
         if bool(self.latent_action_cfg.get("strict_num_bridge_tokens", True)):
             if distributions.shape[1] != self.num_bridge_tokens:
                 raise ValueError(
-                    f"SoftVQ encoder returned {distributions.shape[1]} bridge tokens, "
+                    f"{self.latent_action_backend} encoder returned {distributions.shape[1]} bridge tokens, "
                     f"but latent_action.num_bridge_tokens={self.num_bridge_tokens}."
                 )
         elif distributions.shape[1] < self.num_bridge_tokens:
             raise ValueError(
-                f"SoftVQ encoder returned {distributions.shape[1]} bridge tokens, "
+                f"{self.latent_action_backend} encoder returned {distributions.shape[1]} bridge tokens, "
                 f"fewer than latent_action.num_bridge_tokens={self.num_bridge_tokens}."
             )
         if distributions.shape[-1] != self.codebook_size:
@@ -532,12 +555,15 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
         if self.latent_action_loss_type == "soft_kl":
             if self.num_codebooks != 1:
-                raise ValueError("SoftVQ soft_kl currently requires latent_action.num_codebooks=1.")
+                raise ValueError("soft_kl requires latent_action.num_codebooks=1.")
             logits = logits.squeeze(2)
             if logits.shape != targets.shape:
-                raise ValueError(f"SoftVQ logits shape {tuple(logits.shape)} does not match target {tuple(targets.shape)}.")
+                raise ValueError(
+                    f"Latent logits shape {tuple(logits.shape)} does not match target {tuple(targets.shape)}."
+                )
 
-            eps = float(self.latent_action_cfg.get("softvq", {}).get("kl_eps", 1e-8))
+            backend_cfg = self.latent_action_cfg.get(self.latent_action_backend, {})
+            eps = float(backend_cfg.get("kl_eps", 1e-8))
             target_probs = targets.float().clamp_min(eps)
             target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
             log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -558,9 +584,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             max_prob = (max_prob * valid_mask).sum() / denom
             return {
                 "latent_action_loss": kl_loss,
-                "latent_softvq_kl_loss": kl_loss,
-                "latent_softvq_target_entropy": entropy,
-                "latent_softvq_target_max_prob": max_prob,
+                f"latent_{self.latent_action_backend}_kl_loss": kl_loss,
+                f"latent_{self.latent_action_backend}_target_entropy": entropy,
+                f"latent_{self.latent_action_backend}_target_max_prob": max_prob,
             }
 
         raise ValueError(f"Unknown latent_action_loss_type: {self.latent_action_loss_type}")
@@ -692,7 +718,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         latent_action_loss = None
         if compute_latent:
             if self.latent_action_loss_type == "soft_kl":
-                targets = self._make_softvq_targets(examples)
+                targets = self._make_soft_targets(examples)
                 valid_mask = self._collect_la_padding_mask(examples)
             else:
                 targets = self._make_discrete_targets(examples, instructions)

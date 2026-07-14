@@ -5,8 +5,8 @@ bridge-token positions), this framework moves latent-action learning **into the
 action head**.  A dedicated head
 (:class:`LayerwiseMetaqueryWMFlowmatchingActionHead`) prepends latent-action
 tokens before ``[state, action]`` and jointly denoises the sequence with a
-shared diffusion timestep.  The latent-action targets are the UniT
-pre-quantization continuous embeddings (``before_quant``).
+shared diffusion timestep. Latent-action targets are continuous tokenizer
+embeddings: UniT ``before_quant`` features or Sharla quantizer ``z_q`` outputs.
 
 Dual-dataloader usage (see trainer.dataloader_loss_modes):
   - main / action dataloader -> ``loss_mode='joint'`` (action + latent);
@@ -20,6 +20,11 @@ import torch
 import torch.distributed as dist
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
+from starVLA.dataloader.lerobot_la_datasets import (
+    _cfg_get,
+    _resolve_latent_action_horizon,
+    _resolve_latent_action_stride,
+)
 from starVLA.model.framework.VLM4A.QwenPI_v4 import Qwen_PI_v4
 from starVLA.model.framework.share_tools import load_state_dict_ignore_pretrained_latent_encoder
 from starVLA.model.modules.action_model.LayerwiseMetaqueryWM_ActionHeader import (
@@ -35,7 +40,7 @@ logger = initialize_overwatch(__name__)
 
 @FRAMEWORK_REGISTRY.register("QwenWM_LA")
 class Qwen_WM_LA(Qwen_PI_v4):
-    """QwenVL + joint latent-action/action flow-matching head (UniT continuous targets)."""
+    """QwenVL + joint latent-action/action flow-matching head."""
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         load_latent_action_encoder = bool(kwargs.pop("load_latent_action_encoder", True))
@@ -44,9 +49,10 @@ class Qwen_WM_LA(Qwen_PI_v4):
         self.latent_action_cfg = self.config.framework.latent_action
         self.latent_action_enabled = bool(self.latent_action_cfg.get("enabled", True))
         self.latent_action_backend = str(self.latent_action_cfg.get("backend", "unit")).lower()
-        if self.latent_action_backend not in {"unit", "groot_unit"}:
+        if self.latent_action_backend not in {"unit", "groot_unit", "sharla"}:
             raise NotImplementedError(
-                f"QwenWM_LA currently supports only backend='unit', got {self.latent_action_backend!r}."
+                "QwenWM_LA supports backend='unit', 'groot_unit', or 'sharla', "
+                f"got {self.latent_action_backend!r}."
             )
         self.train_latent_action = bool(self.latent_action_cfg.get("train_latent", True))
         self.train_continuous_action = bool(self.latent_action_cfg.get("train_action", True))
@@ -67,9 +73,13 @@ class Qwen_WM_LA(Qwen_PI_v4):
             self.latent_query_num = int(self.latent_action_cfg.get("query_num", 8))
             cfg_dim = self.latent_action_cfg.get("latent_dim", None)
             if cfg_dim is None:
+                cfg_dim = getattr(self.config.framework.action_model, "latent_action_dim", None)
+            if cfg_dim is None:
                 raise ValueError(
-                    "latent_action.latent_dim must be set when the UniT encoder is not loaded "
-                    "(e.g. smoke tests with latent_action.enabled=false)."
+                    "latent_action.latent_dim must be set when the latent-action encoder is not loaded "
+                    "(e.g. deployment with load_latent_action_encoder=false). "
+                    "Set framework.latent_action.latent_dim or ensure "
+                    "framework.action_model.latent_action_dim is present in the checkpoint config."
                 )
             latent_action_dim = int(cfg_dim)
 
@@ -100,6 +110,12 @@ class Qwen_WM_LA(Qwen_PI_v4):
             "image_size": [224, 224],
             "query_num": 8,
             "latent_dim": None,
+            "sharla": {
+                "config_path": None,
+                "ckpt_path": None,
+                "image_size": [224, 224],
+                "strict_load": True,
+            },
         }
         current = self.config.framework.get("latent_action", {})
         self.config.framework.latent_action = OmegaConf.merge(
@@ -191,7 +207,7 @@ class Qwen_WM_LA(Qwen_PI_v4):
         return loss * (dist.get_world_size() * float(local_count) / count)
 
     # ------------------------------------------------------------------ #
-    # Latent targets (UniT continuous / before-quant embeddings)
+    # Latent targets (continuous tokenizer embeddings)
     # ------------------------------------------------------------------ #
     def _make_continuous_targets(self, examples: List[dict], device, dtype) -> torch.Tensor:
         if self.latent_action_encoder is None:
@@ -200,20 +216,22 @@ class Qwen_WM_LA(Qwen_PI_v4):
         embeddings = self.latent_action_encoder.encode_continuous(frame_pairs)
         if embeddings.ndim != 3:
             raise ValueError(
-                f"UniT encode_continuous must return [pairs, query, e_dim], got {tuple(embeddings.shape)}."
+                f"{self.latent_action_backend} encode_continuous must return [pairs, query, latent_dim], "
+                f"got {tuple(embeddings.shape)}."
             )
         if embeddings.shape[0] != len(frame_pairs):
             raise ValueError(
-                f"UniT encoder returned {embeddings.shape[0]} frame pairs, but {len(frame_pairs)} were provided."
+                f"{self.latent_action_backend} encoder returned {embeddings.shape[0]} frame pairs, "
+                f"but {len(frame_pairs)} were provided."
             )
         if embeddings.shape[1] != self.latent_query_num:
             raise ValueError(
-                f"UniT encoder returned {embeddings.shape[1]} query tokens, "
+                f"{self.latent_action_backend} encoder returned {embeddings.shape[1]} query tokens, "
                 f"but latent_query_num={self.latent_query_num}."
             )
         if embeddings.shape[2] != self.action_model.latent_action_dim:
             raise ValueError(
-                f"UniT encoder returned e_dim={embeddings.shape[2]}, "
+                f"{self.latent_action_backend} encoder returned latent_dim={embeddings.shape[2]}, "
                 f"but action head latent_action_dim={self.action_model.latent_action_dim}."
             )
         pair_count = counts[0]
@@ -221,17 +239,26 @@ class Qwen_WM_LA(Qwen_PI_v4):
             len(examples), pair_count * self.latent_query_num, embeddings.shape[2]
         ).to(device=device, dtype=dtype)
 
+    def _compute_latent_window_count(self, robot_type: str | None) -> int:
+        """Mirror hdf5_la_dataset offset packing: window_count = len(offsets) - 1."""
+        la_cfg = getattr(self.config.datasets.vla_data, "latent_action", None)
+        if la_cfg is None:
+            raise ValueError(
+                "QwenWM_LA requires datasets.vla_data.latent_action in config to size the latent stream."
+            )
+        stride = _resolve_latent_action_stride(la_cfg, robot_type)
+        la_horizon = _resolve_latent_action_horizon(la_cfg, robot_type, self.action_horizon)
+        offsets = list(range(0, la_horizon + 1, stride))
+        if _cfg_get(la_cfg, "include_terminal_frame", True) and offsets[-1] != la_horizon:
+            offsets.append(la_horizon)
+        return len(offsets) - 1
+
     def _infer_num_latent_tokens(self, examples: List[dict]) -> int:
         if not self.train_latent_action:
             return 0
-        frames = examples[0].get("la_frames", None)
-        if frames is None or len(frames) < 2:
-            raise ValueError(
-                "QwenWM_LA.predict_action requires `la_frames` to size the latent stream. "
-                "Enable datasets.vla_data.latent_action for the eval dataset."
-            )
-        window_count = len(frames) - 1
-        return window_count * self.latent_query_num
+        robot_type = examples[0].get("robot_type", None)
+        robot_type = str(robot_type) if robot_type is not None else None
+        return self._compute_latent_window_count(robot_type) * self.latent_query_num
 
     # ------------------------------------------------------------------ #
     # Head invocation
@@ -421,7 +448,9 @@ class Qwen_WM_LA(Qwen_PI_v4):
             if state is not None
             else None
         )
-        num_latent_tokens = self._infer_num_latent_tokens(examples)
+        num_latent_tokens = kwargs.pop("num_latent_tokens", None)
+        if num_latent_tokens is None:
+            num_latent_tokens = self._infer_num_latent_tokens(examples)
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
                 vl_embs_list,

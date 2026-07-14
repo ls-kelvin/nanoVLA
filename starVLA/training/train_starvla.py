@@ -111,6 +111,21 @@ def _make_action_dataloader_cfg(cfg):
     return action_cfg
 
 
+def _make_eval_dataloader_cfg(cfg, action_cfg=None):
+    """Build eval dataloader config: action/state for MSE, no la_frames packing."""
+    base = action_cfg if action_cfg is not None else cfg
+    base_cfg = base.unwrap() if isinstance(base, AccessTrackedConfig) else base
+    eval_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    latent_action_cfg = eval_cfg.datasets.vla_data.get("latent_action", None)
+    if latent_action_cfg is None:
+        eval_cfg.datasets.vla_data.latent_action = OmegaConf.create({})
+        latent_action_cfg = eval_cfg.datasets.vla_data.latent_action
+    latent_action_cfg.enabled = False
+    latent_action_cfg.load_action = True
+    latent_action_cfg.load_state = True
+    return eval_cfg
+
+
 def _make_latent_dataloader_cfg(cfg):
     base_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
     latent_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
@@ -170,7 +185,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
         batch_size=latent_batch_size,
     )
     vla_action_train_dataloader = None
-    eval_cfg = cfg
+    action_cfg = None
     if use_dual_dataloaders:
         action_cfg = _make_action_dataloader_cfg(cfg)
         action_batch_size = _get_vla_dataloader_batch_size(cfg, "action")
@@ -186,7 +201,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
             save_dataset_stats=True,
             batch_size=action_batch_size,
         )
-        eval_cfg = action_cfg
+    eval_cfg = _make_eval_dataloader_cfg(cfg, action_cfg=action_cfg)
     vla_eval_dataloader = build_vla_eval_dataloader(
         cfg=eval_cfg,
         num_samples=getattr(cfg.trainer, "eval_num_samples", None),

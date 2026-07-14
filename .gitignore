@@ -1,6 +1,7 @@
 debug/
 ckpts/
-third_party/
+third_party/*
+!third_party/sharla/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -23,7 +24,6 @@ parts/
 sdist/
 var/
 wheels/
-third_party/
 pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
@@ -266,3 +266,4 @@ starVLA/model/framework/VLM4A/QwenGR00T_v2.py
 
 plans/
 swanlog/
+visualization/
