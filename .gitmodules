@@ -1,0 +1,3 @@
+[submodule "third_party/sharla"]
+	path = third_party/sharla
+	url = https://github.com/jiachunjin/sharla.git
