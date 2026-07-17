@@ -68,7 +68,7 @@ def build_dataloader(
             vla_dataset,
             batch_size=effective_batch_size,
             collate_fn=collate_fn,
-            num_workers=16,
+            num_workers=4,
             pin_memory=True,
             persistent_workers=True,
             prefetch_factor=4,

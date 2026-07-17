@@ -3,11 +3,161 @@ from typing import Sequence
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from PIL import Image
+from safetensors.torch import load_file
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.modules.latent_action.interface import BaseLatentActionEncoder
-from starVLA.model.modules.latent_action.unit.model.gr00t_n1_tokenizer_unit_inference import GR00T_Tokenizer
+from starVLA.model.modules.latent_action.unit.model.gr00t_n1_tokenizer_unit_inference import (
+    GR00T_Tokenizer,
+    GR00T_Tokenizer_Config,
+)
+
+
+def _resolve_sharla_native_unit_paths(
+    tokenizer_path: Path,
+    config_path: str | None,
+) -> tuple[Path, Path]:
+    """Resolve (yaml config, weights) for Sharla-native UniT checkpoints.
+
+    Sharla ``UnitTokenizer`` saves ``config.yaml`` (``model.unit``) plus a flat
+    ``unit.safetensors`` whose keys are prefixed with ``unit.``.
+    """
+    if tokenizer_path.is_file():
+        if tokenizer_path.suffix != ".safetensors":
+            raise ValueError(
+                "UniT tokenizer file checkpoints must be .safetensors, "
+                f"got: {tokenizer_path}"
+            )
+        ckpt_path = tokenizer_path
+        yaml_path = Path(config_path).expanduser() if config_path else ckpt_path.parent / "config.yaml"
+    elif tokenizer_path.is_dir():
+        yaml_path = (
+            Path(config_path).expanduser()
+            if config_path
+            else tokenizer_path / "config.yaml"
+        )
+        if (tokenizer_path / "unit.safetensors").is_file():
+            ckpt_path = tokenizer_path / "unit.safetensors"
+        elif (tokenizer_path / "config.json").is_file():
+            raise ValueError(
+                f"Expected HuggingFace UniT checkpoint directory, got Sharla-style dir "
+                f"without unit.safetensors: {tokenizer_path}"
+            )
+        else:
+            raise FileNotFoundError(
+                f"UniT tokenizer directory must contain unit.safetensors or config.json: "
+                f"{tokenizer_path}"
+            )
+    else:
+        raise FileNotFoundError(f"UniT tokenizer checkpoint path does not exist: {tokenizer_path}")
+
+    if not yaml_path.is_file():
+        raise FileNotFoundError(
+            f"Sharla-native UniT checkpoint requires config.yaml at {yaml_path}. "
+            "Set framework.latent_action.unit.config_path if it lives elsewhere."
+        )
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"UniT tokenizer weights not found: {ckpt_path}")
+    return yaml_path, ckpt_path
+
+
+def _is_sharla_native_unit_checkpoint(tokenizer_path: Path, config_path: str | None) -> bool:
+    if config_path:
+        return True
+    if tokenizer_path.is_file() and tokenizer_path.suffix == ".safetensors":
+        return True
+    if tokenizer_path.is_dir() and (tokenizer_path / "config.yaml").is_file():
+        return not (tokenizer_path / "config.json").is_file()
+    return False
+
+
+def _load_sharla_native_unit_tokenizer(
+    tokenizer_path: Path,
+    *,
+    config_path: str | None,
+    dinov2_path_override: str,
+    strict_load: bool,
+) -> GR00T_Tokenizer:
+    yaml_path, ckpt_path = _resolve_sharla_native_unit_paths(tokenizer_path, config_path)
+    raw_cfg = OmegaConf.load(yaml_path)
+    if not hasattr(raw_cfg, "model") or not hasattr(raw_cfg.model, "unit"):
+        raise ValueError(
+            f"Sharla-native UniT config must define model.unit, got: {yaml_path}"
+        )
+
+    unit_cfg = OmegaConf.to_container(raw_cfg.model.unit, resolve=True)
+    unit_cfg["backbone_cfg"]["dinov2_path"] = str(dinov2_path_override)
+    model_config = GR00T_Tokenizer_Config(**unit_cfg)
+    model = GR00T_Tokenizer(
+        model_config,
+        dinov2_path_override=dinov2_path_override,
+        unified_embodiment_id=unit_cfg.get("unified_embodiment_id"),
+    )
+    model.set_trainable_parameters(
+        tune_vision_model=False,
+        tune_vision_m_former=False,
+        tune_bridge_projector=False,
+        tune_action_encoder=False,
+        tune_fusion=False,
+        tune_vq=False,
+        tune_vision_decoder=False,
+        tune_action_decoder_projector=False,
+        tune_action_decoder_diffusion=False,
+    )
+
+    state_dict = load_file(str(ckpt_path))
+    unit_state = {
+        key[len("unit.") :]: value
+        for key, value in state_dict.items()
+        if key.startswith("unit.")
+    }
+    if not unit_state:
+        raise ValueError(
+            f"No 'unit.' prefixed weights found in {ckpt_path}. "
+            "Expected a Sharla UnitTokenizer safetensors checkpoint."
+        )
+
+    missing, unexpected = model.load_state_dict(unit_state, strict=strict_load)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Failed to load Sharla-native UniT weights from {ckpt_path}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    print(f"Loaded Sharla-native UniT tokenizer from {ckpt_path} (config: {yaml_path})")
+    return model
+
+
+def _load_unit_tokenizer(
+    tokenizer_path: str,
+    *,
+    config_path: str | None,
+    dinov2_path_override: str,
+    strict_load: bool,
+) -> GR00T_Tokenizer:
+    path = Path(str(tokenizer_path)).expanduser()
+    if _is_sharla_native_unit_checkpoint(path, config_path):
+        return _load_sharla_native_unit_tokenizer(
+            path,
+            config_path=config_path,
+            dinov2_path_override=dinov2_path_override,
+            strict_load=strict_load,
+        )
+
+    return GR00T_Tokenizer.from_pretrained(
+        str(path),
+        dinov2_path_override=dinov2_path_override,
+        tune_vision_model=False,
+        tune_vision_m_former=False,
+        tune_bridge_projector=False,
+        tune_action_encoder=False,
+        tune_fusion=False,
+        tune_vq=False,
+        tune_vision_decoder=False,
+        tune_action_decoder_projector=False,
+        tune_action_decoder_diffusion=False,
+    )
 
 
 class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
@@ -29,18 +179,12 @@ class UniTVisualLatentActionEncoder(BaseLatentActionEncoder):
         if not Path(str(dinov2_path_override)).exists():
             raise FileNotFoundError(f"UniT DINOv2 checkpoint must be a local path: {dinov2_path_override}")
 
-        self.model = GR00T_Tokenizer.from_pretrained(
+        unit_cfg = la_cfg.get("unit", {})
+        self.model = _load_unit_tokenizer(
             str(tokenizer_path),
-            dinov2_path_override=dinov2_path_override,
-            tune_vision_model=False,
-            tune_vision_m_former=False,
-            tune_bridge_projector=False,
-            tune_action_encoder=False,
-            tune_fusion=False,
-            tune_vq=False,
-            tune_vision_decoder=False,
-            tune_action_decoder_projector=False,
-            tune_action_decoder_diffusion=False,
+            config_path=unit_cfg.get("config_path", None),
+            dinov2_path_override=str(dinov2_path_override),
+            strict_load=bool(unit_cfg.get("strict_load", True)),
         )
         self.model.eval()
         self.model.requires_grad_(False)

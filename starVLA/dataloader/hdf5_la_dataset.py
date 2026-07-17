@@ -41,16 +41,19 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
             bi = data.get("_la_base_index", None)
             if traj_id is not None and bi is not None:
                 offset = int(_cfg_get(hist_cfg, "offset", 8))
-                video_keys_cfg = _cfg_get(hist_cfg, "video_keys", [])
-                obs_image_size = tuple(_cfg_get(self.data_cfg, "obs_image_size", (224, 224)))
-                history_images = []
-                for key in video_keys_cfg:
-                    vk = f"video.{key}" if not str(key).startswith("video.") else str(key)
-                    frames = self.get_video_frames_by_offsets(
-                        int(traj_id), vk, int(bi), [-offset]
-                    )
-                    history_images.append(frames[0].resize(obs_image_size))
-                sample["image"] = history_images + sample["image"]
+                # Only prepend history when base_index can reach exactly -offset;
+                # otherwise leave sample["image"] unchanged (no clamp/pad).
+                if int(bi) >= offset:
+                    video_keys_cfg = _cfg_get(hist_cfg, "video_keys", [])
+                    obs_image_size = tuple(_cfg_get(self.data_cfg, "obs_image_size", (224, 224)))
+                    history_images = []
+                    for key in video_keys_cfg:
+                        vk = f"video.{key}" if not str(key).startswith("video.") else str(key)
+                        frames = self.get_video_frames_by_offsets(
+                            int(traj_id), vk, int(bi), [-offset]
+                        )
+                        history_images.append(frames[0].resize(obs_image_size))
+                    sample["image"] = history_images + sample["image"]
 
         la_cfg = _cfg_get(self.data_cfg, "latent_action", {})
         if not _cfg_get(la_cfg, "enabled", False):

@@ -51,7 +51,17 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
             for key, value in state_dict.items()
             if key.startswith(("vision_encoder.", "quantizer."))
         }
-        self.model.load_state_dict(state_dict, strict=bool(sharla_cfg.get("strict_load", True)))
+        # Partial ckpts omit frozen DINO frame_encoder; it is loaded from dinov2_path at build time.
+        # Match sharla.model.unit_tokenizer.load_unit_teacher: allow missing non-trainable keys.
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if bool(sharla_cfg.get("strict_load", True)):
+            trainable = {name for name, param in self.model.named_parameters() if param.requires_grad}
+            missing_trainable = trainable.intersection(missing)
+            if missing_trainable or unexpected:
+                raise RuntimeError(
+                    "Failed to load Sharla tokenizer checkpoint: "
+                    f"missing_trainable={sorted(missing_trainable)}, unexpected={sorted(unexpected)}"
+                )
         self.model.requires_grad_(False)
         self.model.eval()
 

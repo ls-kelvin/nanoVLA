@@ -172,11 +172,11 @@ class ModelClient:
         if self.history_frame_offset > 0:
             images = example["image"]
             current_frame = images[self.history_frame_key_index]
-            if len(self._hf_buffer) > 0:
+            # Only prepend when buffer is full (exactly `offset` steps of history);
+            # otherwise leave example["image"] unchanged (matches training).
+            if len(self._hf_buffer) >= self.history_frame_offset:
                 history_frame = self._hf_buffer[0]
-            else:
-                history_frame = current_frame
-            example["image"] = [history_frame] + list(images)
+                example["image"] = [history_frame] + list(images)
             self._hf_buffer.append(current_frame)
 
         example_copy = example.copy()
