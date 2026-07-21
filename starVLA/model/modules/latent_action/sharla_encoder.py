@@ -5,6 +5,7 @@ from typing import Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image
 
@@ -79,7 +80,7 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
 
     @property
     def latent_dim(self) -> int:
-        return int(self.model.quantizer.output_proj.out_features)
+        return int(self.model.quantizer.input_proj.out_features)
 
     def _image_to_tensor(self, image: Image.Image) -> torch.Tensor:
         image = to_pil_preserve(image)
@@ -123,9 +124,9 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         if not frame_pairs:
             return torch.empty((0, self.query_num, self.latent_dim), device=self.device, dtype=self.dtype)
         self.model.eval()
-        latent, _ = self.model.vision_encoder(self._prepare_vision_input(frame_pairs))
-        quantized, _, _ = self.model.quantizer(latent)
-        return quantized
+        latent, _, _ = self.model.vision_encoder(self._prepare_vision_input(frame_pairs))
+        latent = F.normalize(self.model.quantizer.input_proj(latent), dim=-1)
+        return latent
 
     @torch.inference_mode()
     def encode(

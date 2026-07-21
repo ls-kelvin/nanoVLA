@@ -57,13 +57,13 @@ datasets:
     dataset_py: hdf5_la_dataset
     latent_action:
       enabled: true
-      stride: 16
+      stride: 8
       horizon: 32
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
     history_frame:
-      enabled: false
+      enabled: true
       offset: 8
       video_keys: [cam_high]
     include_state: true

@@ -31,8 +31,8 @@ framework:
       token_format: "<latent_action_{i}>"
       head_dropout: 0.0
     sharla:
-      config_path: null
-      ckpt_path: null
+      config_path: playgound/tokenizers/0714_aloha_arx_multi_categorical_v1_s8_l8_arx_vision_only/config.yaml
+      ckpt_path: playgound/tokenizers/0714_aloha_arx_multi_categorical_v1_s8_l8_arx_vision_only/checkpoints/partial_step_100000.pt
       image_size: [224, 224]
       strict_load: true
       kl_eps: 1.0e-08
@@ -70,8 +70,12 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
+      horizon_overrides:
+        arx-x5:
+          frame_stride: 6
+          horizon: 24
     history_frame:
-      enabled: false
+      enabled: true
       offset: 8
       video_keys: [cam_high]
     include_state: true
@@ -92,23 +96,23 @@ trainer:
   use_dual_vla_dataloaders: true
   dataloader_loss_modes:
     latent: latent
-    action: action
+    action: joint
   dataloader_active_ranges:
     latent:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 100000
+  max_train_steps: 90000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
-  eval_num_samples: 512
+  eval_num_samples: 1024
   eval_batch_size: 16
   logging_frequency: 50
   learning_rate:
     base: 5.0e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
+    action_model: 5.0e-5
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-06

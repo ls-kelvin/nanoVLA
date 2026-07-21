@@ -1,41 +1,36 @@
-run_id: qwenpiv4_hdf5_aloha_clean_random_la_unit_eef
+run_id: qwenwm_hdf5_aloha_clean_random_la_sharla_eef
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenPI_v4_LA on RoboTwin2.0 raw HDF5 aloha-agilex EEF data.
-# Action loss uses clean data; UniT latent-action loss uses clean + randomized data.
+# QwenWM_LA on RoboTwin2.0 raw HDF5 aloha-agilex EEF data.
+# Latent-action learning is moved into the action head (joint flow matching over
+# [latent, state, action]); latent targets are Sharla continuous embeddings
+# (quantizer input_proj + L2-normalize). Main/action dataloader runs joint
+# forward; latent dataloader runs latent-only forward (clean + randomized data).
+# The launch script supplies the matching Sharla config and checkpoint paths.
 framework:
-  name: QwenPI_v4_LA
+  name: QwenWM_LA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
 
   latent_action:
     enabled: true
-    backend: unit
-    cached_indices_path: null
-    loss_type: ce
+    backend: sharla
     train_latent: true
     train_action: true
-    latent_loss_weight: 0.1
+    latent_loss_weight: 1.0
     action_loss_weight: 1.0
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
-    groot_tokenizer_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/starVLA/third_party/UniT/outputs/robotwin_tokenizer/checkpoint-80000
-    dinov2_path_override: /mnt/netdata/Team/Personal/zzt/models/dinov2-large
-    num_bridge_tokens: 8
-    num_codebooks: 2
-    codebook_size: 128
-    ce_loss_weights: [1.0, 0.5]
-    label_smoothing: 0.0
-    image_size: [224, 224]
-    strict_num_bridge_tokens: true
-    qwenpi_v4_la:
-      token_format: "<latent_action_{i}>"
-      head_dropout: 0.0
+    sharla:
+      config_path: /mnt/netdata/Team/Personal/zzt/models/sharla/config.yaml
+      ckpt_path: /mnt/netdata/Team/Personal/zzt/models/sharla/partial_step_100000.pt
+      image_size: [224, 224]
+      strict_load: true
 
   action_model:
     action_dim: 16
@@ -70,13 +65,8 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
-      cached_indices_path: null
-      horizon_overrides:
-        arx-x5:
-          frame_stride: 6
-          horizon: 24
     history_frame:
-      enabled: false
+      enabled: true
       offset: 8
       video_keys: [cam_high]
     include_state: true
@@ -107,13 +97,13 @@ trainer:
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
-  eval_num_samples: 1024
+  eval_num_samples: 512
   eval_batch_size: 16
   logging_frequency: 50
   learning_rate:
     base: 5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05
+    action_model: 1.0e-04
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-06

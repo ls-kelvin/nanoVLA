@@ -567,16 +567,42 @@ class VLATrainer(TrainerUtils):
             shutil.rmtree(oldest_path, ignore_errors=True)
             logger.info(f"🗑️ Removed old training state: {oldest_path} (step {oldest_step})")
 
+    def _reduce_mean_metric(self, value: torch.Tensor) -> torch.Tensor:
+        """All-reduce a scalar metric across ranks; every rank must call this together."""
+        return self.accelerator.reduce(value.detach(), reduction="mean")
+
     def _log_metrics(self, metrics):
-        """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
-            last_lrs = self.lr_scheduler.get_last_lr()
-            for i, group in enumerate(self.optimizer.param_groups):
-                group_name = group.get("name", str(i))
-                metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            self.tracker.log(metrics, step=self.completed_steps)
-            logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+        """Record training metrics.
+
+        Tensor metrics stay on device until a logging step. ``action_dit_loss`` /
+        ``action_loss`` are reduced to a global mean; ``latent_action_loss`` is
+        already the sum of active dual-stream latent losses from ``_train_step``.
+        """
+        if self.completed_steps % self.config.trainer.logging_frequency != 0:
+            return
+
+        prepared = {}
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                tensor = value.detach()
+                if key in {"action_dit_loss", "action_loss"}:
+                    # All ranks must participate in the reduce.
+                    tensor = self._reduce_mean_metric(tensor)
+                if dist.get_rank() == 0:
+                    prepared[key] = float(tensor)
+            elif dist.get_rank() == 0:
+                prepared[key] = value
+
+        if dist.get_rank() != 0:
+            return
+
+        last_lrs = self.lr_scheduler.get_last_lr()
+        for i, group in enumerate(self.optimizer.param_groups):
+            group_name = group.get("name", str(i))
+            prepared[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
+        prepared["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+        self.tracker.log(prepared, step=self.completed_steps)
+        logger.info(f"Step {self.completed_steps}, Loss: {prepared})")
 
     def _dataloader_ranges(self, dataloader_name: str):
         ranges_cfg = self.config.trainer.get("dataloader_active_ranges", None)
@@ -887,17 +913,28 @@ class VLATrainer(TrainerUtils):
             if self.use_dual_vla_dataloaders:
                 logger.info(f"  Total batch size (action) = {self.action_total_batch_size}")
 
+    @staticmethod
+    def _extract_action_dit_loss(output_dict: dict) -> torch.Tensor | None:
+        if "action_dit_loss" in output_dict:
+            return output_dict["action_dit_loss"]
+        if "continuous_action_loss" in output_dict:
+            return output_dict["continuous_action_loss"]
+        if "action_loss" in output_dict:
+            return output_dict["action_loss"]
+        return None
+
     def _train_step(self, batch_vla, batch_vlm=None, active_dataloaders: dict[str, bool] | None = None):
         """Execute single training step."""
         profile_la_timing = os.getenv("PROFILE_LA_TIMING", "0").lower() in {"1", "true", "yes", "on"}
         backward_optim_start = None
+        action_dit_loss = None
+        latent_action_loss = None
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 if self.use_dual_vla_dataloaders:
                     active_dataloaders = active_dataloaders or {"latent": True, "action": True}
                     output_dict = {}
                     total_loss = None
-                    action_dit_loss = None
 
                     if active_dataloaders.get("latent", False):
                         latent_output = self.model.forward(
@@ -905,6 +942,8 @@ class VLATrainer(TrainerUtils):
                         )
                         total_loss = latent_output["total_loss"]
                         output_dict.update(latent_output)
+                        if "latent_action_loss" in latent_output:
+                            latent_action_loss = latent_output["latent_action_loss"]
 
                     if active_dataloaders.get("action", False):
                         action_output = self.model.forward(
@@ -916,25 +955,28 @@ class VLATrainer(TrainerUtils):
                             else total_loss + action_output["total_loss"]
                         )
                         output_dict.update(action_output)
-                        if "action_dit_loss" in action_output:
-                            action_dit_loss = action_output["action_dit_loss"]
-                        elif "continuous_action_loss" in action_output:
-                            action_dit_loss = action_output["continuous_action_loss"]
-                        else:
-                            action_dit_loss = action_output["action_loss"]
+                        if "latent_action_loss" in action_output:
+                            action_latent = action_output["latent_action_loss"]
+                            latent_action_loss = (
+                                action_latent
+                                if latent_action_loss is None
+                                else latent_action_loss + action_latent
+                            )
+                        action_dit_loss = self._extract_action_dit_loss(action_output)
 
                     if total_loss is None:
                         raise RuntimeError("No active QwenMetaQuery_LA dataloader produced a loss.")
                     output_dict["total_loss"] = total_loss
+                    if latent_action_loss is not None:
+                        # Keep the summed dual-stream latent loss; do not keep the
+                        # overwritten single-stream value from ``output_dict.update``.
+                        output_dict["latent_action_loss"] = latent_action_loss
                 else:
                     output_dict = self.model.forward(batch_vla)
                     total_loss = output_dict["total_loss"] if "total_loss" in output_dict else output_dict["action_loss"]
-                    if "action_dit_loss" in output_dict:
-                        action_dit_loss = output_dict["action_dit_loss"]
-                    elif "continuous_action_loss" in output_dict:
-                        action_dit_loss = output_dict["continuous_action_loss"]
-                    else:
-                        action_dit_loss = output_dict["action_loss"]
+                    action_dit_loss = self._extract_action_dit_loss(output_dict)
+                    if "latent_action_loss" in output_dict:
+                        latent_action_loss = output_dict["latent_action_loss"]
 
             if profile_la_timing:
                 if torch.cuda.is_available():
@@ -961,11 +1003,12 @@ class VLATrainer(TrainerUtils):
                     torch.cuda.synchronize()
                 output_dict["timing/backward_optim"] = time.perf_counter() - backward_optim_start
 
-        log_dict = {"total_loss": total_loss.item()}
+        # Keep tensors until ``_log_metrics``; avoid per-step ``.item()`` sync.
+        log_dict = {"total_loss": total_loss.detach()}
         if action_dit_loss is not None:
-            log_dict["action_dit_loss"] = action_dit_loss.item()
-        if "latent_action_loss" in output_dict:
-            log_dict["latent_action_loss"] = output_dict["latent_action_loss"].item()
+            log_dict["action_dit_loss"] = action_dit_loss.detach()
+        if latent_action_loss is not None:
+            log_dict["latent_action_loss"] = latent_action_loss.detach()
         if "action_train_batch_size" in output_dict:
             log_dict["action_train_batch_size"] = output_dict["action_train_batch_size"]
         for key, value in output_dict.items():
