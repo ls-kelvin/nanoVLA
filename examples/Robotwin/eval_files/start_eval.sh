@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ROBOTWIN_PATH=/inspire/hdd/project/qproject-fundationmodel/public/ethan/repos/RoboTwin
-export ROBOTWIN_PYTHON=/inspire/hdd/project/qproject-fundationmodel/public/ethan/repos/RoboTwin/.venv/bin/python
+export ROBOTWIN_PATH=/mnt/netdata/Team/Personal/zzt/codebase/RoboTwin
+export ROBOTWIN_PYTHON=/mnt/netdata/Team/Personal/zzt/codebase/RoboTwin/.venv/bin/python
 export STARVLA_PYTHON=.venv/bin/python
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +67,7 @@ ACTIVE_PIDS=()
 ACTIVE_TASKS=()
 ACTIVE_SERVER_LOGS=()
 ACTIVE_EVAL_LOGS=()
+ACTIVE_STARTED_AT=()
 FAILED_TASKS=()
 
 join_arr() {
@@ -210,13 +211,23 @@ check_port_detection() {
 wait_for_server() {
     local port="$1"
     local timeout_s="${2:-600}"
+    local server_pid="${3:-}"
+    local task_name="${4:-unknown}"
+    local server_log="${5:-unknown}"
     local elapsed=0
     while (( elapsed < timeout_s )); do
         if port_in_use "${port}"; then
             return 0
         fi
+        if [[ -n "${server_pid}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
+            echo "[ERROR] Policy server exited while starting task=${task_name}. See ${server_log}" >&2
+            return 2
+        fi
         sleep 2
         elapsed=$((elapsed + 2))
+        if (( elapsed % 10 == 0 )); then
+            echo "[INFO] Waiting for policy server task=${task_name} port=${port} elapsed=${elapsed}s/${timeout_s}s log=${server_log}"
+        fi
     done
     return 1
 }
@@ -379,11 +390,22 @@ launch_task_in_slot() {
         export STARVLA_PYTHON="${STARVLA_PYTHON}"
         export ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON}"
 
-        bash "${SCRIPT_DIR}/run_policy_server.sh" "${CKPT_PATH}" "${gpu_id}" "${port}" > "${server_log}" 2>&1 &
+        PYTHONUNBUFFERED=1 bash "${SCRIPT_DIR}/run_policy_server.sh" \
+            "${CKPT_PATH}" "${gpu_id}" "${port}" > "${server_log}" 2>&1 &
         server_pid=$!
 
-        if ! wait_for_server "${port}" "${ROBOTWIN_SERVER_TIMEOUT:-600}"; then
-            echo "[ERROR] Policy server failed to become ready for task=${task_name} on port=${port}. See ${server_log}" >&2
+        if wait_for_server \
+            "${port}" \
+            "${ROBOTWIN_SERVER_TIMEOUT:-600}" \
+            "${server_pid}" \
+            "${task_name}" \
+            "${server_log}"; then
+            echo "[INFO] Policy server ready task=${task_name} port=${port}"
+        else
+            server_wait_status=$?
+            if (( server_wait_status == 1 )); then
+                echo "[ERROR] Policy server timed out after ${ROBOTWIN_SERVER_TIMEOUT:-600}s for task=${task_name} on port=${port}. See ${server_log}" >&2
+            fi
             exit 1
         fi
 
@@ -406,6 +428,7 @@ launch_task_in_slot() {
     ACTIVE_TASKS[$slot_idx]="${task_name}"
     ACTIVE_SERVER_LOGS[$slot_idx]="${server_log}"
     ACTIVE_EVAL_LOGS[$slot_idx]="${eval_log}"
+    ACTIVE_STARTED_AT[$slot_idx]="$(date +%s)"
 }
 
 # --- Argument parsing ---
@@ -520,6 +543,7 @@ echo "[INFO] tasks (${TOTAL_TASKS}): $(join_arr ', ' "${TASKS[@]}")"
 
 next_task_idx=0
 completed_tasks=0
+last_progress_report="$(date +%s)"
 
 while (( completed_tasks < TOTAL_TASKS )); do
     for (( slot_idx = 0; slot_idx < TOTAL_SLOTS; ++slot_idx )); do
@@ -538,6 +562,7 @@ while (( completed_tasks < TOTAL_TASKS )); do
             ACTIVE_TASKS[$slot_idx]=""
             ACTIVE_SERVER_LOGS[$slot_idx]=""
             ACTIVE_EVAL_LOGS[$slot_idx]=""
+            ACTIVE_STARTED_AT[$slot_idx]=""
             completed_tasks=$((completed_tasks + 1))
         fi
 
@@ -548,6 +573,18 @@ while (( completed_tasks < TOTAL_TASKS )); do
     done
 
     if (( completed_tasks < TOTAL_TASKS )); then
+        now="$(date +%s)"
+        if (( now - last_progress_report >= 30 )); then
+            running_summaries=()
+            for (( slot_idx = 0; slot_idx < TOTAL_SLOTS; ++slot_idx )); do
+                if [[ -n "${ACTIVE_PIDS[$slot_idx]:-}" ]]; then
+                    running_for=$((now - ACTIVE_STARTED_AT[$slot_idx]))
+                    running_summaries+=("${ACTIVE_TASKS[$slot_idx]}(${running_for}s)")
+                fi
+            done
+            echo "[INFO] Progress completed=${completed_tasks}/${TOTAL_TASKS} running: $(join_arr ', ' "${running_summaries[@]}")"
+            last_progress_report="${now}"
+        fi
         sleep 5
     fi
 done
