@@ -22,5 +22,5 @@ normalization_mode: "q99"  # options: min_max, q99
 # History frame: prepend a frame from `offset` steps ago to the image list.
 # 0 = disabled. key_index selects which camera (0 = head/cam_high).
 # If fewer than `offset` steps of history are available, do not prepend.
-history_frame_offset: 0
+history_frame_offset: 8
 history_frame_key_index: 0

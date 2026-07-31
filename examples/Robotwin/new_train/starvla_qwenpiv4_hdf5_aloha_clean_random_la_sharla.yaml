@@ -31,8 +31,8 @@ framework:
       token_format: "<latent_action_{i}>"
       head_dropout: 0.0
     sharla:
-      config_path: playgound/tokenizers/0714_aloha_arx_multi_categorical_v1_s8_l8_arx_vision_only/config.yaml
-      ckpt_path: playgound/tokenizers/0714_aloha_arx_multi_categorical_v1_s8_l8_arx_vision_only/checkpoints/partial_step_100000.pt
+      config_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/models/sharla_a2a/config.yaml
+      ckpt_path: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/models/sharla_a2a/partial_step_30000.pt
       image_size: [224, 224]
       strict_load: true
       kl_eps: 1.0e-08
@@ -70,6 +70,7 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
+      episode_cache_dir: .cache/latent_cache/sharla_soft_kl
       horizon_overrides:
         arx-x5:
           frame_stride: 6
@@ -81,7 +82,7 @@ datasets:
     include_state: true
     data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
-    latent_data_mix: hdf5_aloha_clean_random_eef
+    latent_data_mix: hdf5_arx_clean_random_eef
     hdf5_action_type: eef
     action_type: abs_eef
     action_mode: abs
@@ -102,7 +103,7 @@ trainer:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 90000
+  max_train_steps: 100000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
@@ -127,3 +128,15 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
+
+# Offline Sharla soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
+soft_kl_cache:
+  output_dir: .cache/latent_cache/sharla_soft_kl
+  batch_size: 128
+  num_workers: 8
+  num_gpus: 8
+  use_bf16: true
+  overwrite: false
+  device: null
+  data_root_dir: null
+  data_mixes: null

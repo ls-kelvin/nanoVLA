@@ -65,6 +65,29 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
                 )
         self.model.requires_grad_(False)
         self.model.eval()
+        self._enable_dinov2_sdpa()
+
+    def _enable_dinov2_sdpa(self) -> None:
+        """Switch frozen Dinov2 backbone to SDPA when the frame encoder is DINO."""
+        frame_encoder = getattr(self.model.vision_encoder, "frame_encoder", None)
+        dino = getattr(frame_encoder, "model", None)
+        if dino is None:
+            return
+        if hasattr(dino, "set_attn_implementation"):
+            dino.set_attn_implementation("sdpa")
+            return
+        from transformers import Dinov2Model
+
+        name_or_path = getattr(dino.config, "_name_or_path", None)
+        if not name_or_path:
+            return
+        replacement = Dinov2Model.from_pretrained(
+            name_or_path,
+            local_files_only=True,
+            attn_implementation="sdpa",
+        )
+        replacement.requires_grad_(False)
+        frame_encoder.model = replacement
 
     @property
     def device(self) -> torch.device:
@@ -81,6 +104,10 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
     @property
     def latent_dim(self) -> int:
         return int(self.model.quantizer.input_proj.out_features)
+
+    @property
+    def codebook_size(self) -> int:
+        return int(self.model.quantizer.codebook.num_embeddings)
 
     def _image_to_tensor(self, image: Image.Image) -> torch.Tensor:
         image = to_pil_preserve(image)
@@ -109,11 +136,31 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         frame_pairs: Sequence[Sequence[Image.Image]],
         instructions: Sequence[str] | None = None,
     ) -> torch.Tensor:
+        del instructions
         if not frame_pairs:
-            codebook_size = int(self.model.quantizer.codebook.num_embeddings)
-            return torch.empty((0, self.query_num, codebook_size), device=self.device)
+            return torch.empty((0, self.query_num, self.codebook_size), device=self.device)
         self.model.eval()
         return self.model(self._prepare_vision_input(frame_pairs)).float()
+
+    @torch.inference_mode()
+    def encode_distribution_from_tensors(
+        self,
+        f0: torch.Tensor,
+        f1: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode preprocessed RGB tensors ``[B, 3, H, W]`` in ``[0, 1]`` to soft weights."""
+        if f0.ndim != 4 or f1.ndim != 4:
+            raise ValueError(f"Expected f0/f1 as [B,3,H,W], got {tuple(f0.shape)} / {tuple(f1.shape)}")
+        if f0.shape != f1.shape:
+            raise ValueError(f"f0/f1 shape mismatch: {tuple(f0.shape)} vs {tuple(f1.shape)}")
+        if f0.shape[0] == 0:
+            return torch.empty((0, self.query_num, self.codebook_size), device=self.device, dtype=torch.float32)
+        self.model.eval()
+        inputs = {
+            "f0": f0.to(device=self.device, dtype=self.dtype, non_blocking=True),
+            "f1": f1.to(device=self.device, dtype=self.dtype, non_blocking=True),
+        }
+        return self.model(inputs).float()
 
     @torch.inference_mode()
     def encode_continuous(
@@ -121,6 +168,7 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         frame_pairs: Sequence[Sequence[Image.Image]],
         instructions: Sequence[str] | None = None,
     ) -> torch.Tensor:
+        del instructions
         if not frame_pairs:
             return torch.empty((0, self.query_num, self.latent_dim), device=self.device, dtype=self.dtype)
         self.model.eval()

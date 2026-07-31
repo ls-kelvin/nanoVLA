@@ -20,6 +20,7 @@ from starVLA.dataloader.lerobot_la_datasets import (
     _resolve_latent_action_horizon,
     _resolve_latent_action_stride,
 )
+from starVLA.dataloader.episode_soft_kl_cache import EpisodeSoftKLCache
 from starVLA.dataloader.unit_la_cache_dataset import make_la_cache_traj_key
 
 
@@ -87,6 +88,18 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
         max_length = int(self.trajectory_lengths[trajectory_index])
         sample["la_padded"] = bool(int(base_index) + int(offsets[-1]) > max_length - 1)
 
+        episode_cache_dir = _cfg_get(la_cfg, "episode_cache_dir", None)
+        if episode_cache_dir is not None and str(episode_cache_dir) not in ("", "null", "None"):
+            cached_distribution = self._load_episode_soft_kl_cache(
+                str(episode_cache_dir), int(trajectory_id), int(base_index), offsets
+            )
+            if cached_distribution is not None:
+                sample["la_cached_distribution"] = cached_distribution
+                sample["la_frame_offsets"] = offsets
+                window_count = len(offsets) - 1
+                sample["la_frames"] = [None] * (window_count + 1)
+                return sample
+
         cached_indices_path = _cfg_get(la_cfg, "cached_indices_path", None)
         if cached_indices_path is not None and str(cached_indices_path) not in ("", "null", "None"):
             cached_indices = self._load_cached_indices(
@@ -133,6 +146,36 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
             ]
         sample["la_frame_offsets"] = offsets
         return sample
+
+    def _load_episode_soft_kl_cache(
+        self,
+        cache_dir: str,
+        trajectory_id: int,
+        base_index: int,
+        offsets: list[int],
+    ):
+        """Load soft_kl teacher weights ``[num_pairs * Q, C]`` from episode cache."""
+        if not hasattr(self, "_episode_soft_kl_cache"):
+            la_cfg = _cfg_get(self.data_cfg, "latent_action", {})
+            fingerprint = _cfg_get(la_cfg, "cache_fingerprint", None)
+            self._episode_soft_kl_cache = EpisodeSoftKLCache(
+                cache_dir,
+                expected_fingerprint=(
+                    str(fingerprint) if fingerprint not in (None, "", "null") else None
+                ),
+            )
+        num_pairs = max(len(offsets) - 1, 1)
+        stride = int(offsets[1] - offsets[0]) if len(offsets) >= 2 else 1
+        try:
+            return self._episode_soft_kl_cache.read_window(
+                self.dataset_name,
+                int(trajectory_id),
+                int(base_index),
+                num_pairs=num_pairs,
+                stride=stride,
+            )
+        except FileNotFoundError:
+            return None
 
     def _load_cached_indices(
         self,
