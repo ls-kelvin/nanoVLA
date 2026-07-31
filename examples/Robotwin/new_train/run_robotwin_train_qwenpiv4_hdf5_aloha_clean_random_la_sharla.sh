@@ -27,16 +27,16 @@ batch_size=2
 hdf5_root=/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
 data_mix=hdf5_aloha_clean_eef
 latent_data_mix=hdf5_arx_clean_random_eef
-run_id=0718_${data_mix}_action_${latent_data_mix}_latent_qwenpiv4_la_sharla_lang
-SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_lang/config.yaml
-SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_lang/partial_step_100000.pt
+run_id=0722_${data_mix}_action_${latent_data_mix}_latent_qwenpiv4_la_sharla_lang_lh
+SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/jjc/exp/sharla/0722_ebd_dino_softvq_langalign_largeglobal_hyperadjusted/config.yaml
+SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/jjc/exp/sharla/0722_ebd_dino_softvq_langalign_largeglobal_hyperadjusted/checkpoints/partial_step_30000.pt
 
 output_dir=${run_root_dir}/${run_id}
 mkdir -p "${output_dir}"
 cp "$0" "${output_dir}/"
 
 # accelerate launch \
-#   --num_processes 8 \
+#   --num_processes 2 \
 #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
 #   starVLA/training/train_starvla.py \
 #   --config_yaml "${config_yaml}" \
