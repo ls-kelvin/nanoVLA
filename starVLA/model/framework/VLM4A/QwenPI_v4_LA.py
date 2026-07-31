@@ -4,7 +4,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -345,8 +344,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         batch_images: List,
         instructions: list[str],
         window_count: int,
+        prebuilt_inputs=None,
     ) -> tuple[list[torch.Tensor], torch.Tensor | None, torch.Tensor, dict]:
-        inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        inputs = self._build_vlm_inputs(batch_images, instructions, prebuilt_inputs)
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", None)
         prompt_len = input_ids.shape[1]
@@ -620,10 +620,8 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 valid_mask = torch.ones_like(kl_per_sample)
             else:
                 valid_mask = valid_mask.to(kl_per_sample.device, dtype=kl_per_sample.dtype)
-            valid_count = int(valid_mask.sum().item())
             denom = valid_mask.sum().clamp_min(1.0)
             kl_loss = (kl_per_sample * valid_mask).sum() / denom
-            kl_loss = self._scale_action_loss_for_global_mean(kl_loss, valid_count)
 
             entropy = -(target_probs * target_probs.log()).sum(dim=-1).mean(dim=1)
             entropy = (entropy * valid_mask).sum() / denom
@@ -656,12 +654,12 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
             r = self.repeated_diffusion_steps
             actions_target = actions_target.repeat(r, 1, 1)
+            # ``vl_embs_list`` / ``attention_mask`` stay at the un-repeated batch.
+            # The action head folds the ``r`` diffusion repeats into the DiT query
+            # sequence, so cross-attention K/V are projected once instead of once
+            # per repeat.
             if self.detach_vl_embs_for_action_head:
-                vl_embs_list = [hidden.detach().repeat(r, 1, 1) for hidden in vl_embs_list]
-            else:
-                vl_embs_list = [hidden.repeat(r, 1, 1) for hidden in vl_embs_list]
-            if attention_mask is not None:
-                attention_mask = attention_mask.repeat(r, 1)
+                vl_embs_list = [hidden.detach() for hidden in vl_embs_list]
 
             state_repeated = None
             if state is not None:
@@ -674,19 +672,6 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 state_repeated,
                 encoder_attention_mask=attention_mask,
             )
-
-    def _scale_action_loss_for_global_mean(
-        self,
-        loss: torch.Tensor,
-        local_count: int,
-    ) -> torch.Tensor:
-        if not dist.is_available() or not dist.is_initialized():
-            return loss
-        count = torch.tensor(float(local_count), device=loss.device, dtype=loss.dtype)
-        dist.all_reduce(count, op=dist.ReduceOp.SUM)
-        if count.item() <= 0:
-            return loss * 0.0
-        return loss * (dist.get_world_size() * float(local_count) / count)
 
     def _print_training_sample_once(self, examples: List[dict], instructions: list[str]) -> None:
         if self._printed_training_sample or not self.training or not logger.is_rank_zero():
@@ -722,6 +707,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
+        prebuilt_inputs = getattr(examples, "vlm_inputs", None)
 
         latent_hidden = None
         if compute_latent:
@@ -732,10 +718,13 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 batch_images,
                 instructions,
                 window_count,
+                prebuilt_inputs=prebuilt_inputs,
             )
             self._print_training_sample_once(examples, instructions)
         else:
-            vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
+            vl_embs_list, attention_mask = self._encode_vl_hidden_states(
+                batch_images, instructions, prebuilt_inputs=prebuilt_inputs
+            )
 
         action_dit_loss = None
         action_train_batch_size = 0
@@ -759,7 +748,6 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                     [hidden[:1] for hidden in vl_embs_list],
                     dummy_attention_mask,
                 ) * 0.0
-            action_dit_loss = self._scale_action_loss_for_global_mean(action_dit_loss, action_train_batch_size)
 
         latent_outputs = {}
         latent_action_loss = None

@@ -100,9 +100,25 @@ class Qwen_PI_v4(baseframework):
         self.action_horizon = int(action_cfg.action_horizon)
         self.repeated_diffusion_steps = int(action_cfg.get("repeated_diffusion_steps", 16))
 
-    def _encode_vl_hidden_states(self, batch_images: List, instructions: List[str]) -> tuple:
+    def _build_vlm_inputs(self, batch_images: List, instructions: List[str], prebuilt_inputs=None):
+        """Use dataloader-side processor outputs when available, else build them here.
+
+        Returns a fresh mapping either way: callers append latent bridge tokens to
+        ``input_ids`` in place, which must not leak back into the batch payload.
+        """
+        if prebuilt_inputs is None:
+            return self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        device = self.qwen_vl_interface.model.device
+        return {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in prebuilt_inputs.items()
+        }
+
+    def _encode_vl_hidden_states(
+        self, batch_images: List, instructions: List[str], prebuilt_inputs=None
+    ) -> tuple:
         """Run QwenVL and return layer-wise prompt hidden states plus padding mask."""
-        inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        inputs = self._build_vlm_inputs(batch_images, instructions, prebuilt_inputs)
         attention_mask = inputs.get("attention_mask", None)
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
@@ -123,7 +139,9 @@ class Qwen_PI_v4(baseframework):
         actions = [example["action"] for example in examples]
         state = [example["state"] for example in examples] if "state" in examples[0] else None
 
-        vl_embs_list, attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
+        vl_embs_list, attention_mask = self._encode_vl_hidden_states(
+            batch_images, instructions, prebuilt_inputs=getattr(examples, "vlm_inputs", None)
+        )
         base_hidden = vl_embs_list[-1]
 
         with torch.autocast("cuda", dtype=torch.float32):
@@ -132,9 +150,10 @@ class Qwen_PI_v4(baseframework):
 
             r = self.repeated_diffusion_steps
             actions_target = actions_target.repeat(r, 1, 1)
-            vl_embs_list = [h.repeat(r, 1, 1) for h in vl_embs_list]
-            if attention_mask is not None:
-                attention_mask = attention_mask.repeat(r, 1)
+            # ``vl_embs_list`` / ``attention_mask`` stay at the un-repeated batch.
+            # The action head folds the ``r`` diffusion repeats into the DiT query
+            # sequence, so cross-attention K/V are projected once instead of once
+            # per repeat.
 
             state_repeated = None
             if state is not None:
@@ -152,7 +171,7 @@ class Qwen_PI_v4(baseframework):
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict] = None, **kwargs) -> dict:
-        if type(examples) is not list:
+        if not isinstance(examples, list):
             examples = [examples]
 
         batch_images = [to_pil_preserve(example["image"]) for example in examples]

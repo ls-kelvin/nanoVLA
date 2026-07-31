@@ -50,13 +50,78 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         self.model.proj_out_1 = None
         self.model.proj_out_2 = None
 
+        # Cross-attention rows are independent, so ``repeated_diffusion_steps``
+        # copies of one VL example can share a single set of projected K/V as
+        # long as every other op in the block is position-wise.  ``ada_norm``
+        # (per-batch-element modulation) and sinusoidal ``pos_embed`` (indexed by
+        # sequence position) both break that, so fall back to materialising the
+        # repeats for those DiT variants.
+        self._cross_attention_foldable = all(
+            block.norm_type != "ada_norm" and block.pos_embed is None
+            for block in self.model.transformer_blocks
+        )
+
     def sample_time(self, batch_size, device, dtype):
         # Mantis formula: noise_s * (1 - beta_sample)
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return self.config.noise_s * (1 - sample)
 
-    def _apply_layerwise_cross_attention(self, sa_embs, vl_embs_list, temb, encoder_attention_mask=None):
-        """Interleave self/cross attention across DiT blocks (Mantis semantics)."""
+    @staticmethod
+    def _fold_query_repeats(hidden_states: torch.Tensor, repeat: int) -> torch.Tensor:
+        """``(repeat*B, T, D)`` in ``Tensor.repeat(repeat, 1, 1)`` order -> ``(B, repeat*T, D)``."""
+        total_batch, seq_len, dim = hidden_states.shape
+        batch = total_batch // repeat
+        return (
+            hidden_states.reshape(repeat, batch, seq_len, dim)
+            .transpose(0, 1)
+            .reshape(batch, repeat * seq_len, dim)
+        )
+
+    @staticmethod
+    def _unfold_query_repeats(hidden_states: torch.Tensor, repeat: int) -> torch.Tensor:
+        """Inverse of :meth:`_fold_query_repeats`."""
+        batch, folded_len, dim = hidden_states.shape
+        seq_len = folded_len // repeat
+        return (
+            hidden_states.reshape(batch, repeat, seq_len, dim)
+            .transpose(0, 1)
+            .reshape(repeat * batch, seq_len, dim)
+        )
+
+    def _resolve_query_repeat(self, query_batch: int, vl_batch: int) -> int:
+        if query_batch == vl_batch:
+            return 1
+        if vl_batch <= 0 or query_batch % vl_batch != 0:
+            raise ValueError(
+                f"Query batch {query_batch} must be a multiple of the VL batch {vl_batch}."
+            )
+        return query_batch // vl_batch
+
+    def _materialize_query_repeats(self, vl_embs_list, encoder_attention_mask, query_repeat):
+        """Expand VL states to the query batch for DiT variants that cannot fold."""
+        vl_embs_list = [hidden.repeat(query_repeat, 1, 1) for hidden in vl_embs_list]
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = encoder_attention_mask.repeat(query_repeat, 1)
+        return vl_embs_list, encoder_attention_mask, 1
+
+    def _prepare_cross_attention_inputs(self, query_batch, vl_embs_list, encoder_attention_mask):
+        query_repeat = self._resolve_query_repeat(query_batch, vl_embs_list[0].shape[0])
+        if query_repeat > 1 and not self._cross_attention_foldable:
+            return self._materialize_query_repeats(vl_embs_list, encoder_attention_mask, query_repeat)
+        return vl_embs_list, encoder_attention_mask, query_repeat
+
+    def _apply_layerwise_cross_attention(
+        self, sa_embs, vl_embs_list, temb, encoder_attention_mask=None, query_repeat=1
+    ):
+        """Interleave self/cross attention across DiT blocks (Mantis semantics).
+
+        ``query_repeat > 1`` means ``sa_embs`` carries that many diffusion
+        samples per VL example while ``vl_embs_list`` is still at the
+        un-repeated batch.  The repeats are folded into the query sequence for
+        cross-attention blocks so K/V are projected once instead of once per
+        repeat; self-attention blocks keep the unfolded layout so they never
+        attend across repeats.
+        """
         hidden_states = sa_embs
         interleave = self.model.config.interleave_self_attention
         for layer_idx, block in enumerate(self.model.transformer_blocks):
@@ -68,6 +133,14 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
                     encoder_attention_mask=None,
                     temb=temb,
                 )
+            elif query_repeat > 1:
+                folded = block(
+                    hidden_states=self._fold_query_repeats(hidden_states, query_repeat),
+                    encoder_hidden_states=vl_embs_list[layer_idx],
+                    encoder_attention_mask=encoder_attention_mask,
+                    temb=temb,
+                )
+                hidden_states = self._unfold_query_repeats(folded, query_repeat)
             else:
                 hidden_states = block(
                     hidden_states=hidden_states,
@@ -100,12 +173,19 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         encoder_attention_mask=None,
     ):
         """
-        vl_embs_list: list of (B, seq_length, vl_hidden) per DiT layer.
+        vl_embs_list: list of (Bvl, seq_length, vl_hidden) per DiT layer.
         actions:      (B, action_horizon, action_dim).
         state:        (B, 1, state_dim) or None.
-        encoder_attention_mask: optional (B, seq_length) bool/int mask for padded VL tokens.
+        encoder_attention_mask: optional (Bvl, seq_length) bool/int mask for padded VL tokens.
+
+        ``B`` may be an integer multiple of ``Bvl`` when the caller stacks
+        several diffusion samples per VL example with ``Tensor.repeat``; the VL
+        states are then shared across the repeats instead of being copied.
         """
         device = actions.device
+        vl_embs_list, encoder_attention_mask, query_repeat = self._prepare_cross_attention_inputs(
+            actions.shape[0], vl_embs_list, encoder_attention_mask
+        )
 
         noise = torch.randn(actions.shape, device=device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=device, dtype=actions.dtype)
@@ -124,6 +204,7 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
             vl_embs_list,
             temb,
             encoder_attention_mask=encoder_attention_mask,
+            query_repeat=query_repeat,
         )
         pred_velocity = self._process_output(hidden_states, actions.shape[1])
 

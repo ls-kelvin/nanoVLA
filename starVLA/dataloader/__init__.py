@@ -7,6 +7,7 @@ import numpy as np
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
+from starVLA.dataloader.vlm_input_collator import build_vlm_input_collator
 
 logger = get_logger(__name__)
 
@@ -64,6 +65,7 @@ def build_dataloader(
             if batch_size is not None
             else int(cfg.datasets.vla_data.per_device_batch_size)
         )
+        collate_fn = build_vlm_input_collator(cfg, collate_fn)
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=effective_batch_size,

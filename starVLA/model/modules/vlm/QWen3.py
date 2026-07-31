@@ -26,6 +26,38 @@ _ACTION_TOKEN_MAX = (
 import torch.nn as nn
 
 
+def build_qwen3_vl_messages(images, instructions, cot_prompt=None, solutions=None):
+    """Chat-format one message per ``(images, instruction)`` pair."""
+    assert len(images) == len(instructions), "Images and instructions must have the same length"
+    messages = []
+    for imgs, instruction in zip(images, instructions):
+        content = [{"type": "image", "image": img} for img in imgs]
+        prompt = instruction if cot_prompt is None else cot_prompt.replace("{instruction}", instruction)
+        content.append({"type": "text", "text": prompt})
+        msg = [{"role": "user", "content": content}]
+        if solutions is not None:
+            msg.append({"role": "assistant", "content": [{"type": "text", "text": solutions[len(messages)]}]})
+        messages.append(msg)
+    return messages
+
+
+def build_qwen3_vl_inputs(processor, images, instructions, cot_prompt=None, solutions=None):
+    """Tokenize + pack a batch on CPU.
+
+    Split out of :meth:`_QWen3_VL_Interface.build_qwenvl_inputs` so dataloader
+    workers can run the processor without holding the VLM weights.
+    """
+    messages = build_qwen3_vl_messages(images, instructions, cot_prompt=cot_prompt, solutions=solutions)
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        padding=True,
+        add_generation_prompt=(solutions is None),
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+
 class _QWen3_VL_Interface(nn.Module):
     """
     This exists because of the diversity of VLMs, so we encapsulate the changes here.
@@ -70,6 +102,8 @@ class _QWen3_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        vla_data_cfg = config.datasets.vla_data
+        self.cot_prompt = vla_data_cfg.get("CoT_prompt", "") if "CoT_prompt" in vla_data_cfg else None
 
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
@@ -118,35 +152,12 @@ class _QWen3_VL_Interface(nn.Module):
         Follow Oficial Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
         """
 
-        # Create messages: one message per sample
-        messages = []
-        assert len(images) == len(instructions), "Images and instructions must have the same length"
-        for imgs, instruction in zip(images, instructions):
-            content = [{"type": "image", "image": img} for img in imgs]
-
-            if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
-                CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
-                prompt = CoT_prompt.replace("{instruction}", instruction)
-            else:
-                prompt = instruction
-
-            content.append({"type": "text", "text": prompt})
-            msg = [{"role": "user", "content": content}]
-
-            if solutions is not None:
-                solution = solutions[len(messages)]
-                msg.append({"role": "assistant", "content": [{"type": "text", "text": solution}]})
-            messages.append(msg)
-
-        # Preparation for inference
-
-        batch_inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            padding=True,
-            add_generation_prompt=(solutions is None),
-            return_dict=True,
-            return_tensors="pt",
+        batch_inputs = build_qwen3_vl_inputs(
+            self.processor,
+            images,
+            instructions,
+            cot_prompt=self.cot_prompt,
+            solutions=solutions,
         )
 
         # if solutions, mask out the solution tokens in labels
