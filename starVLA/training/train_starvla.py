@@ -75,7 +75,13 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
 
 
 def _supports_dual_vla_dataloaders(cfg) -> bool:
-    return str(cfg.framework.name) in {"QwenMetaQuery_LA", "QwenPI_v3_LA", "QwenPI_v4_LA", "QwenWM_LA"}
+    return str(cfg.framework.name) in {
+        "QwenMetaQuery_LA",
+        "QwenPI_v3_LA",
+        "QwenPI_v4_LA",
+        "QwenPI_v5_LA",
+        "QwenWM_LA",
+    }
 
 
 def _dataloader_loss_modes(cfg) -> dict:
@@ -164,7 +170,8 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     if use_dual_dataloaders and not _supports_dual_vla_dataloaders(cfg):
         raise ValueError(
             "trainer.use_dual_vla_dataloaders=true is only supported for "
-            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA', 'QwenPI_v4_LA'}."
+            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA', 'QwenPI_v4_LA', 'QwenPI_v5_LA', "
+            "'QwenWM_LA'}."
         )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
@@ -1044,6 +1051,12 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+
+    if os.getenv("ALLOW_TF32", "0").lower() in {"1", "true", "yes", "on"}:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("TF32 enabled for fp32 matmul / cudnn")
+
     accelerator = create_accelerator_from_config(cfg)
 
     output_dir = setup_directories(cfg=cfg)

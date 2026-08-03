@@ -4,7 +4,7 @@ tiktoken
 einops
 transformers_stream_generator==0.0.4
 scipy
-torch==2.7.1
+torch==2.8.0
 torchvision
 setuptools==80.9.0
 pillow
@@ -34,6 +34,8 @@ rotary_embedding_torch==0.8.4
 tyro
 websockets
 tdigest==0.5.2.2
+h5py
+torchcodec==0.7.0
 
 # env for qwen3.5 tip: flash-linear-attention 会导致过去的版本不兼容，导致之前的ckpt 性能下降
 # torch==2.6.0+cu124

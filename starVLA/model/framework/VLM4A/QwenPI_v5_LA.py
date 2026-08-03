@@ -1,15 +1,20 @@
-"""QwenPI_v4 with bridge-token latent-action supervision."""
+# Copyright 2025 starVLA community. All rights reserved.
+# Licensed under the MIT License.
+"""QwenPI_v5 with bridge-token latent-action supervision.
 
-import os
-import time
+Bridge tokens are appended to the Qwen3-VL prompt. The VLM is causal, so the
+prompt never attends to them; prefix K/V fed to the action expert are sliced to
+``prompt_len``, so the suffix also never sees them. Latent loss reads
+``last_hidden[:, prompt_len:]``.
+"""
+
 from typing import List, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from starVLA.model.framework.VLM4A.QwenPI_v4 import Qwen_PI_v4
+from starVLA.model.framework.VLM4A.QwenPI_v5 import Qwen_PI_v5
 from starVLA.model.modules.latent_action import build_latent_action_encoder
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -17,31 +22,30 @@ from starVLA.training.trainer_utils import initialize_overwatch
 logger = initialize_overwatch(__name__)
 
 
-@FRAMEWORK_REGISTRY.register("QwenPI_v4_LA")
-class Qwen_PI_v4_LA(Qwen_PI_v4):
-    """QwenPI_v4 plus latent-action loss on appended bridge-token positions."""
+@FRAMEWORK_REGISTRY.register("QwenPI_v5_LA")
+class Qwen_PI_v5_LA(Qwen_PI_v5):
+    """QwenPI_v5 plus latent-action loss on appended bridge-token positions."""
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         load_latent_action_encoder = bool(kwargs.pop("load_latent_action_encoder", True))
         super().__init__(config=config, **kwargs)
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
-        self.latent_action_private_cfg = self.latent_action_cfg.qwenpi_v4_la
+        self.latent_action_private_cfg = self.latent_action_cfg.qwenpi_v5_la
         self.latent_action_enabled = bool(self.latent_action_cfg.get("enabled", True))
         self.latent_action_backend = str(self.latent_action_cfg.get("backend", "unit")).lower()
         self.train_latent_action = bool(self.latent_action_cfg.get("train_latent", True))
         self.train_continuous_action = bool(self.latent_action_cfg.get("train_action", True))
         if not self.train_latent_action and not self.train_continuous_action:
-            raise ValueError("At least one of latent_action.train_latent or latent_action.train_action must be true.")
+            raise ValueError(
+                "At least one of latent_action.train_latent or latent_action.train_action must be true."
+            )
 
         self.num_bridge_tokens = int(self.latent_action_cfg.num_bridge_tokens)
         self.num_codebooks = int(self.latent_action_cfg.num_codebooks)
         self.codebook_size = int(self.latent_action_cfg.codebook_size)
         self.latent_action_loss_type = self._get_latent_action_loss_type()
         self.label_smoothing = float(self.latent_action_cfg.get("label_smoothing", 0.0))
-        self.detach_vl_embs_for_action_head = bool(
-            self.latent_action_cfg.get("detach_vl_embs_for_action_head", False)
-        )
 
         self.latent_action_token_ids: list[int] = []
         self.latent_action_encoder = None
@@ -49,9 +53,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         episode_cache_dir = self.latent_action_cfg.get("episode_cache_dir", None)
         if episode_cache_dir is None:
             try:
-                episode_cache_dir = self.config.datasets.vla_data.latent_action.get(
-                    "episode_cache_dir", None
-                )
+                episode_cache_dir = self.config.datasets.vla_data.latent_action.get("episode_cache_dir", None)
             except Exception:
                 episode_cache_dir = None
         self.use_cached_soft_distribution = (
@@ -83,8 +85,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
-        keys_to_remove = [key for key in state_dict if key.startswith("latent_action_encoder.")]
-        for key in keys_to_remove:
+        for key in [key for key in state_dict if key.startswith("latent_action_encoder.")]:
             del state_dict[key]
         return state_dict
 
@@ -112,7 +113,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             "image_size": [224, 224],
             "cached_indices_path": None,
             "episode_cache_dir": None,
-            "qwenpi_v4_la": {
+            "qwenpi_v5_la": {
                 "token_format": "<latent_action_{i}>",
                 "head_dropout": 0.0,
             },
@@ -133,10 +134,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                     "starVLA/model/modules/latent_action/softvq_joint/"
                     "0614_joint_aloha_xrecon_scratch.yaml"
                 ),
-                "ckpt_path": (
-                    "/inspire/qb-ilm/project/qproject-fundationmodel/public/jjc/exp/softla/"
-                    "0614_joint_aloha_xrecon_scratch/checkpoints/partial_step_100000.pt"
-                ),
+                "ckpt_path": None,
                 "image_size": [224, 224],
                 "strict_load": True,
                 "kl_eps": 1e-8,
@@ -211,11 +209,11 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         return loss_type
 
     def _expand_latent_action_bridge_tokens(self) -> None:
-        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        tokenizer = self.processor.tokenizer
         token_format = str(self.latent_action_private_cfg.token_format)
         tokens = [token_format.format(i=i) for i in range(self.num_bridge_tokens)]
         tokenizer.add_special_tokens({"additional_special_tokens": tokens})
-        self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
+        self.action_model.qwenvl_with_expert.qwenvl.resize_token_embeddings(len(tokenizer))
 
         token_ids = []
         for token in tokens:
@@ -250,6 +248,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             self.codebook_size = villax_codebook_size
             self.latent_action_cfg.codebook_size = villax_codebook_size
 
+    # ------------------------------------------------------------------ #
+    # per-sample action selection
+    # ------------------------------------------------------------------ #
     def _get_action_train_robot_types(self) -> set[str] | None:
         robot_types = self.latent_action_cfg.get("action_train_robot_types", None)
         if robot_types is None:
@@ -264,48 +265,37 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         allowed = {str(robot_type) for robot_type in robot_types if str(robot_type)}
         return allowed if allowed else None
 
-    def _select_action_training_batch(
-        self,
-        examples: List[dict],
-        vl_embs_list: list[torch.Tensor],
-        attention_mask: torch.Tensor | None,
-    ) -> tuple[List[dict], list[torch.Tensor], torch.Tensor | None]:
-        action_train_robot_types = self._get_action_train_robot_types()
-        if action_train_robot_types is None:
-            return examples, vl_embs_list, attention_mask
+    def _action_row_weights(self, examples: List[dict], device) -> tuple[torch.Tensor | None, int]:
+        """Rows excluded by ``action_train_robot_types`` get a zero action mask.
 
-        selected_indices = [
-            idx
-            for idx, example in enumerate(examples)
-            if str(example.get("robot_type", "")) in action_train_robot_types
-        ]
-        if len(selected_indices) == len(examples):
-            return examples, vl_embs_list, attention_mask
-        if not selected_indices:
-            return [], [], None
+        QwenPI_v4_LA can slice the batch because its action head runs separately;
+        here the action suffix rides along in the same joint forward, so the
+        selection is applied to the flow-matching mask instead.
+        """
+        allowed = self._get_action_train_robot_types()
+        if allowed is None:
+            return None, len(examples)
+        flags = [1.0 if str(example.get("robot_type", "")) in allowed else 0.0 for example in examples]
+        weights = torch.tensor(flags, dtype=torch.float32, device=device)
+        return weights, int(sum(flags))
 
-        index_tensor = torch.tensor(selected_indices, device=vl_embs_list[-1].device, dtype=torch.long)
-        selected_examples = [examples[idx] for idx in selected_indices]
-        selected_vl_embs_list = [hidden.index_select(0, index_tensor) for hidden in vl_embs_list]
-        selected_attention_mask = (
-            attention_mask.index_select(0, index_tensor) if attention_mask is not None else None
-        )
-        return selected_examples, selected_vl_embs_list, selected_attention_mask
-
+    # ------------------------------------------------------------------ #
+    # latent-action targets
+    # ------------------------------------------------------------------ #
     def _collect_latent_window_counts(self, examples: List[dict]) -> list[int]:
         counts = []
         for example in examples:
             frames = example.get("la_frames", None)
             if frames is None:
                 raise ValueError(
-                    "QwenPI_v4_LA requires `la_frames`. Use "
+                    "QwenPI_v5_LA requires `la_frames`. Use "
                     "datasets.vla_data.dataset_py=lerobot_la_datasets or hdf5_la_dataset "
                     "and enable datasets.vla_data.latent_action."
                 )
             if self.latent_action_backend == "villax":
                 if not isinstance(frames, list) or len(frames) == 0 or not isinstance(frames[0], list):
                     raise ValueError(
-                        "QwenPI_v4_LA (villax) requires `la_frames` to be a list of clips. "
+                        "QwenPI_v5_LA (villax) requires `la_frames` to be a list of clips. "
                         "Set datasets.vla_data.latent_action.full_window=true."
                     )
                 counts.append(len(frames))
@@ -315,7 +305,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 counts.append(len(frames) - 1)
         if len(set(counts)) != 1:
             raise ValueError(
-                "QwenPI_v4_LA requires the same latent-action window count per batch "
+                "QwenPI_v5_LA requires the same latent-action window count per batch "
                 f"because bridge-token suffixes are batched without padding, got {counts}."
             )
         return counts
@@ -327,7 +317,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             frames = example.get("la_frames", None)
             if frames is None or len(frames) < 2:
                 raise ValueError(
-                    "QwenPI_v4_LA requires `la_frames` with at least two frames for latent-action targets."
+                    "QwenPI_v5_LA requires `la_frames` with at least two frames for latent-action targets."
                 )
             counts.append(len(frames) - 1)
             for i in range(len(frames) - 1):
@@ -335,54 +325,6 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         if len(set(counts)) != 1:
             raise ValueError(f"Latent-action frame-pair counts must match within a batch, got {counts}.")
         return frame_pairs, counts
-
-    def _build_latent_suffix(self, window_count: int, batch_size: int, device: torch.device) -> torch.LongTensor:
-        bridge_ids = self.latent_action_bridge_token_ids.to(device)
-        suffix = bridge_ids.repeat(int(window_count))
-        return suffix.unsqueeze(0).expand(batch_size, -1)
-
-    def _encode_vl_hidden_states_with_latent_tokens(
-        self,
-        batch_images: List,
-        instructions: list[str],
-        window_count: int,
-        prebuilt_inputs=None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor | None, torch.Tensor, dict]:
-        inputs = self._build_vlm_inputs(batch_images, instructions, prebuilt_inputs)
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask", None)
-        prompt_len = input_ids.shape[1]
-        batch_size = input_ids.shape[0]
-
-        suffix = self._build_latent_suffix(window_count, batch_size, input_ids.device)
-        inputs["input_ids"] = torch.cat([input_ids, suffix], dim=1)
-        if attention_mask is not None:
-            suffix_mask = torch.ones(
-                suffix.shape,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            inputs["attention_mask"] = torch.cat([attention_mask, suffix_mask], dim=1)
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = self.qwen_vl_interface(
-                **inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-                # Only ``hidden_states`` are consumed; keep the vocab projection to a
-                # single position instead of running it over the whole sequence.
-                logits_to_keep=1,
-            )
-            vl_embs_list = [
-                hidden[:, :prompt_len, :]
-                for hidden in outputs.hidden_states[-self.num_action_dit_layers :]
-            ]
-            latent_hidden = outputs.hidden_states[-1][:, prompt_len:, :]
-
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(dtype=torch.bool)
-        return vl_embs_list, attention_mask, latent_hidden, inputs
 
     def _make_discrete_targets(self, examples: List[dict], instructions: list[str]) -> torch.LongTensor:
         if self.use_cached_indices and "la_cached_indices" in examples[0]:
@@ -406,7 +348,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         elif indices.ndim == 2:
             indices = indices.unsqueeze(-1)
         elif indices.ndim != 3:
-            raise ValueError(f"Latent-action encoder must return [pairs,tokens,codes], got {tuple(indices.shape)}.")
+            raise ValueError(
+                f"Latent-action encoder must return [pairs,tokens,codes], got {tuple(indices.shape)}."
+            )
 
         self._validate_discrete_target_shape(indices, len(frame_pairs))
         pair_count = counts[0]
@@ -437,7 +381,7 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             clips = example.get("la_frames", None)
             if clips is None or not isinstance(clips, list) or len(clips) == 0 or not isinstance(clips[0], list):
                 raise ValueError(
-                    "QwenPI_v4_LA (villax) requires `la_frames` as a list of clips. "
+                    "QwenPI_v5_LA (villax) requires `la_frames` as a list of clips. "
                     "Set datasets.vla_data.latent_action.full_window=true."
                 )
             window_counts.append(len(clips))
@@ -527,9 +471,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             )
         distributions = distributions[:, : self.num_bridge_tokens]
         pair_count = counts[0]
-        return distributions.reshape(len(examples), pair_count * self.num_bridge_tokens, self.codebook_size).to(
-            self.latent_action_bridge_token_ids.device
-        )
+        return distributions.reshape(
+            len(examples), pair_count * self.num_bridge_tokens, self.codebook_size
+        ).to(self.latent_action_bridge_token_ids.device)
 
     def _load_cached_soft_targets(self, examples: List[dict]) -> torch.Tensor:
         """Load soft_kl teacher weights from episode cache samples."""
@@ -562,11 +506,16 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         flags = [bool(example.get("la_padded", False)) for example in examples]
         return torch.tensor([0.0 if padded else 1.0 for padded in flags], dtype=torch.float32)
 
+    # ------------------------------------------------------------------ #
+    # latent-action loss
+    # ------------------------------------------------------------------ #
     def _latent_logits(self, latent_hidden: torch.Tensor) -> torch.Tensor:
         if self.latent_head is None:
             raise RuntimeError("Latent-action head is not initialized.")
-        logits = self.latent_head(latent_hidden)
-        return logits.reshape(latent_hidden.shape[0], latent_hidden.shape[1], self.num_codebooks, self.codebook_size)
+        logits = self.latent_head(latent_hidden.to(self.latent_head[1].weight.dtype))
+        return logits.reshape(
+            latent_hidden.shape[0], latent_hidden.shape[1], self.num_codebooks, self.codebook_size
+        )
 
     def _compute_latent_loss(
         self,
@@ -582,7 +531,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             if targets.ndim != 3:
                 raise ValueError(f"CE targets must be [B,N,num_codebooks], got {tuple(targets.shape)}.")
             if logits.shape[:3] != targets.shape:
-                raise ValueError(f"Latent logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}.")
+                raise ValueError(
+                    f"Latent logits shape {tuple(logits.shape)} does not match targets {tuple(targets.shape)}."
+                )
 
             weights_cfg = self.latent_action_cfg.get("ce_loss_weights", None)
             if weights_cfg is None:
@@ -591,7 +542,8 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 weights = [float(weight) for weight in weights_cfg]
                 if len(weights) != self.num_codebooks:
                     raise ValueError(
-                        f"latent_action.ce_loss_weights must have length {self.num_codebooks}, got {len(weights)}."
+                        f"latent_action.ce_loss_weights must have length {self.num_codebooks}, "
+                        f"got {len(weights)}."
                     )
 
             per_codebook_losses = []
@@ -641,49 +593,28 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
 
         raise ValueError(f"Unknown latent_action_loss_type: {self.latent_action_loss_type}")
 
-    def _action_loss_from_hidden(
-        self,
-        examples: List[dict],
-        vl_embs_list: list[torch.Tensor],
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if not examples or "action" not in examples[0]:
-            raise ValueError("QwenPI_v4_LA action loss requires examples with `action`.")
+    # ------------------------------------------------------------------ #
+    # bridge tokens
+    # ------------------------------------------------------------------ #
+    def _append_bridge_tokens(self, inputs: dict, window_count: int) -> tuple[dict, int]:
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        bridge_ids = self.latent_action_bridge_token_ids.to(input_ids.device)
+        suffix = bridge_ids.repeat(int(window_count)).unsqueeze(0).expand(input_ids.shape[0], -1)
 
-        actions = [example["action"] for example in examples]
-        state = [example["state"] for example in examples] if "state" in examples[0] else None
-        base_hidden = vl_embs_list[-1]
-        with torch.autocast("cuda", dtype=torch.float32):
-            actions = torch.tensor(np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype)
-            actions_target = actions[:, -self.action_horizon :, :]
-
-            r = self.repeated_diffusion_steps
-            actions_target = actions_target.repeat(r, 1, 1)
-            # ``vl_embs_list`` / ``attention_mask`` stay at the un-repeated batch.
-            # The action head folds the ``r`` diffusion repeats into the DiT query
-            # sequence, so cross-attention K/V are projected once instead of once
-            # per repeat.
-            if self.detach_vl_embs_for_action_head:
-                vl_embs_list = [hidden.detach() for hidden in vl_embs_list]
-
-            state_repeated = None
-            if state is not None:
-                state = torch.tensor(np.array(state), device=base_hidden.device, dtype=base_hidden.dtype)
-                state_repeated = state.repeat(r, 1, 1)
-
-            return self.action_model(
-                vl_embs_list,
-                actions_target,
-                state_repeated,
-                encoder_attention_mask=attention_mask,
-            )
+        inputs = dict(inputs)
+        inputs["input_ids"] = torch.cat([input_ids, suffix], dim=1)
+        inputs["attention_mask"] = torch.cat(
+            [attention_mask, torch.ones_like(suffix, dtype=attention_mask.dtype)], dim=1
+        )
+        return inputs, suffix.shape[1]
 
     def _print_training_sample_once(self, examples: List[dict], instructions: list[str]) -> None:
         if self._printed_training_sample or not self.training or not logger.is_rank_zero():
             return
         example = examples[0]
         logger.info(
-            "First QwenPI_v4_LA training sample (episode_index=%s, step_index=%s, episode_path=%s):\n"
+            "First QwenPI_v5_LA training sample (episode_index=%s, step_index=%s, episode_path=%s):\n"
             "  instruction: %s\n"
             "  la_frame_offsets: %s\n"
             "  num_bridge_tokens: %s\n"
@@ -698,26 +629,13 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         )
         self._printed_training_sample = True
 
-    def _start_profile_timer(self) -> float | None:
-        if os.getenv("PROFILE_LA_TIMING", "0").lower() not in {"1", "true", "yes", "on"}:
-            return None
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter()
-
-    @staticmethod
-    def _stop_profile_timer(timings: dict, name: str, start_time: float | None) -> None:
-        if start_time is None:
-            return
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        timings[f"timing/{name}"] = time.perf_counter() - start_time
-
+    # ------------------------------------------------------------------ #
+    # forward
+    # ------------------------------------------------------------------ #
     def forward(self, examples: List[dict] = None, **kwargs) -> dict:
         loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
         if loss_mode not in {"joint", "latent", "action"}:
             raise ValueError(f"loss_mode must be 'joint', 'latent', or 'action', got {loss_mode!r}.")
-        timings: dict = {}
 
         compute_action = loss_mode in {"joint", "action"} and self.train_continuous_action
         compute_latent = loss_mode in {"joint", "latent"} and self.train_latent_action
@@ -725,58 +643,52 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             raise RuntimeError("Action loss requested, but latent_action.train_action=false.")
         if loss_mode == "latent" and not compute_latent:
             raise RuntimeError("Latent loss requested, but latent_action.train_latent=false.")
+        if compute_latent and (not self.latent_action_enabled or self.latent_head is None):
+            raise RuntimeError("Latent-action loss requested, but latent action is disabled or uninitialized.")
 
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
-        prebuilt_inputs = getattr(examples, "vlm_inputs", None)
 
-        _t = self._start_profile_timer()
-        latent_hidden = None
+        inputs = self._build_vlm_inputs(
+            batch_images, instructions, prebuilt_inputs=getattr(examples, "vlm_inputs", None)
+        )
+        device = inputs["input_ids"].device
+
+        num_latent_tokens = 0
         if compute_latent:
-            if not self.latent_action_enabled or self.latent_head is None:
-                raise RuntimeError("Latent-action loss requested, but latent action is disabled or uninitialized.")
             window_count = self._collect_latent_window_counts(examples)[0]
-            vl_embs_list, attention_mask, latent_hidden, _ = self._encode_vl_hidden_states_with_latent_tokens(
-                batch_images,
-                instructions,
-                window_count,
-                prebuilt_inputs=prebuilt_inputs,
-            )
+            inputs, num_latent_tokens = self._append_bridge_tokens(inputs, window_count)
             self._print_training_sample_once(examples, instructions)
-        else:
-            vl_embs_list, attention_mask = self._encode_vl_hidden_states(
-                batch_images, instructions, prebuilt_inputs=prebuilt_inputs
-            )
 
-        self._stop_profile_timer(timings, f"{loss_mode}_vlm_encode", _t)
-
-        _t = self._start_profile_timer()
         action_dit_loss = None
+        latent_hidden = None
         action_train_batch_size = 0
+
         if compute_action:
-            action_examples, action_vl_embs_list, action_attention_mask = self._select_action_training_batch(
-                examples,
-                vl_embs_list,
-                attention_mask,
+            state = self._prepare_state(examples, device)
+            actions, action_mask = self._prepare_actions(examples, device)
+            row_weights, action_train_batch_size = self._action_row_weights(examples, device)
+            if row_weights is not None:
+                action_mask = action_mask * row_weights[:, None, None]
+
+            repeats = self.repeated_diffusion_steps
+            if state is None:
+                state = torch.zeros(actions.shape[0], self.state_dim, device=device, dtype=actions.dtype)
+
+            out = self.action_model(
+                inputs,
+                state,
+                actions,
+                action_mask,
+                num_latent_tokens=num_latent_tokens,
+                num_repeats=repeats,
             )
-            action_train_batch_size = len(action_examples)
-            if action_examples:
-                action_dit_loss = self._action_loss_from_hidden(
-                    action_examples,
-                    action_vl_embs_list,
-                    action_attention_mask,
-                )
-            else:
-                dummy_attention_mask = attention_mask[:1] if attention_mask is not None else None
-                action_dit_loss = self._action_loss_from_hidden(
-                    examples[:1],
-                    [hidden[:1] for hidden in vl_embs_list],
-                    dummy_attention_mask,
-                ) * 0.0
+            action_dit_loss = out["action_loss"]
+            if compute_latent:
+                latent_hidden = out["latent_hidden"]
+        elif compute_latent:
+            latent_hidden = self.action_model.encode_prefix(inputs, num_latent_tokens)
 
-        self._stop_profile_timer(timings, f"{loss_mode}_action_dit", _t)
-
-        _t = self._start_profile_timer()
         latent_outputs = {}
         latent_action_loss = None
         if compute_latent:
@@ -786,16 +698,16 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             else:
                 targets = self._make_discrete_targets(examples, instructions)
                 valid_mask = None
-            logits = self._latent_logits(latent_hidden)
-            latent_outputs = self._compute_latent_loss(logits, targets, valid_mask)
+            latent_outputs = self._compute_latent_loss(self._latent_logits(latent_hidden), targets, valid_mask)
             latent_action_loss = latent_outputs["latent_action_loss"]
-        self._stop_profile_timer(timings, f"{loss_mode}_latent_loss", _t)
 
         total_loss = None
         if action_dit_loss is not None:
             total_loss = action_dit_loss * float(self.latent_action_cfg.action_loss_weight)
         if latent_action_loss is not None:
-            latent_weight = float(self.latent_action_cfg.get("latent_loss_weight", self.latent_action_cfg.get("loss_weight", 1.0)))
+            latent_weight = float(
+                self.latent_action_cfg.get("latent_loss_weight", self.latent_action_cfg.get("loss_weight", 1.0))
+            )
             weighted_latent = latent_action_loss * latent_weight
             total_loss = weighted_latent if total_loss is None else total_loss + weighted_latent
         if total_loss is None:
@@ -812,5 +724,4 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         if latent_action_loss is not None:
             out["latent_action_loss"] = latent_action_loss
         out.update(latent_outputs)
-        out.update(timings)
         return out

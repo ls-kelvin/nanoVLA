@@ -129,6 +129,9 @@ class Qwen_PI_v4(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                # Only ``hidden_states`` are consumed; keep the vocab projection to a
+                # single position instead of running it over the whole sequence.
+                logits_to_keep=1,
             )
             vl_embs_list = list(outputs.hidden_states[-self.num_action_dit_layers :])
         return vl_embs_list, attention_mask

@@ -1,17 +1,19 @@
-run_id: qwenpiv4_hdf5_aloha_clean_random_la_sharla_eef
+run_id: qwenpiv5_hdf5_aloha_clean_random_la_sharla_eef
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenPI_v4_LA with a frozen Sharla teacher.
-# The launch script supplies the matching Sharla config and checkpoint paths.
+# QwenPI_v5_LA + frozen Sharla teacher (models/sharla_a2a).
 framework:
-  name: QwenPI_v4_LA
+  name: QwenPI_v5_LA
   qwenvl:
-    base_vlm: playground/Pretrained_models/RynnBrain-2B
+    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
+    freeze_vision_encoder: false
+    train_expert_only: false
+    gradient_checkpointing: false
 
   latent_action:
     enabled: true
@@ -21,13 +23,12 @@ framework:
     train_action: true
     latent_loss_weight: 0.1
     action_loss_weight: 1.0
-    detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
     num_bridge_tokens: 8
     num_codebooks: 1
     codebook_size: 256
     strict_num_bridge_tokens: true
-    qwenpi_v4_la:
+    qwenpi_v5_la:
       token_format: "<latent_action_{i}>"
       head_dropout: 0.0
     sharla:
@@ -41,24 +42,22 @@ framework:
     action_dim: 16
     state_dim: 16
     action_horizon: 32
-    add_pos_embed: true
-    max_seq_len: 1024
-    num_target_vision_tokens: 0
+    num_inference_timesteps: 10
     repeated_diffusion_steps: 8
+    loss_type: fm
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
-    noise_s: 0.999
-    num_timestep_buckets: 1000
-    num_inference_timesteps: 20
-    diffusion_model_cfg:
-      input_embedding_dim: 1024
-      attention_head_dim: 32
-      num_attention_heads: 32
-      norm_type: norm
-      dropout: 0.0
-      final_dropout: true
-      interleave_self_attention: true
-      positional_embeddings: null
+    expert_attention: sdpa
+    action_dim_mask: null
+    action_expert:
+      hidden_size: 768
+      intermediate_size: 2752
+      num_attention_heads: 16
+      num_key_value_heads: 8
+      head_dim: 128
+      num_layers: null
+      adanorm_time: true
+      final_norm_adanorm: false
 
 datasets:
   vla_data:
@@ -86,13 +85,12 @@ datasets:
     hdf5_action_type: eef
     action_type: abs_eef
     action_mode: abs
-    per_device_batch_size: 16
-    latent_per_device_batch_size: 16
+    per_device_batch_size: 4
+    latent_per_device_batch_size: 4
     balance_dataset_weights: true
     balance_trajectory_weights: true
     load_all_data_for_training: true
     obs_image_size: [256, 256]
-    # Run the Qwen3-VL processor in the dataloader workers instead of inside forward.
     precompute_vlm_inputs: true
 
 trainer:
@@ -105,20 +103,20 @@ trainer:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 100000
+  max_train_steps: 90000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
-  eval_num_samples: 1024
-  eval_batch_size: 16
+  eval_num_samples: 512
+  eval_batch_size: 4
   logging_frequency: 50
   learning_rate:
-    base: 1e-5
-    qwen_vl_interface: 2.0e-05
-    action_model: 1e-4
+    base: 5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 5.0e-07
+    min_lr: 1e-7
   freeze_modules: ""
   loss_scale:
     vla: 1.0
@@ -130,15 +128,4 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
-
-# Offline Sharla soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
-soft_kl_cache:
-  output_dir: .cache/latent_cache/sharla_soft_kl
-  batch_size: 256
-  num_workers: 64
-  num_gpus: 8
-  use_bf16: false
-  overwrite: false
-  device: null
-  data_root_dir: null
-  data_mixes: null
+  is_resume: true

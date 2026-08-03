@@ -94,7 +94,7 @@ def main() -> None:
             config,
             cache_dir=str(output_dir),
             device=device,
-            batch_size=1024,
+            batch_size=int(cache_cfg.get("batch_size", 256)),
             num_workers=int(cache_cfg.get("num_workers", 8)),
             use_bf16=bool(cache_cfg.get("use_bf16", True)),
             overwrite=overwrite,
