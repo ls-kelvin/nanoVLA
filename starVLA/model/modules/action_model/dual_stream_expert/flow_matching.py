@@ -248,37 +248,45 @@ class DualStreamFlowMatching(nn.Module):
                 f"{prefix['prompt_pad_masks'].shape[0]} before repeats."
             )
 
-        if repeats > 1:
-            actions = actions.repeat(repeats, 1, 1)
-            action_mask = action_mask.repeat(repeats, 1, 1)
-            if state is not None:
-                state = state.repeat(repeats, 1)
+        # The expert is designed to run in fp32 (see the explicit ``.float()``
+        # calls throughout embed_suffix/run_expert), but the trainer wraps the
+        # whole forward in ``autocast(bfloat16)`` and DeepSpeed casts all
+        # parameters to bf16, so those casts alone are silently overridden back
+        # to bf16 compute. Nesting an ``autocast(float32)`` island here forces
+        # the expert's autocast-eligible ops (matmul/linear) to actually compute
+        # in fp32, matching QwenPI_v4's DiT precision handling.
+        with torch.autocast("cuda", dtype=torch.float32):
+            if repeats > 1:
+                actions = actions.repeat(repeats, 1, 1)
+                action_mask = action_mask.repeat(repeats, 1, 1)
+                if state is not None:
+                    state = state.repeat(repeats, 1)
 
-        if state is None:
-            state = torch.zeros(actions.shape[0], self.max_state_dim, device=device, dtype=torch.float32)
+            if state is None:
+                state = torch.zeros(actions.shape[0], self.max_state_dim, device=device, dtype=torch.float32)
 
-        if noise is None:
-            noise = torch.randn(actions.shape, device=device, dtype=torch.float32)
-        else:
-            noise = noise.float()
-        if time is None:
-            time = self.sample_time(actions.size(0), device)
-        else:
-            time = time.float()
+            if noise is None:
+                noise = torch.randn(actions.shape, device=device, dtype=torch.float32)
+            else:
+                noise = noise.float()
+            if time is None:
+                time = self.sample_time(actions.size(0), device)
+            else:
+                time = time.float()
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
 
-        expert_prefix, expert_kvs = self._expand_prefix_for_repeats(prefix, prefix_kvs, repeats)
-        suffix_out = self.run_expert(expert_prefix, expert_kvs, state, x_t, time)
-        v_t = self.action_out_proj(suffix_out).float()
+            expert_prefix, expert_kvs = self._expand_prefix_for_repeats(prefix, prefix_kvs, repeats)
+            suffix_out = self.run_expert(expert_prefix, expert_kvs, state, x_t, time)
+            v_t = self.action_out_proj(suffix_out).float()
 
-        if self.loss_type == "L1_fm":
-            losses = F.l1_loss(u_t, v_t, reduction="none")
-        else:
-            losses = F.mse_loss(u_t, v_t, reduction="none")
-        action_loss = (losses * action_mask).sum() / action_mask.sum().clamp_min(1.0)
+            if self.loss_type == "L1_fm":
+                losses = F.l1_loss(u_t, v_t, reduction="none")
+            else:
+                losses = F.mse_loss(u_t, v_t, reduction="none")
+            action_loss = (losses * action_mask).sum() / action_mask.sum().clamp_min(1.0)
 
         out = {"action_loss": action_loss}
         if num_latent_tokens > 0:
@@ -300,13 +308,17 @@ class DualStreamFlowMatching(nn.Module):
 
         prefix, _, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens=0)
 
-        dt = -1.0 / self.num_steps
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            suffix_out = self.run_expert(prefix, prefix_kvs, state, x_t, expanded_time)
-            v_t = self.action_out_proj(suffix_out).float()
-            x_t = x_t + dt * v_t
-            time = time + dt
+        # See the matching comment in ``forward``: force real fp32 compute for
+        # the expert's autocast-eligible ops instead of silently inheriting
+        # whatever ambient autocast dtype the caller established.
+        with torch.autocast("cuda", dtype=torch.float32):
+            dt = -1.0 / self.num_steps
+            x_t = noise
+            time = torch.tensor(1.0, dtype=torch.float32, device=device)
+            while time >= -dt / 2:
+                expanded_time = time.expand(bsize)
+                suffix_out = self.run_expert(prefix, prefix_kvs, state, x_t, expanded_time)
+                v_t = self.action_out_proj(suffix_out).float()
+                x_t = x_t + dt * v_t
+                time = time + dt
         return x_t

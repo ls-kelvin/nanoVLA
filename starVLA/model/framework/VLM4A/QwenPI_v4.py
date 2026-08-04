@@ -143,7 +143,7 @@ class Qwen_PI_v4(baseframework):
         state = [example["state"] for example in examples] if "state" in examples[0] else None
 
         vl_embs_list, attention_mask = self._encode_vl_hidden_states(
-            batch_images, instructions, prebuilt_inputs=getattr(examples, "vlm_inputs", None)
+            batch_images, instructions, prebuilt_inputs=examples[0].get("vlm_inputs", None)
         )
         base_hidden = vl_embs_list[-1]
 

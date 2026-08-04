@@ -309,6 +309,10 @@ class VLATrainer(TrainerUtils):
         self.print_trainable_parameters(self.model)
         self.dump_parameter_status(self.model, self.config.output_dir)
         self.optimizer, self.lr_scheduler = setup_optimizer_and_scheduler(model=self.model, cfg=self.config)
+        # lr_scheduler is intentionally never passed to accelerator.prepare() (see
+        # setup_distributed_training calls below), so it must be registered explicitly
+        # for accelerator.save_state()/load_state() to actually persist/restore it.
+        self.accelerator.register_for_checkpointing(self.lr_scheduler)
         self._adjust_lr_scheduler_for_resume()
 
         if self.use_dual_vla_dataloaders:
@@ -429,8 +433,10 @@ class VLATrainer(TrainerUtils):
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps.
 
-        Skipped when resuming from a full training state because
-        accelerator.load_state() restores the scheduler state directly.
+        Skipped when resuming from a full training state: lr_scheduler is registered
+        via accelerator.register_for_checkpointing() (see prepare_training), so
+        accelerator.load_state() restores its step count directly. Manually stepping
+        it here as well would double-advance it.
         """
         if self._full_state_resume_path is not None:
             logger.info("Skipping manual LR scheduler adjustment (full state resume will restore scheduler)")

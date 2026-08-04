@@ -9,17 +9,6 @@ the collate function keeps it on the dataloader workers instead.
 from starVLA.model.modules.vlm.QWen3 import build_qwen3_vl_inputs
 
 
-class VLABatch(list):
-    """Collated example list that also carries the batch's VLM processor inputs.
-
-    Subclassing ``list`` keeps every existing consumer (which treats a batch as
-    ``List[dict]``) working unchanged; the payload rides along as an attribute
-    so ``pin_memory`` does not clone it once per example.
-    """
-
-    vlm_inputs = None
-
-
 class QwenVLInputCollator:
     """Wrap a dataset collate function with Qwen3-VL input construction."""
 
@@ -47,14 +36,18 @@ class QwenVLInputCollator:
 
     def __call__(self, batch):
         examples = self.base_collate_fn(batch)
-        collated = VLABatch(examples)
-        collated.vlm_inputs = build_qwen3_vl_inputs(
+        # The payload lives under a key of the first example instead of on the
+        # batch object itself: ``accelerate``'s ``send_to_device`` rebuilds the
+        # batch with ``type(batch)(...)`` and would drop any attribute, while
+        # dict values are recursed into (and moved to the GPU for free).  Only
+        # the first example carries it, so ``pin_memory`` pins it once.
+        examples[0]["vlm_inputs"] = build_qwen3_vl_inputs(
             self._get_processor(),
             [example["image"] for example in examples],
             [example["lang"] for example in examples],
             cot_prompt=self.cot_prompt,
         )
-        return collated
+        return examples
 
 
 def build_vlm_input_collator(cfg, base_collate_fn):

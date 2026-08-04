@@ -11,6 +11,7 @@ prompt never attends to them; prefix K/V fed to the action expert are sliced to
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -577,8 +578,10 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
                 valid_mask = torch.ones_like(kl_per_sample)
             else:
                 valid_mask = valid_mask.to(kl_per_sample.device, dtype=kl_per_sample.dtype)
+            valid_count = int(valid_mask.sum().item())
             denom = valid_mask.sum().clamp_min(1.0)
             kl_loss = (kl_per_sample * valid_mask).sum() / denom
+            kl_loss = self._scale_loss_for_global_mean(kl_loss, valid_count)
 
             entropy = -(target_probs * target_probs.log()).sum(dim=-1).mean(dim=1)
             entropy = (entropy * valid_mask).sum() / denom
@@ -592,6 +595,25 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
             }
 
         raise ValueError(f"Unknown latent_action_loss_type: {self.latent_action_loss_type}")
+
+    def _scale_loss_for_global_mean(
+        self,
+        loss: torch.Tensor,
+        local_count: int,
+    ) -> torch.Tensor:
+        """Turn DDP's mean-of-per-rank-means into a mean over all valid samples.
+
+        ``la_padded`` samples are dropped per rank, so the local denominators
+        differ every step; without this the ranks that kept fewer samples would
+        be over-weighted in the averaged gradient.
+        """
+        if not dist.is_available() or not dist.is_initialized():
+            return loss
+        count = torch.tensor(float(local_count), device=loss.device, dtype=loss.dtype)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        if count.item() <= 0:
+            return loss * 0.0
+        return loss * (dist.get_world_size() * float(local_count) / count)
 
     # ------------------------------------------------------------------ #
     # bridge tokens
@@ -650,7 +672,7 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
         instructions = [example["lang"] for example in examples]
 
         inputs = self._build_vlm_inputs(
-            batch_images, instructions, prebuilt_inputs=getattr(examples, "vlm_inputs", None)
+            batch_images, instructions, prebuilt_inputs=examples[0].get("vlm_inputs", None)
         )
         device = inputs["input_ids"].device
 

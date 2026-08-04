@@ -147,19 +147,33 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         self,
         f0: torch.Tensor,
         f1: torch.Tensor,
+        fmid: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode preprocessed RGB tensors ``[B, 3, H, W]`` in ``[0, 1]`` to soft weights."""
+        """Encode preprocessed RGB tensors ``[B, 3, H, W]`` in ``[0, 1]`` to soft weights.
+
+        Optional ``fmid`` has shape ``[B, M, 3, H, W]`` for full-stride Perceiver
+        teachers; omitted for two-frame teachers.
+        """
         if f0.ndim != 4 or f1.ndim != 4:
             raise ValueError(f"Expected f0/f1 as [B,3,H,W], got {tuple(f0.shape)} / {tuple(f1.shape)}")
         if f0.shape != f1.shape:
             raise ValueError(f"f0/f1 shape mismatch: {tuple(f0.shape)} vs {tuple(f1.shape)}")
         if f0.shape[0] == 0:
             return torch.empty((0, self.query_num, self.codebook_size), device=self.device, dtype=torch.float32)
+        if fmid is not None:
+            if fmid.ndim != 5:
+                raise ValueError(f"Expected fmid as [B,M,3,H,W], got {tuple(fmid.shape)}")
+            if fmid.shape[0] != f0.shape[0] or fmid.shape[2:] != f0.shape[1:]:
+                raise ValueError(
+                    f"fmid shape {tuple(fmid.shape)} is incompatible with f0 {tuple(f0.shape)}"
+                )
         self.model.eval()
         inputs = {
             "f0": f0.to(device=self.device, dtype=self.dtype, non_blocking=True),
             "f1": f1.to(device=self.device, dtype=self.dtype, non_blocking=True),
         }
+        if fmid is not None:
+            inputs["fmid"] = fmid.to(device=self.device, dtype=self.dtype, non_blocking=True)
         return self.model(inputs).float()
 
     @torch.inference_mode()

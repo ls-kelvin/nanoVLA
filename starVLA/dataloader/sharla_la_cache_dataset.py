@@ -1,8 +1,8 @@
 """Pair-level DataLoader helpers for Sharla soft_kl episode-cache building.
 
-Each sample is one (obs, goal) frame pair for a single episode step. Workers
-decode HDF5 frames and emit ``[0, 1]`` CHW float tensors so the GPU encode loop
-stays busy.
+Each sample is one stride window for a single episode step: endpoints plus the
+dense mid frames. Workers decode HDF5 frames and emit ``[0, 1]`` CHW float
+tensors so the GPU encode loop stays busy.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ class SharlaPairEntry:
     step: int
     obs_abs: int
     goal_abs: int
+    mid_abs: tuple[int, ...]
     ep_num_steps: int
     stride: int
 
@@ -51,15 +52,22 @@ def build_sharla_pair_entries(
     *,
     stride: int,
 ) -> list[SharlaPairEntry]:
-    """Emit one pair per episode step: ``(t, min(t + stride, T - 1))``."""
+    """Emit one full-stride window per episode step.
+
+    Endpoints are ``(t, min(t + stride, T - 1))``; mid frames are every index
+    between them. Past the episode end, indices clamp to the last frame so the
+    window always has ``stride - 1`` mid frames.
+    """
     entries: list[SharlaPairEntry] = []
+    stride = int(stride)
     for traj_id in trajectory_ids:
         trajectory_index = single_dataset.get_trajectory_index(int(traj_id))
         ep_len = int(single_dataset.trajectory_lengths[trajectory_index])
         traj_key = make_la_cache_traj_key(single_dataset.dataset_name, traj_id)
         for step in range(ep_len):
             obs_abs = step
-            goal_abs = min(step + int(stride), ep_len - 1)
+            goal_abs = min(step + stride, ep_len - 1)
+            mid_abs = tuple(min(step + offset, ep_len - 1) for offset in range(1, stride))
             entries.append(
                 SharlaPairEntry(
                     traj_key=traj_key,
@@ -69,8 +77,9 @@ def build_sharla_pair_entries(
                     step=int(step),
                     obs_abs=int(obs_abs),
                     goal_abs=int(goal_abs),
+                    mid_abs=mid_abs,
                     ep_num_steps=ep_len,
-                    stride=int(stride),
+                    stride=stride,
                 )
             )
     return entries
@@ -106,7 +115,7 @@ def _read_frame_tensor(
 
 
 class SharlaLatentActionCacheDataset(Dataset):
-    """One sample = one stride frame pair with CPU-side Sharla preprocessing."""
+    """One sample = one full-stride frame window with CPU-side Sharla preprocessing."""
 
     def __init__(
         self,
@@ -142,9 +151,26 @@ class SharlaLatentActionCacheDataset(Dataset):
             entry.goal_abs,
             self.image_size,
         )
+        mid_frames = [
+            _read_frame_tensor(
+                single_ds,
+                entry.ds_idx,
+                entry.traj_id,
+                self.video_key,
+                mid_abs,
+                self.image_size,
+            )
+            for mid_abs in entry.mid_abs
+        ]
+        fmid = (
+            torch.stack(mid_frames, dim=0)
+            if mid_frames
+            else torch.empty((0, 3, *self.image_size), dtype=torch.float32)
+        )
         return {
             "f0": obs,
             "f1": goal,
+            "fmid": fmid,
             "traj_key": entry.traj_key,
             "dataset_name": entry.dataset_name,
             "traj_id": entry.traj_id,
@@ -156,9 +182,10 @@ class SharlaLatentActionCacheDataset(Dataset):
 
 def collate_sharla_la_pairs(
     batch: list[dict[str, Any]],
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     f0 = torch.stack([item["f0"] for item in batch], dim=0)
     f1 = torch.stack([item["f1"] for item in batch], dim=0)
+    fmid = torch.stack([item["fmid"] for item in batch], dim=0)
     meta = [
         {
             "traj_key": item["traj_key"],
@@ -170,7 +197,7 @@ def collate_sharla_la_pairs(
         }
         for item in batch
     ]
-    return f0, f1, meta
+    return f0, f1, fmid, meta
 
 
 def make_sharla_pair_dataloader(

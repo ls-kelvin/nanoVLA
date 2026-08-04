@@ -182,7 +182,7 @@ class Qwen_PI_v5(baseframework):
         instructions = [example["lang"] for example in examples]
 
         inputs = self._build_vlm_inputs(
-            batch_images, instructions, prebuilt_inputs=getattr(examples, "vlm_inputs", None)
+            batch_images, instructions, prebuilt_inputs=examples[0].get("vlm_inputs", None)
         )
         device = inputs["input_ids"].device
 

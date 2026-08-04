@@ -9,8 +9,9 @@ Each ``.pt`` stores SoftVQ codebook weights (soft_kl teacher targets)::
 
     {"distribution": Tensor[T, Q, C]}
 
-Training reads ``num_pairs`` consecutive stride starts at ``base_index`` and
-flattens to ``[num_pairs * Q, C]``.
+Cache building encodes each episode step with a full-stride window
+``(f0, fmid, f1)``. Training reads ``num_pairs`` consecutive stride starts at
+``base_index`` and flattens to ``[num_pairs * Q, C]``.
 """
 
 from __future__ import annotations
@@ -311,7 +312,8 @@ def build_episode_soft_kl_cache(
 
     dataset_meta: dict[str, dict[str, Any]] = {}
     all_single_datasets = []
-    pair_entries = []
+    # Group by stride so ALOHA (8) and ARX (6) mid-frame stacks never mix in one batch.
+    pair_entries_by_stride: dict[int, list] = {}
     global_episode_index = 0
 
     if is_main:
@@ -362,7 +364,7 @@ def build_episode_soft_kl_cache(
                 mine_traj_ids.append(episode_id)
 
             if mine_traj_ids:
-                pair_entries.extend(
+                pair_entries_by_stride.setdefault(stride, []).extend(
                     build_sharla_pair_entries(
                         single_ds,
                         ds_idx,
@@ -371,7 +373,16 @@ def build_episode_soft_kl_cache(
                     )
                 )
 
-    if pair_entries:
+    assembler = SoftDistributionEpisodeAssembler()
+    autocast_enabled = bool(use_bf16) and torch_device.type == "cuda"
+    for stride, pair_entries in sorted(pair_entries_by_stride.items()):
+        if not pair_entries:
+            continue
+        if is_main:
+            print(
+                f"[soft_kl_cache] encoding stride={stride} pairs={len(pair_entries)}",
+                flush=True,
+            )
         cache_dataset = SharlaLatentActionCacheDataset(
             single_datasets=all_single_datasets,
             entries=pair_entries,
@@ -384,16 +395,14 @@ def build_episode_soft_kl_cache(
             num_workers=max(0, int(num_workers)),
             pin_memory=torch_device.type == "cuda",
         )
-        assembler = SoftDistributionEpisodeAssembler()
-        autocast_enabled = bool(use_bf16) and torch_device.type == "cuda"
-        progress = tqdm(loader, desc=f"encode[r{rank}]", disable=not is_main)
-        for f0, f1, batch_meta in progress:
+        progress = tqdm(loader, desc=f"encode[r{rank}/s{stride}]", disable=not is_main)
+        for f0, f1, fmid, batch_meta in progress:
             with torch.autocast(
                 device_type="cuda",
                 dtype=torch.bfloat16,
                 enabled=autocast_enabled,
             ):
-                encoded = encoder.encode_distribution_from_tensors(f0, f1)
+                encoded = encoder.encode_distribution_from_tensors(f0, f1, fmid=fmid)
             encoded_cpu = encoded.detach().cpu().float()
             for index, item in enumerate(batch_meta):
                 finished = assembler.add(
@@ -420,11 +429,11 @@ def build_episode_soft_kl_cache(
                     rank=rank,
                 )
 
-        if assembler.pending_traj_keys():
-            leftover = assembler.pending_traj_keys()
-            raise RuntimeError(
-                f"Rank {rank} finished encoding with incomplete episodes: {leftover[:8]}"
-            )
+    if assembler.pending_traj_keys():
+        leftover = assembler.pending_traj_keys()
+        raise RuntimeError(
+            f"Rank {rank} finished encoding with incomplete episodes: {leftover[:8]}"
+        )
 
     if enabled:
         import torch.distributed as dist

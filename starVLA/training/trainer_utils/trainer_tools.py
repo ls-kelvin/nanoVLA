@@ -214,13 +214,19 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params]
-            if params:  # only add param group if there are trainable parameters
-                param_groups.append({"params": params, "lr": lr, "name": module_name})
-                used_params.update(id(p) for p in params)
-        except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+        except AttributeError as exc:
+            # A stale/incorrect path here used to fail silently (the exception was
+            # constructed but never raised), which left the affected parameters at
+            # the base LR without any indication that the override was ignored.
+            raise AttributeError(
+                f"trainer.learning_rate module path `{module_name}` not found on model "
+                f"{type(model).__name__}; fix the YAML path or remove this entry."
+            ) from exc
+        # filter out frozen parameters
+        params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params]
+        if params:  # only add param group if there are trainable parameters
+            param_groups.append({"params": params, "lr": lr, "name": module_name})
+            used_params.update(id(p) for p in params)
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
     other_params = [

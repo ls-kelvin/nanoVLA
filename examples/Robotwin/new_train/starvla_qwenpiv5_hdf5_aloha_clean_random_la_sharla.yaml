@@ -112,8 +112,12 @@ trainer:
   logging_frequency: 50
   learning_rate:
     base: 5e-05
-    qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05
+    # v5 has no top-level `qwen_vl_interface`; the VLM/expert live nested under
+    # `action_model.qwenvl_with_expert`. Remaining action_model-level params
+    # (state/action projections) fall through to `base`, which already equals
+    # the old blanket `action_model` rate below.
+    action_model.qwenvl_with_expert.qwenvl: 1.0e-05
+    action_model.qwenvl_with_expert.qwen_expert: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1e-7
