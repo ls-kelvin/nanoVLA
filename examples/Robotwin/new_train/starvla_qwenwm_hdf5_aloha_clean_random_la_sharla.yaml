@@ -1,4 +1,4 @@
-run_id: qwenwm_hdf5_aloha_clean_random_la_sharla_eef
+run_id: qwenwm_hdf5_aloha_clean_random_la_sharla_a2a_eef
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
@@ -6,11 +6,14 @@ is_debug: false
 version_id: "0.21"
 
 # QwenWM_LA on RoboTwin2.0 raw HDF5 aloha-agilex EEF data.
-# Latent-action learning is moved into the action head (joint flow matching over
-# [latent, state, action]); latent targets are Sharla continuous embeddings
-# (quantizer input_proj + L2-normalize). Main/action dataloader runs joint
-# forward; latent dataloader runs latent-only forward (clean + randomized data).
-# The launch script supplies the matching Sharla config and checkpoint paths.
+# Latent and action are independent flow-matching streams sharing the DiT + VLM
+# hidden states (separate final LayerNorms). Latent targets are Sharla-a2a
+# post-quantize / pre-output_proj embeddings (codebook_dim=32), standardised by
+# latent_norm_stats.json.
+# dataloader_loss_modes.action=joint => action dataloader computes BOTH
+# action_loss and latent_loss; latent dataloader remains latent-only.
+# One-click multi-node cache + train (same env as qwenpiv5 launcher):
+#   bash examples/Robotwin/new_train/run_robotwin_train_qwenwm_hdf5_aloha_clean_random_la_sharla.sh
 framework:
   name: QwenWM_LA
   qwenvl:
@@ -27,10 +30,12 @@ framework:
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
     sharla:
-      config_path: /mnt/netdata/Team/Personal/zzt/models/sharla/config.yaml
-      ckpt_path: /mnt/netdata/Team/Personal/zzt/models/sharla/partial_step_100000.pt
+      config_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
+      ckpt_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
       image_size: [224, 224]
       strict_load: true
+      # Produced by scripts/cache_sharla_embeddings.py under embedding_cache.output_dir.
+      norm_stats_path: .cache/latent_cache/sharla_a2a_embedding/latent_norm_stats.json
 
   action_model:
     action_dim: 16
@@ -65,12 +70,18 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
+      # Optional: skip on-the-fly Sharla encode when the episode cache is present.
+      embedding_cache_dir: .cache/latent_cache/sharla_a2a_embedding
+      horizon_overrides:
+        arx-x5:
+          frame_stride: 6
+          horizon: 24
     history_frame:
       enabled: true
       offset: 8
       video_keys: [cam_high]
     include_state: true
-    data_root_dir: /inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/data/RoboTwin2.0/dataset
+    data_root_dir: /mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
     latent_data_mix: hdf5_aloha_clean_random_eef
     hdf5_action_type: eef
@@ -85,6 +96,8 @@ datasets:
 
 trainer:
   use_dual_vla_dataloaders: true
+  # action=joint: one forward yields both action_dit_loss and latent_action_loss.
+  # latent=latent: latent-only forward on the secondary mix.
   dataloader_loss_modes:
     action: joint
     latent: latent
@@ -103,7 +116,7 @@ trainer:
   learning_rate:
     base: 5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-06
@@ -118,3 +131,13 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
+
+# Offline cache builder options (scripts/cache_sharla_embeddings.py).
+embedding_cache:
+  output_dir: .cache/latent_cache/sharla_a2a_embedding
+  batch_size: 256
+  num_workers: 128
+  num_gpus: 8
+  use_bf16: true
+  overwrite: false
+  compute_norm_stats: true

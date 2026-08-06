@@ -272,6 +272,12 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
         self.use_dual_vla_dataloaders = vla_action_train_dataloader is not None
         self.dataloader_loss_modes = _dataloader_loss_modes(cfg)
+        # Frameworks whose two dual streams share the same VLM input layout can run
+        # them as one batched forward, which keeps the VLM off tiny per-stream batches.
+        supports_merge = getattr(model, "supports_merged_dual_forward", None)
+        self.merged_dual_forward = self.use_dual_vla_dataloaders and bool(
+            supports_merge is not None and supports_merge(self.dataloader_loss_modes)
+        )
 
         self.completed_steps = 0
         self.tracker = None
@@ -949,19 +955,41 @@ class VLATrainer(TrainerUtils):
                     output_dict = {}
                     total_loss = None
 
-                    if active_dataloaders.get("latent", False):
-                        latent_output = self.model.forward(
-                            batch_vla["latent"], loss_mode=self.dataloader_loss_modes["latent"]
+                    latent_active = active_dataloaders.get("latent", False)
+                    action_active = active_dataloaders.get("action", False)
+                    latent_output = None
+                    action_output = None
+
+                    if latent_active and action_active and self.merged_dual_forward:
+                        # One VLM forward over both streams; rows never attend across
+                        # the batch axis, so the losses match the two-forward path.
+                        dual_output = self.model.forward(
+                            batch_vla,
+                            loss_mode="dual",
+                            dual_loss_modes=self.dataloader_loss_modes,
                         )
+                        latent_output = dual_output["streams"]["latent"]
+                        action_output = dual_output["streams"]["action"]
+                        output_dict.update(
+                            {k: v for k, v in dual_output.items() if k.startswith("timing/")}
+                        )
+                    else:
+                        if latent_active:
+                            latent_output = self.model.forward(
+                                batch_vla["latent"], loss_mode=self.dataloader_loss_modes["latent"]
+                            )
+                        if action_active:
+                            action_output = self.model.forward(
+                                batch_vla["action"], loss_mode=self.dataloader_loss_modes["action"]
+                            )
+
+                    if latent_output is not None:
                         total_loss = latent_output["total_loss"]
                         output_dict.update(latent_output)
                         if "latent_action_loss" in latent_output:
                             latent_action_loss = latent_output["latent_action_loss"]
 
-                    if active_dataloaders.get("action", False):
-                        action_output = self.model.forward(
-                            batch_vla["action"], loss_mode=self.dataloader_loss_modes["action"]
-                        )
+                    if action_output is not None:
                         total_loss = (
                             action_output["total_loss"]
                             if total_loss is None

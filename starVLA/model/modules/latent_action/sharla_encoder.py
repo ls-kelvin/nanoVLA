@@ -103,7 +103,8 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
 
     @property
     def latent_dim(self) -> int:
-        return int(self.model.quantizer.input_proj.out_features)
+        # Post-quantize / pre-output_proj embedding lives in codebook_dim.
+        return int(self.model.quantizer.codebook.embedding_dim)
 
     @property
     def codebook_size(self) -> int:
@@ -130,6 +131,37 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
             "f1": torch.stack(frame_future).to(device=self.device, dtype=self.dtype),
         }
 
+    def _post_quant_pre_proj_embedding(self, latent: torch.Tensor) -> torch.Tensor:
+        """SoftVQ: ``weights @ codebook`` (after quantize, before ``output_proj``)."""
+        _, weights, _, _ = self.model.quantizer(latent)
+        codebook = F.normalize(self.model.quantizer.codebook.weight, dim=-1)
+        return weights @ codebook
+
+    def _vision_inputs_from_tensors(
+        self,
+        f0: torch.Tensor,
+        f1: torch.Tensor,
+        fmid: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if f0.ndim != 4 or f1.ndim != 4:
+            raise ValueError(f"Expected f0/f1 as [B,3,H,W], got {tuple(f0.shape)} / {tuple(f1.shape)}")
+        if f0.shape != f1.shape:
+            raise ValueError(f"f0/f1 shape mismatch: {tuple(f0.shape)} vs {tuple(f1.shape)}")
+        if fmid is not None:
+            if fmid.ndim != 5:
+                raise ValueError(f"Expected fmid as [B,M,3,H,W], got {tuple(fmid.shape)}")
+            if fmid.shape[0] != f0.shape[0] or fmid.shape[2:] != f0.shape[1:]:
+                raise ValueError(
+                    f"fmid shape {tuple(fmid.shape)} is incompatible with f0 {tuple(f0.shape)}"
+                )
+        inputs = {
+            "f0": f0.to(device=self.device, dtype=self.dtype, non_blocking=True),
+            "f1": f1.to(device=self.device, dtype=self.dtype, non_blocking=True),
+        }
+        if fmid is not None:
+            inputs["fmid"] = fmid.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        return inputs
+
     @torch.inference_mode()
     def encode_distribution(
         self,
@@ -154,27 +186,10 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         Optional ``fmid`` has shape ``[B, M, 3, H, W]`` for full-stride Perceiver
         teachers; omitted for two-frame teachers.
         """
-        if f0.ndim != 4 or f1.ndim != 4:
-            raise ValueError(f"Expected f0/f1 as [B,3,H,W], got {tuple(f0.shape)} / {tuple(f1.shape)}")
-        if f0.shape != f1.shape:
-            raise ValueError(f"f0/f1 shape mismatch: {tuple(f0.shape)} vs {tuple(f1.shape)}")
         if f0.shape[0] == 0:
             return torch.empty((0, self.query_num, self.codebook_size), device=self.device, dtype=torch.float32)
-        if fmid is not None:
-            if fmid.ndim != 5:
-                raise ValueError(f"Expected fmid as [B,M,3,H,W], got {tuple(fmid.shape)}")
-            if fmid.shape[0] != f0.shape[0] or fmid.shape[2:] != f0.shape[1:]:
-                raise ValueError(
-                    f"fmid shape {tuple(fmid.shape)} is incompatible with f0 {tuple(f0.shape)}"
-                )
         self.model.eval()
-        inputs = {
-            "f0": f0.to(device=self.device, dtype=self.dtype, non_blocking=True),
-            "f1": f1.to(device=self.device, dtype=self.dtype, non_blocking=True),
-        }
-        if fmid is not None:
-            inputs["fmid"] = fmid.to(device=self.device, dtype=self.dtype, non_blocking=True)
-        return self.model(inputs).float()
+        return self.model(self._vision_inputs_from_tensors(f0, f1, fmid=fmid)).float()
 
     @torch.inference_mode()
     def encode_continuous(
@@ -182,13 +197,30 @@ class SharlaLatentActionEncoder(BaseLatentActionEncoder):
         frame_pairs: Sequence[Sequence[Image.Image]],
         instructions: Sequence[str] | None = None,
     ) -> torch.Tensor:
+        """Return post-quantize / pre-``output_proj`` embeddings ``[pairs, Q, codebook_dim]``."""
         del instructions
         if not frame_pairs:
             return torch.empty((0, self.query_num, self.latent_dim), device=self.device, dtype=self.dtype)
         self.model.eval()
         latent, _, _ = self.model.vision_encoder(self._prepare_vision_input(frame_pairs))
-        latent = F.normalize(self.model.quantizer.input_proj(latent), dim=-1)
-        return latent
+        return self._post_quant_pre_proj_embedding(latent).to(dtype=self.dtype)
+
+    @torch.inference_mode()
+    def encode_continuous_from_tensors(
+        self,
+        f0: torch.Tensor,
+        f1: torch.Tensor,
+        fmid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode preprocessed RGB tensors to post-quantize / pre-proj embeddings.
+
+        Same tensor conventions as :meth:`encode_distribution_from_tensors`.
+        """
+        if f0.shape[0] == 0:
+            return torch.empty((0, self.query_num, self.latent_dim), device=self.device, dtype=torch.float32)
+        self.model.eval()
+        latent, _, _ = self.model.vision_encoder(self._vision_inputs_from_tensors(f0, f1, fmid=fmid))
+        return self._post_quant_pre_proj_embedding(latent).float()
 
     @torch.inference_mode()
     def encode(

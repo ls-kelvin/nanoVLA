@@ -1,127 +1,54 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
+source .venv/bin/activate
 
 export NCCL_IB_DISABLE=0
 
-source .venv/bin/activate
+# 设置每个节点的进程数，默认为8（如果未设置环境变量）
+PET_NPROC_PER_NODE=${MLP_WORKER_GPU:-8}
+# 总节点数 (默认为2，请根据实际修改)
+PET_NNODES=${WORLD_SIZE:-1}
+# 当前节点的 Rank (0 为主节点，1 为从节点...，必须在不同节点上设置不同值)
+PET_NODE_RANK=${RANK:-0}
+# 计算总进程数 (Total World Size)
+TOTAL_PROCESSES=$((PET_NPROC_PER_NODE * PET_NNODES))
 
-# export TORCH_USE_CUDA_DSA=1
-# export CUDA_LAUNCH_BLOCKING=1
-
-# # 设置每个节点的进程数，默认为8（如果未设置环境变量）
-# PET_NPROC_PER_NODE=${MLP_WORKER_GPU:-8}
-# # 总节点数 (默认为2，请根据实际修改)
-# PET_NNODES=${MLP_WORKER_NUM:-2}
-# # 当前节点的 Rank (0 为主节点，1 为从节点...，必须在不同节点上设置不同值)
-# PET_NODE_RANK=${MLP_ROLE_INDEX:-0}
-# # 计算总进程数 (Total World Size)
-# TOTAL_PROCESSES=$((PET_NPROC_PER_NODE * PET_NNODES))
-
-###########################################################################################
-# QwenWM_LA + Sharla on RoboTwin2.0 raw HDF5 aloha-agilex EEF data.
-# Latent-action learning is inside the action head (joint flow matching over
-# [latent, state, action]); latent targets are Sharla continuous embeddings.
-# Main/action dataloader: joint forward. Latent dataloader: latent only.
-###########################################################################################
-
-# export TORCH_HOME="/inspire/qb-ilm/project/qproject-fundationmodel/public/zzt/.cache/torch"
 export SWANLAB_MODE=offline
-# export SWANLAB_API_KEY=r0jz2sjqk2ALFvcHjBVQF
 
-
-Framework_name=QwenWM_LA
-freeze_module_list=''
 base_vlm=/mnt/netdata/Team/Personal/zzt/models/RynnBrain-2B
 config_yaml=./examples/Robotwin/new_train/starvla_qwenwm_hdf5_aloha_clean_random_la_sharla.yaml
 run_root_dir=./results/Checkpoints2
-data_mix=hdf5_aloha_clean_eef
-latent_data_mix=hdf5_aloha_random_eef
-run_id=0719_${data_mix}_joint_action_latent_qwenwm_la_sharla_test
-batch_size=4
+batch_size=8
 hdf5_root=/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
-SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla/config.yaml
-SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla/partial_step_100000.pt
+data_mix=hdf5_aloha_clean_eef
+latent_data_mix=hdf5_arx_clean_random_eef
+run_id=0806_${data_mix}_action_${latent_data_mix}_latent_qwenwm_la_sharla_a2a
+SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
+SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
+EMBEDDING_CACHE_DIR=.cache/latent_cache/sharla_a2a_embedding
 
-output_dir=${run_root_dir}/${run_id}
-mkdir -p "${output_dir}"
-cp "$0" "${output_dir}/"
+bash scripts/cache_sharla_embeddings.sh "${config_yaml}" --output-dir "${EMBEDDING_CACHE_DIR}" --data-root-dir "${hdf5_root}"
 
 accelerate launch \
-  --num_processes 8 \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --num_processes ${TOTAL_PROCESSES} \
+  --num_machines ${PET_NNODES} \
+  --machine_rank ${PET_NODE_RANK} \
+  --main_process_ip ${MASTER_ADDR:-127.0.0.1} \
+  --main_process_port ${MASTER_PORT:-29500} \
   starVLA/training/train_starvla.py \
   --config_yaml "${config_yaml}" \
-  --framework.name "${Framework_name}" \
+  --framework.name QwenWM_LA \
   --framework.qwenvl.base_vlm "${base_vlm}" \
-  --framework.latent_action.enabled true \
-  --framework.latent_action.backend sharla \
-  --framework.latent_action.detach_vl_embs_for_action_head false \
   --framework.latent_action.sharla.config_path "${SHARLA_CONFIG_PATH}" \
   --framework.latent_action.sharla.ckpt_path "${SHARLA_CKPT_PATH}" \
-  --framework.latent_action.action_train_robot_types "[aloha-agilex]" \
-  --datasets.vla_data.dataset_py hdf5_la_dataset \
+  --framework.latent_action.sharla.norm_stats_path "${EMBEDDING_CACHE_DIR}/latent_norm_stats.json" \
   --datasets.vla_data.data_root_dir "${hdf5_root}" \
   --datasets.vla_data.data_mix "${data_mix}" \
   --datasets.vla_data.latent_data_mix "${latent_data_mix}" \
-  --datasets.vla_data.hdf5_action_type eef \
-  --datasets.vla_data.latent_action.enabled true \
+  --datasets.vla_data.latent_action.embedding_cache_dir "${EMBEDDING_CACHE_DIR}" \
   --datasets.vla_data.per_device_batch_size "${batch_size}" \
   --datasets.vla_data.latent_per_device_batch_size "${batch_size}" \
-  --trainer.use_dual_vla_dataloaders true \
-  --trainer.dataloader_loss_modes.action joint \
-  --trainer.dataloader_loss_modes.latent latent \
-  --trainer.freeze_modules "${freeze_module_list}" \
-  --trainer.max_train_steps 100000 \
-  --trainer.num_warmup_steps 5000 \
-  --trainer.save_interval 10000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 1000 \
-  --trainer.eval_num_samples 512 \
   --trainer.eval_batch_size "${batch_size}" \
-  --trainer.gradient_accumulation_steps 1 \
   --run_root_dir "${run_root_dir}" \
-  --run_id "${run_id}" \
-  --wandb_project starVLA_Robotwin
-
-
-# accelerate launch \
-#   --num_processes ${TOTAL_PROCESSES} \
-#   --num_machines ${PET_NNODES} \
-#   --machine_rank ${PET_NODE_RANK} \
-#   --main_process_ip ${MLP_WORKER_0_HOST} \
-#   --main_process_port ${MLP_WORKER_0_PORT} \
-#   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-#   starVLA/training/train_starvla.py \
-#   --config_yaml "${config_yaml}" \
-#   --framework.name "${Framework_name}" \
-#   --framework.qwenvl.base_vlm "${base_vlm}" \
-#   --framework.latent_action.enabled true \
-#   --framework.latent_action.backend sharla \
-#   --framework.latent_action.detach_vl_embs_for_action_head false \
-#   --framework.latent_action.sharla.config_path "${SHARLA_CONFIG_PATH}" \
-#   --framework.latent_action.sharla.ckpt_path "${SHARLA_CKPT_PATH}" \
-#   --framework.latent_action.action_train_robot_types "[aloha-agilex]" \
-#   --datasets.vla_data.dataset_py hdf5_la_dataset \
-#   --datasets.vla_data.data_root_dir "${hdf5_root}" \
-#   --datasets.vla_data.data_mix "${data_mix}" \
-#   --datasets.vla_data.latent_data_mix "${latent_data_mix}" \
-#   --datasets.vla_data.hdf5_action_type eef \
-#   --datasets.vla_data.latent_action.enabled true \
-#   --datasets.vla_data.per_device_batch_size "${batch_size}" \
-#   --datasets.vla_data.latent_per_device_batch_size "${batch_size}" \
-#   --trainer.use_dual_vla_dataloaders true \
-#   --trainer.dataloader_loss_modes.action joint \
-#   --trainer.dataloader_loss_modes.latent latent \
-#   --trainer.freeze_modules "${freeze_module_list}" \
-#   --trainer.max_train_steps 100000 \
-#   --trainer.num_warmup_steps 5000 \
-#   --trainer.save_interval 10000 \
-#   --trainer.logging_frequency 50 \
-#   --trainer.eval_interval 1000 \
-#   --trainer.eval_num_samples 512 \
-#   --trainer.eval_batch_size "${batch_size}" \
-#   --trainer.gradient_accumulation_steps 1 \
-#   --run_root_dir "${run_root_dir}" \
-#   --run_id "${run_id}" \
-#   --wandb_project starVLA_Robotwin
+  --run_id "${run_id}"

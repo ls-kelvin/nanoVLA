@@ -242,7 +242,7 @@ def main() -> None:
             global_ds_idx = len(all_single_datasets)
             all_single_datasets.append(single_ds)
 
-            robot_type = getattr(single_ds, "robot_type", None)
+            robot_type = single_ds.lerobot_info_meta.get("robot_type", None)
             robot_type = str(robot_type) if robot_type is not None else None
             offsets = compute_offsets(la_cfg, action_horizon, robot_type)
 

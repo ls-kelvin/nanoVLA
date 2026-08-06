@@ -51,12 +51,17 @@ def build_sharla_pair_entries(
     trajectory_ids: list[int],
     *,
     stride: int,
+    include_mid_frames: bool = True,
 ) -> list[SharlaPairEntry]:
     """Emit one full-stride window per episode step.
 
     Endpoints are ``(t, min(t + stride, T - 1))``; mid frames are every index
     between them. Past the episode end, indices clamp to the last frame so the
     window always has ``stride - 1`` mid frames.
+
+    ``include_mid_frames=False`` skips building ``mid_abs`` (and therefore the
+    per-step mid-frame HDF5 decode) for encoders whose ``vision_encoder`` never
+    reads ``fmid`` (e.g. the two-frame Sharla teacher, ``num_mid_frames=0``).
     """
     entries: list[SharlaPairEntry] = []
     stride = int(stride)
@@ -67,7 +72,11 @@ def build_sharla_pair_entries(
         for step in range(ep_len):
             obs_abs = step
             goal_abs = min(step + stride, ep_len - 1)
-            mid_abs = tuple(min(step + offset, ep_len - 1) for offset in range(1, stride))
+            mid_abs = (
+                tuple(min(step + offset, ep_len - 1) for offset in range(1, stride))
+                if include_mid_frames
+                else ()
+            )
             entries.append(
                 SharlaPairEntry(
                     traj_key=traj_key,

@@ -111,8 +111,13 @@ class DualStreamFlowMatching(nn.Module):
             prompt_pad_masks=prompt_pad_masks,
         )
 
-    def encode_prefix_context(self, inputs: dict, num_latent_tokens: int = 0):
-        """Encode the VLM prefix and build per-layer prompt K/V for the expert."""
+    def encode_prefix_hidden(self, inputs: dict, num_latent_tokens: int = 0):
+        """Run the VLM prefix pass; returns ``(prefix, last_hidden, layer_inputs)``.
+
+        Split out of :meth:`encode_prefix_context` so callers that only need the
+        last hidden state skip the per-layer K/V rebuild, and so several streams
+        can share one VLM pass and rebuild K/V for their own rows only.
+        """
         prefix = self.embed_prefix(inputs, num_latent_tokens)
         last_hidden, layer_inputs = self.qwenvl_with_expert.encode_prefix_layers(
             inputs_embeds=prefix["embs"],
@@ -121,12 +126,21 @@ class DualStreamFlowMatching(nn.Module):
             visual_pos_masks=prefix["visual_pos_masks"],
             deepstack_visual_embeds=prefix["deepstack_visual_embeds"],
         )
-        prefix_kvs = self.qwenvl_with_expert.build_prefix_kv(
-            layer_inputs,
-            prefix["position_ids"],
+        return prefix, last_hidden, layer_inputs
+
+    def build_prefix_kvs(self, prefix: dict, layer_inputs, rows: slice | None = None):
+        """Per-layer prompt K/V for the expert, optionally for a batch-row subset."""
+        rows = slice(None) if rows is None else rows
+        return self.qwenvl_with_expert.build_prefix_kv(
+            [hidden[rows] for hidden in layer_inputs],
+            prefix["position_ids"][:, rows],
             prefix["prompt_len"],
         )
-        return prefix, last_hidden, prefix_kvs
+
+    def encode_prefix_context(self, inputs: dict, num_latent_tokens: int = 0):
+        """Encode the VLM prefix and build per-layer prompt K/V for the expert."""
+        prefix, last_hidden, layer_inputs = self.encode_prefix_hidden(inputs, num_latent_tokens)
+        return prefix, last_hidden, self.build_prefix_kvs(prefix, layer_inputs)
 
     # -- suffix (state + noisy actions + time) ----------------------------
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -213,7 +227,7 @@ class DualStreamFlowMatching(nn.Module):
 
     # -- LA: bridge-token hidden only -------------------------------------
     def encode_prefix(self, inputs: dict, num_latent_tokens: int) -> Tensor:
-        prefix, last_hidden, _ = self.encode_prefix_context(inputs, num_latent_tokens)
+        prefix, last_hidden, _ = self.encode_prefix_hidden(inputs, num_latent_tokens)
         return last_hidden[:, prefix["prompt_len"] :]
 
     # -- training ---------------------------------------------------------
@@ -234,6 +248,27 @@ class DualStreamFlowMatching(nn.Module):
         actions / state / prefix K/V are tiled to ``B*r`` for the expert, matching
         QwenPI_v4's cheap repeat (VLM not re-run).
         """
+        prefix, last_hidden, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens)
+        action_loss = self.flow_matching_loss(
+            prefix, prefix_kvs, state, actions, action_mask, noise=noise, time=time, num_repeats=num_repeats
+        )
+        out = {"action_loss": action_loss}
+        if num_latent_tokens > 0:
+            out["latent_hidden"] = last_hidden[:, prefix["prompt_len"] :]
+        return out
+
+    def flow_matching_loss(
+        self,
+        prefix: dict,
+        prefix_kvs,
+        state: Tensor,
+        actions: Tensor,
+        action_mask: Tensor,
+        noise: Optional[Tensor] = None,
+        time: Optional[Tensor] = None,
+        num_repeats: Optional[int] = None,
+    ) -> Tensor:
+        """Flow-matching loss on an already-encoded prefix (see :meth:`forward`)."""
         actions = actions.float()
         action_mask = action_mask.float()
         device = actions.device
@@ -241,7 +276,6 @@ class DualStreamFlowMatching(nn.Module):
         if repeats < 1:
             raise ValueError(f"num_repeats must be >= 1, got {repeats}.")
 
-        prefix, last_hidden, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens)
         if actions.shape[0] != prefix["prompt_pad_masks"].shape[0]:
             raise ValueError(
                 f"actions batch {actions.shape[0]} must match prefix batch "
@@ -288,10 +322,7 @@ class DualStreamFlowMatching(nn.Module):
                 losses = F.mse_loss(u_t, v_t, reduction="none")
             action_loss = (losses * action_mask).sum() / action_mask.sum().clamp_min(1.0)
 
-        out = {"action_loss": action_loss}
-        if num_latent_tokens > 0:
-            out["latent_hidden"] = last_hidden[:, prefix["prompt_len"] :]
-        return out
+        return action_loss
 
     # -- inference --------------------------------------------------------
     @torch.no_grad()

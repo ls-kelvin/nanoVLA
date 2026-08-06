@@ -58,6 +58,33 @@ def build_qwen3_vl_inputs(processor, images, instructions, cot_prompt=None, solu
     )
 
 
+def merge_qwen3_vl_inputs(stream_inputs, pad_token_id: int) -> dict:
+    """Stack per-stream processor outputs into one batch for a single VLM forward.
+
+    The tokenizer pads on the left, so shorter streams are left-padded up to the
+    longest one; image patches concatenate in batch order, matching the order the
+    image placeholder tokens appear in ``input_ids``.
+    """
+    target_len = max(item["input_ids"].shape[1] for item in stream_inputs)
+    all_ids, all_masks = [], []
+    for item in stream_inputs:
+        ids, mask = item["input_ids"], item["attention_mask"]
+        gap = target_len - ids.shape[1]
+        if gap > 0:
+            pad_ids = torch.full((ids.shape[0], gap), pad_token_id, dtype=ids.dtype, device=ids.device)
+            pad_mask = torch.zeros((mask.shape[0], gap), dtype=mask.dtype, device=mask.device)
+            ids = torch.cat([pad_ids, ids], dim=1)
+            mask = torch.cat([pad_mask, mask], dim=1)
+        all_ids.append(ids)
+        all_masks.append(mask)
+    return {
+        "input_ids": torch.cat(all_ids, dim=0),
+        "attention_mask": torch.cat(all_masks, dim=0),
+        "pixel_values": torch.cat([item["pixel_values"] for item in stream_inputs], dim=0),
+        "image_grid_thw": torch.cat([item["image_grid_thw"] for item in stream_inputs], dim=0),
+    }
+
+
 class _QWen3_VL_Interface(nn.Module):
     """
     This exists because of the diversity of VLMs, so we encapsulate the changes here.

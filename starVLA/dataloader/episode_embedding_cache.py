@@ -1,17 +1,18 @@
-"""Episode-level soft_kl distribution cache for Sharla.
+"""Episode-level continuous embedding cache for Sharla (QwenWM_LA).
 
 Layout::
 
     {cache_root}/manifest.json
+    {cache_root}/latent_norm_stats.json
     {cache_root}/{dataset_name}/episode{id}.pt
 
-Each ``.pt`` stores SoftVQ codebook weights (soft_kl teacher targets)::
+Each ``.pt`` stores post-quantize / pre-``output_proj`` embeddings::
 
-    {"distribution": Tensor[T, Q, C]}
+    {"embedding": Tensor[T, Q, D]}
 
 Cache building encodes each episode step with a full-stride window
 ``(f0, fmid, f1)``. Training reads ``num_pairs`` consecutive stride starts at
-``base_index`` and flattens to ``[num_pairs * Q, C]``.
+``base_index`` and flattens to ``[num_pairs * Q, D]``.
 """
 
 from __future__ import annotations
@@ -27,9 +28,10 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 MANIFEST_NAME = "manifest.json"
-TARGET_TYPE = "soft_distribution"
+NORM_STATS_NAME = "latent_norm_stats.json"
+TARGET_TYPE = "continuous_embedding"
 LAYOUT = "episode"
-PAYLOAD_KEY = "distribution"
+PAYLOAD_KEY = "embedding"
 
 
 def target_fingerprint(payload: dict[str, Any]) -> str:
@@ -45,19 +47,22 @@ def episode_cache_fingerprint(
     *,
     sharla_cfg: dict[str, Any],
     window_cfg: dict[str, Any],
-    codebook_size: int,
-    num_bridge_tokens: int,
+    query_num: int,
+    latent_dim: int,
 ) -> str:
     sharla = dict(sharla_cfg)
+    # Norm-stats path is a consumer of the cache, not part of the embedding identity.
+    sharla.pop("norm_stats_path", None)
     sharla.pop("kl_eps", None)
     return target_fingerprint(
         {
             "layout": LAYOUT,
             "target_type": TARGET_TYPE,
+            "embedding_kind": "post_quant_pre_proj",
             "sharla": sharla,
             "window": window_cfg,
-            "codebook_size": int(codebook_size),
-            "num_bridge_tokens": int(num_bridge_tokens),
+            "query_num": int(query_num),
+            "latent_dim": int(latent_dim),
         }
     )
 
@@ -81,13 +86,13 @@ def fingerprint_from_config(config: DictConfig) -> str:
     return episode_cache_fingerprint(
         sharla_cfg=sharla,
         window_cfg=window,
-        codebook_size=int(la.get("codebook_size", 256)),
-        num_bridge_tokens=int(la.get("num_bridge_tokens", 8)),
+        query_num=int(la.get("query_num", 8)),
+        latent_dim=int(la.get("latent_dim") or 64),
     )
 
 
-class EpisodeSoftKLCache:
-    """Read consecutive stride soft distributions from per-episode ``.pt`` files."""
+class EpisodeEmbeddingCache:
+    """Read consecutive stride embeddings from per-episode ``.pt`` files."""
 
     def __init__(
         self,
@@ -97,7 +102,7 @@ class EpisodeSoftKLCache:
         self.root = Path(root).expanduser()
         manifest_path = self.root / MANIFEST_NAME
         if not manifest_path.is_file():
-            raise FileNotFoundError(f"Episode soft_kl cache manifest is missing: {manifest_path}")
+            raise FileNotFoundError(f"Episode embedding cache manifest is missing: {manifest_path}")
         with manifest_path.open(encoding="utf-8") as stream:
             self.manifest = json.load(stream)
         if self.manifest.get("layout") != LAYOUT:
@@ -109,7 +114,7 @@ class EpisodeSoftKLCache:
                 f"Expected target_type={TARGET_TYPE!r}, got {self.manifest.get('target_type')!r}"
             )
         if expected_fingerprint is not None and self.manifest.get("fingerprint") != expected_fingerprint:
-            raise ValueError("Episode soft_kl cache fingerprint does not match the current config")
+            raise ValueError("Episode embedding cache fingerprint does not match the current config")
         self.datasets: dict[str, dict[str, Any]] = dict(self.manifest.get("datasets", {}))
         self._loaded_key: Optional[tuple[str, int]] = None
         self._loaded_payload: Optional[dict[str, torch.Tensor]] = None
@@ -120,14 +125,14 @@ class EpisodeSoftKLCache:
             return self._loaded_payload
         path = episode_pt_path(self.root, dataset, episode_id)
         if not path.is_file():
-            raise FileNotFoundError(f"Episode soft_kl cache file is missing: {path}")
+            raise FileNotFoundError(f"Episode embedding cache file is missing: {path}")
         raw = torch.load(path, map_location="cpu", weights_only=True)
         if isinstance(raw, dict) and PAYLOAD_KEY in raw:
             payload = {PAYLOAD_KEY: raw[PAYLOAD_KEY]}
         elif isinstance(raw, torch.Tensor):
             payload = {PAYLOAD_KEY: raw}
         else:
-            raise ValueError(f"Unsupported episode soft_kl cache payload at {path}")
+            raise ValueError(f"Unsupported episode embedding cache payload at {path}")
         self._loaded_key = key
         self._loaded_payload = payload
         return payload
@@ -141,7 +146,7 @@ class EpisodeSoftKLCache:
         num_pairs: int,
         stride: int,
     ) -> torch.Tensor:
-        """Return soft weights ``[num_pairs * Q, C]`` for the training window."""
+        """Return embeddings ``[num_pairs * Q, D]`` for the training window."""
         payload = self._load_episode(dataset, episode_id)
         values = payload[PAYLOAD_KEY]
         last = values.shape[0] - 1
@@ -174,6 +179,75 @@ def write_manifest(
     temporary.replace(path)
 
 
+def compute_and_save_embedding_norm_stats(
+    cache_root: str | Path,
+    *,
+    eps: float = 1e-6,
+) -> Path:
+    """Scan episode embedding caches and write per-dim mean/std JSON.
+
+    Statistics are computed over all ``[T, Q, D]`` tokens flattened to
+    ``(N, D)``.  Writes ``{cache_root}/latent_norm_stats.json``.
+    """
+    root = Path(cache_root).expanduser()
+    manifest_path = root / MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Episode embedding cache manifest is missing: {manifest_path}")
+    with manifest_path.open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("target_type") != TARGET_TYPE:
+        raise ValueError(
+            f"Norm-stats require target_type={TARGET_TYPE!r}, got {manifest.get('target_type')!r}"
+        )
+
+    count = 0
+    sum_vec: torch.Tensor | None = None
+    sumsq_vec: torch.Tensor | None = None
+    datasets = dict(manifest.get("datasets", {}))
+    for dataset_name in sorted(datasets.keys()):
+        dataset_dir = root / dataset_name
+        if not dataset_dir.is_dir():
+            continue
+        for path in sorted(dataset_dir.glob("episode*.pt")):
+            raw = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(raw, dict) and PAYLOAD_KEY in raw:
+                values = raw[PAYLOAD_KEY]
+            elif isinstance(raw, torch.Tensor):
+                values = raw
+            else:
+                raise ValueError(f"Unsupported episode embedding cache payload at {path}")
+            flat = values.detach().float().reshape(-1, values.shape[-1])
+            if sum_vec is None:
+                sum_vec = flat.sum(dim=0)
+                sumsq_vec = (flat * flat).sum(dim=0)
+            else:
+                sum_vec = sum_vec + flat.sum(dim=0)
+                sumsq_vec = sumsq_vec + (flat * flat).sum(dim=0)
+            count += int(flat.shape[0])
+
+    if count <= 0 or sum_vec is None or sumsq_vec is None:
+        raise RuntimeError(f"No embedding samples found under {root}")
+
+    mean = sum_vec / float(count)
+    var = (sumsq_vec / float(count)) - (mean * mean)
+    std = torch.sqrt(torch.clamp(var, min=0.0)).clamp_min(eps)
+    payload = {
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "n_samples": int(count),
+        "latent_dim": int(mean.numel()),
+        "target_type": TARGET_TYPE,
+        "fingerprint": manifest.get("fingerprint"),
+    }
+    out_path = root / NORM_STATS_NAME
+    temporary = out_path.with_suffix(out_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    temporary.replace(out_path)
+    return out_path
+
+
 def _window_meta(la_cfg: dict[str, Any], robot_type: str | None) -> dict[str, int]:
     from starVLA.dataloader.lerobot_la_datasets import (
         _resolve_latent_action_horizon,
@@ -191,7 +265,7 @@ def _window_meta(la_cfg: dict[str, Any], robot_type: str | None) -> dict[str, in
     gaps = [offsets[index + 1] - offsets[index] for index in range(len(offsets) - 1)]
     if any(gap != gaps[0] for gap in gaps):
         raise ValueError(
-            "episode soft_kl cache requires a uniform stride between latent window offsets; "
+            "episode embedding cache requires a uniform stride between latent window offsets; "
             f"got offsets={offsets} for robot_type={robot_type!r}"
         )
     return {
@@ -209,7 +283,7 @@ def _distributed_context() -> tuple[bool, int, int]:
     return False, 0, 1
 
 
-def _save_episode_distribution(
+def _save_episode_embedding(
     destination: Path,
     *,
     values: torch.Tensor,
@@ -233,7 +307,7 @@ def _save_episode_distribution(
     temporary.replace(destination)
 
 
-def build_episode_soft_kl_cache(
+def build_episode_embedding_cache(
     config: DictConfig,
     *,
     cache_dir: str | Path,
@@ -243,8 +317,9 @@ def build_episode_soft_kl_cache(
     use_bf16: bool = False,
     overwrite: bool = False,
     data_mixes: list[str] | None = None,
+    compute_norm_stats: bool = True,
 ) -> Path:
-    """Encode Sharla soft codebook weights per episode step and write ``.pt`` caches."""
+    """Encode Sharla post-quant embeddings per episode step and write ``.pt`` caches."""
     from starVLA.dataloader.hdf5_la_dataset import get_vla_dataset
     from starVLA.dataloader.sharla_la_cache_dataset import (
         SoftDistributionEpisodeAssembler,
@@ -257,14 +332,10 @@ def build_episode_soft_kl_cache(
 
     backend = str(config.framework.latent_action.get("backend", "")).lower()
     if backend != "sharla":
-        raise ValueError(f"Episode soft_kl cache requires backend='sharla', got {backend!r}")
-    loss_type = str(config.framework.latent_action.get("loss_type", "soft_kl")).lower()
-    if loss_type not in {"soft_kl", "auto"}:
-        raise ValueError(f"Episode soft_kl cache requires loss_type soft_kl/auto, got {loss_type!r}")
+        raise ValueError(f"Episode embedding cache requires backend='sharla', got {backend!r}")
 
     enabled, rank, world_size = _distributed_context()
     is_main = rank == 0
-    fingerprint = fingerprint_from_config(config)
     root = Path(cache_dir).expanduser()
     if is_main:
         root.mkdir(parents=True, exist_ok=True)
@@ -290,7 +361,6 @@ def build_episode_soft_kl_cache(
         if latent_mix:
             mixes.append(str(latent_mix))
         mixes.append(str(data_cfg.data_mix))
-        # Preserve order, drop duplicates.
         mixes = list(dict.fromkeys(mixes))
 
     encoder = build_latent_action_encoder(config)
@@ -299,12 +369,37 @@ def build_episode_soft_kl_cache(
     encoder.to(device=torch_device)
     encoder.eval()
 
+    vision_encoder = encoder.model.vision_encoder
+    needs_mid_frames = bool(getattr(vision_encoder, "num_mid_frames", 0)) or bool(
+        getattr(vision_encoder, "all_frame_targets", False)
+    )
+
+    # Refresh fingerprint with the real encoder dims (config may leave latent_dim unset).
+    la_container = OmegaConf.to_container(config.framework.latent_action, resolve=True)
+    if not isinstance(la_container, dict):
+        raise TypeError("framework.latent_action must resolve to a dict")
+    la_container["query_num"] = int(encoder.query_num)
+    la_container["latent_dim"] = int(encoder.latent_dim)
+    fingerprint = episode_cache_fingerprint(
+        sharla_cfg=dict(la_container.get("sharla") or {}),
+        window_cfg={
+            "stride": la_cfg.get("stride"),
+            "horizon": la_cfg.get("horizon"),
+            "include_terminal_frame": la_cfg.get("include_terminal_frame", True),
+            "image_size": la_cfg.get("image_size", la_container.get("image_size")),
+            "video_keys": la_cfg.get("video_keys") or la_cfg.get("video_key"),
+            "horizon_overrides": la_cfg.get("horizon_overrides"),
+        },
+        query_num=int(encoder.query_num),
+        latent_dim=int(encoder.latent_dim),
+    )
+
     video_keys = list(la_cfg.get("video_keys") or [])
     if not video_keys:
         single = la_cfg.get("video_key", None)
         video_keys = [single] if single else []
     if len(video_keys) != 1:
-        raise ValueError("Episode soft_kl cache currently supports exactly one latent video key")
+        raise ValueError("Episode embedding cache currently supports exactly one latent video key")
     video_key = str(video_keys[0])
     if not video_key.startswith("video."):
         video_key = f"video.{video_key}"
@@ -312,14 +407,14 @@ def build_episode_soft_kl_cache(
 
     dataset_meta: dict[str, dict[str, Any]] = {}
     all_single_datasets = []
-    # Group by stride so ALOHA (8) and ARX (6) mid-frame stacks never mix in one batch.
     pair_entries_by_stride: dict[int, list] = {}
     global_episode_index = 0
 
     if is_main:
         print(
-            f"[soft_kl_cache] building world_size={world_size} device={torch_device} "
-            f"batch_size={batch_size} num_workers={num_workers} use_bf16={use_bf16} mixes={mixes}",
+            f"[embedding_cache] building world_size={world_size} device={torch_device} "
+            f"batch_size={batch_size} num_workers={num_workers} use_bf16={use_bf16} mixes={mixes} "
+            f"needs_mid_frames={needs_mid_frames}",
             flush=True,
         )
 
@@ -334,7 +429,6 @@ def build_episode_soft_kl_cache(
             seed=int(config.get("seed", 42)),
         )
         for single_ds in mixture.datasets:
-            # Skip datasets already processed under another mix.
             if single_ds.dataset_name in dataset_meta:
                 continue
             ds_idx = len(all_single_datasets)
@@ -347,7 +441,7 @@ def build_episode_soft_kl_cache(
                 **meta,
                 "robot_type": robot_type,
                 "query_count": int(encoder.query_num),
-                "codebook_size": int(encoder.codebook_size),
+                "latent_dim": int(encoder.latent_dim),
             }
             stride = int(meta["stride"])
 
@@ -370,6 +464,7 @@ def build_episode_soft_kl_cache(
                         ds_idx,
                         mine_traj_ids,
                         stride=stride,
+                        include_mid_frames=needs_mid_frames,
                     )
                 )
 
@@ -380,7 +475,7 @@ def build_episode_soft_kl_cache(
             continue
         if is_main:
             print(
-                f"[soft_kl_cache] encoding stride={stride} pairs={len(pair_entries)}",
+                f"[embedding_cache] encoding stride={stride} pairs={len(pair_entries)}",
                 flush=True,
             )
         cache_dataset = SharlaLatentActionCacheDataset(
@@ -402,7 +497,7 @@ def build_episode_soft_kl_cache(
                 dtype=torch.bfloat16,
                 enabled=autocast_enabled,
             ):
-                encoded = encoder.encode_distribution_from_tensors(f0, f1, fmid=fmid)
+                encoded = encoder.encode_continuous_from_tensors(f0, f1, fmid=fmid)
             encoded_cpu = encoded.detach().cpu().float()
             for index, item in enumerate(batch_meta):
                 finished = assembler.add(
@@ -420,7 +515,7 @@ def build_episode_soft_kl_cache(
                 destination = episode_pt_path(
                     root, ep_meta["dataset_name"], int(ep_meta["traj_id"])
                 )
-                _save_episode_distribution(
+                _save_episode_embedding(
                     destination,
                     values=values,
                     stride=int(ep_meta["stride"]),
@@ -445,13 +540,16 @@ def build_episode_soft_kl_cache(
             root,
             fingerprint=fingerprint,
             datasets=dataset_meta,
-            extra={"version": 1, "data_mixes": mixes},
+            extra={"version": 1, "data_mixes": mixes, "embedding_kind": "post_quant_pre_proj"},
         )
         print(
-            f"[soft_kl_cache] wrote root={root} datasets={len(dataset_meta)} "
+            f"[embedding_cache] wrote root={root} datasets={len(dataset_meta)} "
             f"world_size={world_size}",
             flush=True,
         )
+        if compute_norm_stats:
+            stats_path = compute_and_save_embedding_norm_stats(root)
+            print(f"[embedding_cache] wrote norm stats: {stats_path}", flush=True)
 
     if enabled:
         import torch.distributed as dist

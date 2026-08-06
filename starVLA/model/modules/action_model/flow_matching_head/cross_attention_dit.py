@@ -163,10 +163,13 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+        # Self-attention (encoder_hidden_states is None) uses ``attention_mask``;
+        # cross-attention keeps ``encoder_attention_mask`` for the VL key padding.
+        attn_mask = attention_mask if encoder_hidden_states is None else encoder_attention_mask
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=encoder_attention_mask,  # @JinhuiYE original attention_mask=attention_mask
+            attention_mask=attn_mask,
         )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)

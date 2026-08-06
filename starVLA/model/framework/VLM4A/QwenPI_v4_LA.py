@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from starVLA.model.framework.VLM4A.QwenPI_v4 import Qwen_PI_v4
 from starVLA.model.modules.latent_action import build_latent_action_encoder
+from starVLA.model.modules.vlm.QWen3 import merge_qwen3_vl_inputs
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -342,13 +343,14 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         suffix = bridge_ids.repeat(int(window_count))
         return suffix.unsqueeze(0).expand(batch_size, -1)
 
-    def _encode_vl_hidden_states_with_latent_tokens(
+    def _build_latent_vlm_inputs(
         self,
         batch_images: List,
         instructions: list[str],
         window_count: int,
         prebuilt_inputs=None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor | None, torch.Tensor, dict]:
+    ) -> tuple[dict, int]:
+        """Processor inputs with the bridge-token suffix appended, before any VLM run."""
         inputs = self._build_vlm_inputs(batch_images, instructions, prebuilt_inputs)
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", None)
@@ -364,7 +366,9 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 device=attention_mask.device,
             )
             inputs["attention_mask"] = torch.cat([attention_mask, suffix_mask], dim=1)
+        return inputs, prompt_len
 
+    def _run_vlm_hidden_states(self, inputs: dict):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.qwen_vl_interface(
                 **inputs,
@@ -375,14 +379,44 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
                 # single position instead of running it over the whole sequence.
                 logits_to_keep=1,
             )
-            vl_embs_list = [
-                hidden[:, :prompt_len, :]
-                for hidden in outputs.hidden_states[-self.num_action_dit_layers :]
-            ]
-            latent_hidden = outputs.hidden_states[-1][:, prompt_len:, :]
+        return outputs.hidden_states
 
+    def _split_latent_encoding(
+        self,
+        hidden_states,
+        prompt_len: int,
+        rows: slice | None = None,
+        offset: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Cut prompt / bridge hidden states out of a (possibly merged) VLM run.
+
+        ``offset`` is the left-padding introduced when several streams share one
+        forward; ``rows`` selects the stream's slice of the batch axis.
+        """
+        rows = slice(None) if rows is None else rows
+        end = offset + prompt_len
+        vl_embs_list = [
+            hidden[rows, offset:end, :] for hidden in hidden_states[-self.num_action_dit_layers :]
+        ]
+        latent_hidden = hidden_states[-1][rows, end:, :]
+        return vl_embs_list, latent_hidden
+
+    def _encode_vl_hidden_states_with_latent_tokens(
+        self,
+        batch_images: List,
+        instructions: list[str],
+        window_count: int,
+        prebuilt_inputs=None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor | None, torch.Tensor, dict]:
+        inputs, prompt_len = self._build_latent_vlm_inputs(
+            batch_images, instructions, window_count, prebuilt_inputs
+        )
+        hidden_states = self._run_vlm_hidden_states(inputs)
+        vl_embs_list, latent_hidden = self._split_latent_encoding(hidden_states, prompt_len)
+
+        attention_mask = inputs.get("attention_mask", None)
         if attention_mask is not None:
-            attention_mask = attention_mask.to(dtype=torch.bool)
+            attention_mask = attention_mask[:, :prompt_len].to(dtype=torch.bool)
         return vl_embs_list, attention_mask, latent_hidden, inputs
 
     def _make_discrete_targets(self, examples: List[dict], instructions: list[str]) -> torch.LongTensor:
@@ -735,18 +769,30 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             torch.cuda.synchronize()
         timings[f"timing/{name}"] = time.perf_counter() - start_time
 
-    def forward(self, examples: List[dict] = None, **kwargs) -> dict:
-        loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
+    @staticmethod
+    def _resolve_loss_mode(loss_mode: str) -> str:
+        loss_mode = str(loss_mode).lower()
         if loss_mode not in {"joint", "latent", "action"}:
             raise ValueError(f"loss_mode must be 'joint', 'latent', or 'action', got {loss_mode!r}.")
-        timings: dict = {}
+        return loss_mode
 
+    def _check_loss_mode_flags(self, loss_mode: str) -> tuple[bool, bool]:
         compute_action = loss_mode in {"joint", "action"} and self.train_continuous_action
         compute_latent = loss_mode in {"joint", "latent"} and self.train_latent_action
         if loss_mode == "action" and not compute_action:
             raise RuntimeError("Action loss requested, but latent_action.train_action=false.")
         if loss_mode == "latent" and not compute_latent:
             raise RuntimeError("Latent loss requested, but latent_action.train_latent=false.")
+        return compute_action, compute_latent
+
+    def forward(self, examples=None, **kwargs) -> dict:
+        loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
+        if loss_mode == "dual":
+            return self._forward_dual(examples, kwargs.pop("dual_loss_modes", None))
+        loss_mode = self._resolve_loss_mode(loss_mode)
+        timings: dict = {}
+
+        compute_action, compute_latent = self._check_loss_mode_flags(loss_mode)
 
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
@@ -771,6 +817,28 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
             )
 
         self._stop_profile_timer(timings, f"{loss_mode}_vlm_encode", _t)
+        return self._losses_from_encoded(
+            examples,
+            instructions,
+            loss_mode,
+            vl_embs_list,
+            attention_mask,
+            latent_hidden,
+            timings,
+        )
+
+    def _losses_from_encoded(
+        self,
+        examples: List[dict],
+        instructions: list[str],
+        loss_mode: str,
+        vl_embs_list: list[torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        latent_hidden: torch.Tensor | None,
+        timings: dict,
+    ) -> dict:
+        """Action / latent losses from an already-encoded VLM prefix."""
+        compute_action, compute_latent = self._check_loss_mode_flags(loss_mode)
 
         _t = self._start_profile_timer()
         action_dit_loss = None
@@ -836,3 +904,93 @@ class Qwen_PI_v4_LA(Qwen_PI_v4):
         out.update(latent_outputs)
         out.update(timings)
         return out
+
+    def supports_merged_dual_forward(self, dual_loss_modes: dict | None = None) -> bool:
+        """Whether both dual streams can share one VLM forward.
+
+        Merging is only equivalent when both streams build the same prefix layout,
+        i.e. both append the bridge-token suffix. A stream running a pure ``action``
+        loss has no bridge tokens and must keep its own forward.
+        """
+        if not (self.latent_action_enabled and self.latent_head is not None):
+            return False
+        if not self.train_latent_action:
+            return False
+        modes = dual_loss_modes or {}
+        return all(
+            str(modes.get(name, "")).lower() in {"joint", "latent"}
+            for name in ("latent", "action")
+        )
+
+    def _forward_dual(self, batches: dict, dual_loss_modes: dict | None) -> dict:
+        """Run both dual-dataloader streams through a single merged VLM forward.
+
+        The two streams carry different samples but the same weights, and batch rows
+        never attend to each other, so stacking them is numerically identical to two
+        separate forwards while keeping the VLM at a batch size that saturates the GPU.
+        """
+        if not isinstance(batches, dict):
+            raise TypeError(f"loss_mode='dual' expects a dict of streams, got {type(batches)!r}.")
+        dual_loss_modes = dual_loss_modes or {}
+        names = [name for name in ("latent", "action") if batches.get(name)]
+        if len(names) < 2:
+            raise ValueError(f"loss_mode='dual' needs both streams, got {names}.")
+
+        timings: dict = {}
+        _t = self._start_profile_timer()
+
+        streams = []
+        for name in names:
+            examples = batches[name]
+            loss_mode = self._resolve_loss_mode(dual_loss_modes.get(name, "joint"))
+            self._check_loss_mode_flags(loss_mode)
+            instructions = [example["lang"] for example in examples]
+            inputs, prompt_len = self._build_latent_vlm_inputs(
+                [example["image"] for example in examples],
+                instructions,
+                self._collect_latent_window_counts(examples)[0],
+                prebuilt_inputs=examples[0].get("vlm_inputs", None),
+            )
+            streams.append(
+                {
+                    "name": name,
+                    "examples": examples,
+                    "instructions": instructions,
+                    "loss_mode": loss_mode,
+                    "inputs": inputs,
+                    "prompt_len": prompt_len,
+                }
+            )
+            self._print_training_sample_once(examples, instructions)
+
+        pad_token_id = int(self.qwen_vl_interface.processor.tokenizer.pad_token_id)
+        merged = merge_qwen3_vl_inputs([stream["inputs"] for stream in streams], pad_token_id)
+        hidden_states = self._run_vlm_hidden_states(merged)
+        merged_len = merged["input_ids"].shape[1]
+        self._stop_profile_timer(timings, "dual_vlm_encode", _t)
+
+        row = 0
+        outputs = {}
+        for stream in streams:
+            inputs, prompt_len = stream["inputs"], stream["prompt_len"]
+            batch_size, own_len = inputs["input_ids"].shape
+            # left padding pushes each stream's real tokens to the right end
+            offset = merged_len - own_len
+            vl_embs_list, latent_hidden = self._split_latent_encoding(
+                hidden_states, prompt_len, rows=slice(row, row + batch_size), offset=offset
+            )
+            attention_mask = inputs.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :prompt_len].to(dtype=torch.bool)
+            outputs[stream["name"]] = self._losses_from_encoded(
+                stream["examples"],
+                stream["instructions"],
+                stream["loss_mode"],
+                vl_embs_list,
+                attention_mask,
+                latent_hidden,
+                timings,
+            )
+            row += batch_size
+
+        return {"streams": outputs, **timings}

@@ -111,7 +111,13 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         return vl_embs_list, encoder_attention_mask, query_repeat
 
     def _apply_layerwise_cross_attention(
-        self, sa_embs, vl_embs_list, temb, encoder_attention_mask=None, query_repeat=1
+        self,
+        sa_embs,
+        vl_embs_list,
+        temb,
+        encoder_attention_mask=None,
+        query_repeat=1,
+        self_attention_mask=None,
     ):
         """Interleave self/cross attention across DiT blocks (Mantis semantics).
 
@@ -121,6 +127,10 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
         cross-attention blocks so K/V are projected once instead of once per
         repeat; self-attention blocks keep the unfolded layout so they never
         attend across repeats.
+
+        ``self_attention_mask`` is forwarded only to the interleaved self-attn
+        blocks (odd layers when ``interleave_self_attention`` is on). Default
+        ``None`` preserves the previous unmasked self-attention behaviour.
         """
         hidden_states = sa_embs
         interleave = self.model.config.interleave_self_attention
@@ -128,7 +138,7 @@ class LayerwiseMetaqueryFlowmatchingActionHead(LayerwiseFlowmatchingActionHead):
             if layer_idx % 2 == 1 and interleave:
                 hidden_states = block(
                     hidden_states=hidden_states,
-                    attention_mask=None,
+                    attention_mask=self_attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,

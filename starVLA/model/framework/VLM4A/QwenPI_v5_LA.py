@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from starVLA.model.framework.VLM4A.QwenPI_v5 import Qwen_PI_v5
 from starVLA.model.modules.latent_action import build_latent_action_encoder
+from starVLA.model.modules.vlm.QWen3 import merge_qwen3_vl_inputs
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -654,8 +655,7 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
     # ------------------------------------------------------------------ #
     # forward
     # ------------------------------------------------------------------ #
-    def forward(self, examples: List[dict] = None, **kwargs) -> dict:
-        loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
+    def _resolve_loss_flags(self, loss_mode: str) -> tuple[bool, bool]:
         if loss_mode not in {"joint", "latent", "action"}:
             raise ValueError(f"loss_mode must be 'joint', 'latent', or 'action', got {loss_mode!r}.")
 
@@ -667,43 +667,60 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
             raise RuntimeError("Latent loss requested, but latent_action.train_latent=false.")
         if compute_latent and (not self.latent_action_enabled or self.latent_head is None):
             raise RuntimeError("Latent-action loss requested, but latent action is disabled or uninitialized.")
+        return compute_action, compute_latent
 
-        batch_images = [example["image"] for example in examples]
-        instructions = [example["lang"] for example in examples]
-
+    def _build_stream_inputs(
+        self, examples: List[dict], instructions: list[str], compute_latent: bool
+    ) -> tuple[dict, int]:
+        """Processor inputs with the bridge-token suffix appended, before any VLM run."""
         inputs = self._build_vlm_inputs(
-            batch_images, instructions, prebuilt_inputs=examples[0].get("vlm_inputs", None)
+            [example["image"] for example in examples],
+            instructions,
+            prebuilt_inputs=examples[0].get("vlm_inputs", None),
         )
-        device = inputs["input_ids"].device
+        if not compute_latent:
+            return inputs, 0
+        window_count = self._collect_latent_window_counts(examples)[0]
+        inputs, num_latent_tokens = self._append_bridge_tokens(inputs, window_count)
+        self._print_training_sample_once(examples, instructions)
+        return inputs, num_latent_tokens
 
-        num_latent_tokens = 0
-        if compute_latent:
-            window_count = self._collect_latent_window_counts(examples)[0]
-            inputs, num_latent_tokens = self._append_bridge_tokens(inputs, window_count)
-            self._print_training_sample_once(examples, instructions)
+    def _prepare_action_inputs(self, examples: List[dict], device):
+        state = self._prepare_state(examples, device)
+        actions, action_mask = self._prepare_actions(examples, device)
+        row_weights, action_train_batch_size = self._action_row_weights(examples, device)
+        if row_weights is not None:
+            action_mask = action_mask * row_weights[:, None, None]
+        if state is None:
+            state = torch.zeros(actions.shape[0], self.state_dim, device=device, dtype=actions.dtype)
+        return state, actions, action_mask, action_train_batch_size
+
+    def forward(self, examples: List[dict] = None, **kwargs) -> dict:
+        loss_mode = str(kwargs.pop("loss_mode", "joint")).lower()
+        if loss_mode == "dual":
+            return self._forward_dual(examples, kwargs.pop("dual_loss_modes", None))
+
+        compute_action, compute_latent = self._resolve_loss_flags(loss_mode)
+
+        instructions = [example["lang"] for example in examples]
+        inputs, num_latent_tokens = self._build_stream_inputs(examples, instructions, compute_latent)
+        device = inputs["input_ids"].device
 
         action_dit_loss = None
         latent_hidden = None
         action_train_batch_size = 0
 
         if compute_action:
-            state = self._prepare_state(examples, device)
-            actions, action_mask = self._prepare_actions(examples, device)
-            row_weights, action_train_batch_size = self._action_row_weights(examples, device)
-            if row_weights is not None:
-                action_mask = action_mask * row_weights[:, None, None]
-
-            repeats = self.repeated_diffusion_steps
-            if state is None:
-                state = torch.zeros(actions.shape[0], self.state_dim, device=device, dtype=actions.dtype)
-
+            state, actions, action_mask, action_train_batch_size = self._prepare_action_inputs(
+                examples, device
+            )
             out = self.action_model(
                 inputs,
                 state,
                 actions,
                 action_mask,
                 num_latent_tokens=num_latent_tokens,
-                num_repeats=repeats,
+                num_repeats=self.repeated_diffusion_steps,
             )
             action_dit_loss = out["action_loss"]
             if compute_latent:
@@ -711,9 +728,21 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
         elif compute_latent:
             latent_hidden = self.action_model.encode_prefix(inputs, num_latent_tokens)
 
+        return self._assemble_losses(
+            examples, instructions, action_dit_loss, latent_hidden, action_train_batch_size
+        )
+
+    def _assemble_losses(
+        self,
+        examples: List[dict],
+        instructions: list[str],
+        action_dit_loss: torch.Tensor | None,
+        latent_hidden: torch.Tensor | None,
+        action_train_batch_size: int,
+    ) -> dict:
         latent_outputs = {}
         latent_action_loss = None
-        if compute_latent:
+        if latent_hidden is not None:
             if self.latent_action_loss_type == "soft_kl":
                 targets = self._make_soft_targets(examples)
                 valid_mask = self._collect_la_padding_mask(examples)
@@ -747,3 +776,113 @@ class Qwen_PI_v5_LA(Qwen_PI_v5):
             out["latent_action_loss"] = latent_action_loss
         out.update(latent_outputs)
         return out
+
+    # ------------------------------------------------------------------ #
+    # merged dual-dataloader forward
+    # ------------------------------------------------------------------ #
+    def supports_merged_dual_forward(self, dual_loss_modes: dict | None = None) -> bool:
+        """Whether both dual streams can share one VLM prefix pass.
+
+        Merging is only equivalent when both streams build the same prefix layout,
+        i.e. both append the bridge-token suffix. A stream running a pure ``action``
+        loss has no bridge tokens and must keep its own forward.
+        """
+        if not (self.latent_action_enabled and self.latent_head is not None):
+            return False
+        if not self.train_latent_action:
+            return False
+        modes = dual_loss_modes or {}
+        return all(
+            str(modes.get(name, "")).lower() in {"joint", "latent"} for name in ("latent", "action")
+        )
+
+    def _forward_dual(self, batches: dict, dual_loss_modes: dict | None) -> dict:
+        """Run both dual-dataloader streams through a single merged VLM prefix pass.
+
+        The two streams carry different samples but the same weights, and batch rows
+        never attend to each other, so stacking them is numerically identical to two
+        separate forwards while keeping the VLM at a batch size that saturates the GPU.
+        Per-layer prefix K/V are rebuilt only for the rows that actually run the expert.
+        """
+        if not isinstance(batches, dict):
+            raise TypeError(f"loss_mode='dual' expects a dict of streams, got {type(batches)!r}.")
+        modes = dual_loss_modes or {}
+        names = [name for name in ("latent", "action") if batches.get(name)]
+        if len(names) < 2:
+            raise ValueError(f"loss_mode='dual' needs both streams, got {names}.")
+
+        streams = []
+        for name in names:
+            examples = batches[name]
+            loss_mode = str(modes.get(name, "joint")).lower()
+            compute_action, compute_latent = self._resolve_loss_flags(loss_mode)
+            instructions = [example["lang"] for example in examples]
+            inputs, num_latent_tokens = self._build_stream_inputs(examples, instructions, compute_latent)
+            streams.append(
+                {
+                    "name": name,
+                    "examples": examples,
+                    "instructions": instructions,
+                    "loss_mode": loss_mode,
+                    "compute_action": compute_action,
+                    "compute_latent": compute_latent,
+                    "inputs": inputs,
+                    "num_latent_tokens": num_latent_tokens,
+                }
+            )
+
+        # A merged pass carries a single ``prompt_len``, so the bridge suffixes have
+        # to line up across streams; otherwise fall back to one forward per stream.
+        if len({stream["num_latent_tokens"] for stream in streams}) != 1:
+            return {
+                "streams": {
+                    stream["name"]: self.forward(stream["examples"], loss_mode=stream["loss_mode"])
+                    for stream in streams
+                }
+            }
+
+        pad_token_id = int(self.processor.tokenizer.pad_token_id)
+        merged = merge_qwen3_vl_inputs([stream["inputs"] for stream in streams], pad_token_id)
+        prefix, last_hidden, layer_inputs = self.action_model.encode_prefix_hidden(
+            merged, streams[0]["num_latent_tokens"]
+        )
+        prompt_len = prefix["prompt_len"]
+        device = last_hidden.device
+
+        row = 0
+        outputs = {}
+        for stream in streams:
+            batch_size = stream["inputs"]["input_ids"].shape[0]
+            rows = slice(row, row + batch_size)
+            row += batch_size
+
+            latent_hidden = last_hidden[rows, prompt_len:] if stream["compute_latent"] else None
+            action_dit_loss = None
+            action_train_batch_size = 0
+            if stream["compute_action"]:
+                state, actions, action_mask, action_train_batch_size = self._prepare_action_inputs(
+                    stream["examples"], device
+                )
+                stream_prefix = {
+                    "position_ids": prefix["position_ids"][:, rows],
+                    "prompt_pad_masks": prefix["prompt_pad_masks"][rows],
+                    "prompt_len": prompt_len,
+                }
+                action_dit_loss = self.action_model.flow_matching_loss(
+                    stream_prefix,
+                    self.action_model.build_prefix_kvs(prefix, layer_inputs, rows),
+                    state,
+                    actions,
+                    action_mask,
+                    num_repeats=self.repeated_diffusion_steps,
+                )
+
+            outputs[stream["name"]] = self._assemble_losses(
+                stream["examples"],
+                stream["instructions"],
+                action_dit_loss,
+                latent_hidden,
+                action_train_batch_size,
+            )
+
+        return {"streams": outputs}
