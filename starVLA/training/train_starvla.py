@@ -81,6 +81,7 @@ def _supports_dual_vla_dataloaders(cfg) -> bool:
         "QwenPI_v4_LA",
         "QwenPI_v5_LA",
         "QwenWM_LA",
+        "QwenWMv2_LA"
     }
 
 

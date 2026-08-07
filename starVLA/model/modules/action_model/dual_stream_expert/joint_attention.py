@@ -8,6 +8,7 @@ keeps the pi0 state/action block semantics, so suffix uses flex_attention.
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -161,6 +162,109 @@ def flex_attention_with_block_mask(
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output.reshape(batch_size, seq_len, -1)
+
+
+class FlashDenseAttentionMeta(NamedTuple):
+    """Precomputed unpad bookkeeping for the dense (no block-causal) latent
+    flash-attention path. Built once per forward (shared by every expert
+    layer, since it only depends on prefix padding / suffix length, not on
+    layer-specific K/V content).
+    """
+
+    gather_index: torch.Tensor  # [total_valid] long, into flattened [B*(Lp+Ls)]
+    cu_seqlens_q: torch.Tensor  # [B+1] int32
+    cu_seqlens_k: torch.Tensor  # [B+1] int32
+    max_seqlen_q: int
+    max_seqlen_k: int
+    query_len: int
+
+
+def build_dense_flash_meta(prefix_pad_masks: torch.Tensor, suffix_len: int) -> FlashDenseAttentionMeta:
+    """Unpad bookkeeping for latent (fully bidirectional) expert attention.
+
+    ``prefix_pad_masks`` is ``[B, Lp]`` with left padding (tokenizer
+    ``padding_side="left"``); the suffix (latent target tokens) is always
+    fully valid and has the same length across the batch (enforced upstream
+    by the same-window-count constraint), so only the prefix needs unpadding.
+    """
+    batch_size, prefix_len = prefix_pad_masks.shape
+    kv_len = prefix_len + suffix_len
+    device = prefix_pad_masks.device
+
+    pad_offset = (~prefix_pad_masks).long().sum(dim=1)  # [B]
+    valid_len = (prefix_len - pad_offset) + suffix_len  # [B]
+
+    row_base = torch.arange(batch_size, device=device) * kv_len
+    gather_rows = []
+    for b in range(batch_size):
+        start = int(pad_offset[b].item())
+        base = int(row_base[b].item())
+        prefix_idx = torch.arange(start, prefix_len, device=device) + base
+        suffix_idx = torch.arange(prefix_len, kv_len, device=device) + base
+        gather_rows.append(torch.cat([prefix_idx, suffix_idx], dim=0))
+    gather_index = torch.cat(gather_rows, dim=0)
+
+    cu_seqlens_k = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+    cu_seqlens_k[1:] = torch.cumsum(valid_len, dim=0).to(torch.int32)
+    max_seqlen_k = int(valid_len.max().item())
+
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * suffix_len, suffix_len, device=device, dtype=torch.int32
+    )
+
+    return FlashDenseAttentionMeta(
+        gather_index=gather_index,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=suffix_len,
+        max_seqlen_k=max_seqlen_k,
+        query_len=suffix_len,
+    )
+
+
+def flash_attention_dense(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    meta: FlashDenseAttentionMeta,
+    scaling=None,
+) -> torch.Tensor:
+    """Variable-length flash-attention for the latent (dense, no block-causal) stream.
+
+    Inputs are ``[B, H, L, D]`` (fp32; the expert runs fp32 end-to-end). flash_attn
+    requires fp16/bf16, so only the attention matmul itself is computed in bf16;
+    RoPE and the surrounding residual path stay fp32. Returns ``[B, Lq, H*D]`` fp32.
+    """
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+    batch_size, num_q_heads, q_len, head_dim = query_states.shape
+    num_kv_heads = key_states.shape[1]
+    kv_len = key_states.shape[2]
+    if q_len != meta.query_len:
+        raise ValueError(f"Latent query length {q_len} does not match flash meta ({meta.query_len}).")
+
+    q = query_states.transpose(1, 2).reshape(batch_size * q_len, num_q_heads, head_dim)
+    k = key_states.transpose(1, 2).reshape(batch_size * kv_len, num_kv_heads, head_dim)
+    v = value_states.transpose(1, 2).reshape(batch_size * kv_len, num_kv_heads, head_dim)
+
+    gather_index = meta.gather_index.to(k.device)
+    k = k.index_select(0, gather_index)
+    v = v.index_select(0, gather_index)
+
+    compute_dtype = torch.bfloat16
+    attn_output = flash_attn_varlen_func(
+        q.to(compute_dtype),
+        k.to(compute_dtype),
+        v.to(compute_dtype),
+        cu_seqlens_q=meta.cu_seqlens_q.to(q.device),
+        cu_seqlens_k=meta.cu_seqlens_k.to(q.device),
+        max_seqlen_q=meta.max_seqlen_q,
+        max_seqlen_k=meta.max_seqlen_k,
+        causal=False,
+        softmax_scale=scaling,
+    )
+    attn_output = attn_output.to(query_states.dtype)
+    return attn_output.reshape(batch_size, q_len, num_q_heads * head_dim)
 
 
 def sdpa_attention_with_mask(

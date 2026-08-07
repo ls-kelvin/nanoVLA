@@ -37,7 +37,12 @@ class DualStreamFlowMatching(nn.Module):
             adanorm_time=bool(expert_cfg.adanorm_time),
             final_norm_adanorm=bool(expert_cfg.final_norm_adanorm),
             attn_implementation=str(qwenvl_cfg.get("attn_implementation", "flash_attention_2")),
-            expert_attention=str(action_cfg.get("expert_attention", "flex")),
+            # `action_expert_attention` is the preferred key (lets subclasses give the
+            # action stream a different backend than an independent latent stream);
+            # `expert_attention` is kept as a back-compat alias for existing configs.
+            expert_attention=str(
+                action_cfg.get("action_expert_attention", action_cfg.get("expert_attention", "flex"))
+            ),
             freeze_vision_encoder=bool(qwenvl_cfg.get("freeze_vision_encoder", False)),
             train_expert_only=bool(qwenvl_cfg.get("train_expert_only", False)),
         )
@@ -185,7 +190,7 @@ class DualStreamFlowMatching(nn.Module):
         return suffix_1d.unsqueeze(0).expand(3, -1, -1)
 
     # -- shared expert step -----------------------------------------------
-    def run_expert(self, prefix, prefix_kvs, state, x_t, timestep) -> Tensor:
+    def run_expert(self, prefix, prefix_kvs, state, x_t, timestep, attention_implementation=None) -> Tensor:
         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             state, x_t, timestep
         )
@@ -200,6 +205,7 @@ class DualStreamFlowMatching(nn.Module):
             suffix_pad_masks=suffix_pad_masks,
             suffix_att_masks=suffix_att_masks,
             ada_cond=time_embs if self.adanorm_time else None,
+            attention_implementation=attention_implementation,
         )
         return suffix_out[:, -x_t.shape[1] :]
 
@@ -267,6 +273,7 @@ class DualStreamFlowMatching(nn.Module):
         noise: Optional[Tensor] = None,
         time: Optional[Tensor] = None,
         num_repeats: Optional[int] = None,
+        attention_implementation: Optional[str] = None,
     ) -> Tensor:
         """Flow-matching loss on an already-encoded prefix (see :meth:`forward`)."""
         actions = actions.float()
@@ -313,7 +320,9 @@ class DualStreamFlowMatching(nn.Module):
             u_t = noise - actions
 
             expert_prefix, expert_kvs = self._expand_prefix_for_repeats(prefix, prefix_kvs, repeats)
-            suffix_out = self.run_expert(expert_prefix, expert_kvs, state, x_t, time)
+            suffix_out = self.run_expert(
+                expert_prefix, expert_kvs, state, x_t, time, attention_implementation=attention_implementation
+            )
             v_t = self.action_out_proj(suffix_out).float()
 
             if self.loss_type == "L1_fm":
@@ -326,7 +335,13 @@ class DualStreamFlowMatching(nn.Module):
 
     # -- inference --------------------------------------------------------
     @torch.no_grad()
-    def sample_actions(self, inputs: dict, state: Tensor, noise: Optional[Tensor] = None) -> Tensor:
+    def sample_actions(
+        self,
+        inputs: dict,
+        state: Tensor,
+        noise: Optional[Tensor] = None,
+        attention_implementation: Optional[str] = None,
+    ) -> Tensor:
         bsize = state.shape[0]
         device = state.device
 
@@ -348,7 +363,10 @@ class DualStreamFlowMatching(nn.Module):
             time = torch.tensor(1.0, dtype=torch.float32, device=device)
             while time >= -dt / 2:
                 expanded_time = time.expand(bsize)
-                suffix_out = self.run_expert(prefix, prefix_kvs, state, x_t, expanded_time)
+                suffix_out = self.run_expert(
+                    prefix, prefix_kvs, state, x_t, expanded_time,
+                    attention_implementation=attention_implementation,
+                )
                 v_t = self.action_out_proj(suffix_out).float()
                 x_t = x_t + dt * v_t
                 time = time + dt

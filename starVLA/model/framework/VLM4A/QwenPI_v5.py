@@ -90,7 +90,7 @@ class Qwen_PI_v5(baseframework):
         qwenvl_cfg = self.config.framework.qwenvl
         action_cfg = self.config.framework.action_model
 
-        self.action_model = DualStreamFlowMatching(global_config=self.config)
+        self.action_model = self._build_action_model()
 
         vlm_hf_cfg = self.action_model.qwenvl_with_expert.qwenvl.config
         qwenvl_cfg.vl_hidden_dim = int(vlm_hf_cfg.text_config.hidden_size)
@@ -121,6 +121,13 @@ class Qwen_PI_v5(baseframework):
             self.action_model.qwenvl_with_expert.qwenvl.gradient_checkpointing_enable(
                 {"use_reentrant": False}
             )
+
+    def _build_action_model(self) -> DualStreamFlowMatching:
+        """Construct the action model. Overridable so subclasses can swap in a
+        different ``DualStreamFlowMatching`` variant (e.g. with a decoupled
+        latent-action branch) without loading the wrapped VLM twice.
+        """
+        return DualStreamFlowMatching(global_config=self.config)
 
     # ------------------------------------------------------------------ #
     # VLM inputs

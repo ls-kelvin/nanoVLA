@@ -18,7 +18,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb,
 )
 
-from .joint_attention import build_expert_block_mask, build_suffix_attention_mask
+from .joint_attention import build_dense_flash_meta, build_expert_block_mask, build_suffix_attention_mask
 from .qwen2_expert import build_qwen2_expert
 
 
@@ -259,8 +259,15 @@ class QwenVLWithExpert(nn.Module):
         suffix_pad_masks: torch.Tensor,
         suffix_att_masks: torch.Tensor,
         ada_cond: Optional[torch.Tensor] = None,
+        attention_implementation: Optional[str] = None,
     ) -> torch.Tensor:
-        """Run the action expert over ``[prefix_kv, suffix]``. Returns suffix hidden."""
+        """Run the action expert over ``[prefix_kv, suffix]``. Returns suffix hidden.
+
+        ``attention_implementation`` overrides ``self.expert_attention`` for this
+        call so independent streams (e.g. action vs. latent) sharing one expert
+        can pick different backends (see ``joint_attention.py`` for ``"flash"``,
+        which only fits a fully bidirectional suffix with no block-causal mask).
+        """
         if len(prefix_kvs) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} prefix K/V pairs, got {len(prefix_kvs)}.")
 
@@ -271,19 +278,29 @@ class QwenVLWithExpert(nn.Module):
         else:
             raise ValueError(f"suffix_position_ids must be 3D mrope ids, got {tuple(suffix_position_ids.shape)}")
 
-        # Build attention structure once; all layers share the same mask.
+        attention_implementation = attention_implementation or self.expert_attention
+
+        # Build attention structure once; all layers share the same mask/meta.
         block_mask = None
         attention_mask = None
-        if self.expert_attention == "flex":
+        flash_meta = None
+        if attention_implementation == "flex":
             block_mask = build_expert_block_mask(
                 prefix_pad_masks, suffix_pad_masks, suffix_att_masks
             )
-        elif self.expert_attention == "sdpa":
+        elif attention_implementation == "sdpa":
             attention_mask = build_suffix_attention_mask(
                 prefix_pad_masks, suffix_pad_masks, suffix_att_masks
             )
+        elif attention_implementation == "flash":
+            if not bool(suffix_pad_masks.all()) or bool((suffix_att_masks[:, 1:] != 0).any()):
+                raise ValueError(
+                    "flash expert attention only supports a fully valid, fully bidirectional "
+                    "suffix (no padding, no block-causal structure)."
+                )
+            flash_meta = build_dense_flash_meta(prefix_pad_masks, suffix_pad_masks.shape[1])
         else:
-            raise ValueError(f"Unknown expert_attention: {self.expert_attention}")
+            raise ValueError(f"Unknown expert attention implementation: {attention_implementation}")
 
         # Suffix RoPE via the VLM mrope (same frequencies as the prefix K/V).
         language_model = self.qwenvl.model.language_model
@@ -303,7 +320,8 @@ class QwenVLWithExpert(nn.Module):
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 block_mask=block_mask,
+                flash_meta=flash_meta,
                 ada_cond=ada_cond,
-                attention_implementation=self.expert_attention,
+                attention_implementation=attention_implementation,
             )
         return self.qwen_expert.apply_final_norm(hidden_states, ada_cond)

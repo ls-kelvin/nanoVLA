@@ -19,7 +19,12 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 
-from .joint_attention import flex_attention_with_block_mask, sdpa_attention_with_mask
+from .joint_attention import (
+    FlashDenseAttentionMeta,
+    flash_attention_dense,
+    flex_attention_with_block_mask,
+    sdpa_attention_with_mask,
+)
 
 
 class AdaRMSNorm(nn.Module):
@@ -94,6 +99,7 @@ class Qwen2ExpertDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask=None,
         block_mask=None,
+        flash_meta: Optional[FlashDenseAttentionMeta] = None,
         ada_cond: Optional[torch.Tensor] = None,
         attention_implementation: str = "flex",
     ) -> torch.Tensor:
@@ -138,6 +144,12 @@ class Qwen2ExpertDecoderLayer(GradientCheckpointingLayer):
                 raise ValueError("sdpa expert attention requires an attention_mask.")
             attn_output = sdpa_attention_with_mask(
                 query_states, key_states, value_states, attention_mask, scaling=self.scaling
+            )
+        elif attention_implementation == "flash":
+            if flash_meta is None:
+                raise ValueError("flash expert attention requires a pre-built FlashDenseAttentionMeta.")
+            attn_output = flash_attention_dense(
+                query_states, key_states, value_states, flash_meta, scaling=self.scaling
             )
         else:
             raise ValueError(f"Unknown expert attention implementation: {attention_implementation}")
