@@ -397,6 +397,26 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
         prefix_kvs = self._maybe_detach_prefix_kvs(prefix_kvs)
         self._print_training_sample_once(examples, instructions)
 
+        action_dit_loss, latent_action_loss, action_train_batch_size = self._compute_stream_losses(
+            prefix, prefix_kvs, examples, device, compute_action, compute_latent
+        )
+        return self._assemble_losses(action_dit_loss, latent_action_loss, action_train_batch_size)
+
+    def _compute_stream_losses(
+        self,
+        prefix: dict,
+        prefix_kvs,
+        examples: List[dict],
+        device,
+        compute_action: bool,
+        compute_latent: bool,
+    ):
+        """Run independent action / latent flow-matching losses for one stream.
+
+        Shared by :meth:`forward` and :meth:`_forward_dual` so subclasses can
+        override only this hook (e.g. joint foresight readout) without copying
+        dual-dataloader merge logic.
+        """
         action_dit_loss = None
         latent_action_loss = None
         action_train_batch_size = 0
@@ -413,8 +433,7 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
             latent_action_loss = self.action_model.flow_matching_loss_latent(
                 prefix, prefix_kvs, latent_targets, num_repeats=self.repeated_diffusion_steps
             )
-
-        return self._assemble_losses(action_dit_loss, latent_action_loss, action_train_batch_size)
+        return action_dit_loss, latent_action_loss, action_train_batch_size
 
     # ------------------------------------------------------------------ #
     # merged dual-dataloader forward
@@ -489,23 +508,14 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
             prefix_kvs = self._maybe_detach_prefix_kvs(prefix_kvs)
             self._print_training_sample_once(stream["examples"], stream["instructions"])
 
-            action_dit_loss = None
-            latent_action_loss = None
-            action_train_batch_size = 0
-            if stream["compute_action"]:
-                state, actions, action_mask, action_train_batch_size = self._prepare_action_inputs(
-                    stream["examples"], device
-                )
-                action_dit_loss = self.action_model.flow_matching_loss(
-                    stream_prefix, prefix_kvs, state, actions, action_mask,
-                    num_repeats=self.repeated_diffusion_steps,
-                )
-            if stream["compute_latent"]:
-                latent_targets = self._make_continuous_targets(stream["examples"], device, torch.float32)
-                latent_action_loss = self.action_model.flow_matching_loss_latent(
-                    stream_prefix, prefix_kvs, latent_targets, num_repeats=self.repeated_diffusion_steps
-                )
-
+            action_dit_loss, latent_action_loss, action_train_batch_size = self._compute_stream_losses(
+                stream_prefix,
+                prefix_kvs,
+                stream["examples"],
+                device,
+                stream["compute_action"],
+                stream["compute_latent"],
+            )
             outputs[stream["name"]] = self._assemble_losses(
                 action_dit_loss, latent_action_loss, action_train_batch_size
             )

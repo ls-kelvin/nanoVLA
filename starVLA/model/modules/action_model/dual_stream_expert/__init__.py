@@ -3,6 +3,11 @@
 """Dual-stream (Qwen3-VL + Qwen2 action expert) flow-matching action model."""
 
 from .flow_matching import DualStreamFlowMatching
+from .flow_matching_foresight import DualStreamFlowMatchingForesight
 from .flow_matching_wm import DualStreamFlowMatchingWM
 
-__all__ = ["DualStreamFlowMatching", "DualStreamFlowMatchingWM"]
+__all__ = [
+    "DualStreamFlowMatching",
+    "DualStreamFlowMatchingForesight",
+    "DualStreamFlowMatchingWM",
+]

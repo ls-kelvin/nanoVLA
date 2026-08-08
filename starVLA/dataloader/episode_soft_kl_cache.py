@@ -299,6 +299,11 @@ def build_episode_soft_kl_cache(
     encoder.to(device=torch_device)
     encoder.eval()
 
+    vision_encoder = encoder.model.vision_encoder
+    needs_mid_frames = bool(getattr(vision_encoder, "num_mid_frames", 0)) or bool(
+        getattr(vision_encoder, "all_frame_targets", False)
+    )
+
     video_keys = list(la_cfg.get("video_keys") or [])
     if not video_keys:
         single = la_cfg.get("video_key", None)
@@ -319,7 +324,8 @@ def build_episode_soft_kl_cache(
     if is_main:
         print(
             f"[soft_kl_cache] building world_size={world_size} device={torch_device} "
-            f"batch_size={batch_size} num_workers={num_workers} use_bf16={use_bf16} mixes={mixes}",
+            f"batch_size={batch_size} num_workers={num_workers} use_bf16={use_bf16} "
+            f"needs_mid_frames={needs_mid_frames} mixes={mixes}",
             flush=True,
         )
 
@@ -370,6 +376,7 @@ def build_episode_soft_kl_cache(
                         ds_idx,
                         mine_traj_ids,
                         stride=stride,
+                        include_mid_frames=needs_mid_frames,
                     )
                 )
 

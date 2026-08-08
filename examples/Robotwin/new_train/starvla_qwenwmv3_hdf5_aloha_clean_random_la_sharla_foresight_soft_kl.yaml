@@ -1,64 +1,68 @@
-run_id: qwenwm_hdf5_aloha_clean_random_la_sharla_a2a_eef
+run_id: qwenwmv3_hdf5_aloha_clean_random_la_sharla_a2a_eef_foresight_soft_kl
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenWM_LA on RoboTwin2.0 raw HDF5 aloha-agilex EEF data.
-# Latent and action are independent flow-matching streams sharing the DiT + VLM
-# hidden states (separate final LayerNorms). Latent targets are Sharla-a2a
-# post-quantize / pre-output_proj embeddings (codebook_dim=32), standardised by
-# latent_norm_stats.json.
-# dataloader_loss_modes.action=joint => action dataloader computes BOTH
-# action_loss and latent_loss; latent dataloader remains latent-only.
-# One-click multi-node cache + train (same env as qwenpiv5 launcher):
-#   bash examples/Robotwin/new_train/run_robotwin_train_qwenwm_hdf5_aloha_clean_random_la_sharla.sh
+# QwenWMv3_LA foresight + soft_kl (PI_v4/v5-style codebook distribution KL).
+# Same joint learnable-token suffix as the embedding foresight config, but the
+# readout head predicts codebook logits and is supervised with
+# KL(teacher soft weights || student) instead of embedding MSE.
+# Requires a soft_kl episode cache (scripts/cache_sharla_soft_kl_episodes.sh);
+# embedding norm_stats are not used in this mode.
 framework:
-  name: QwenWM_LA
+  name: QwenWMv3_LA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
+    freeze_vision_encoder: false
+    train_expert_only: false
+    gradient_checkpointing: false
 
   latent_action:
     enabled: true
     backend: sharla
+    loss_type: soft_kl
     train_latent: true
     train_action: true
-    latent_loss_weight: 1.0
+    latent_loss_weight: 0.1
     action_loss_weight: 1.0
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
+    # Still required by DualStreamFlowMatchingWM parent init (unused by soft_kl head).
+    latent_dim: 32
+    codebook_size: 256
     sharla:
       config_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
       ckpt_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
       image_size: [224, 224]
       strict_load: true
-      # Produced by scripts/cache_sharla_embeddings.py under embedding_cache.output_dir.
-      norm_stats_path: .cache/latent_cache/sharla_a2a_embedding/latent_norm_stats.json
+      kl_eps: 1.0e-08
 
   action_model:
     action_dim: 16
     state_dim: 16
     action_horizon: 32
-    add_pos_embed: true
-    max_seq_len: 1024
-    num_target_vision_tokens: 0
+    num_inference_timesteps: 20
     repeated_diffusion_steps: 8
+    loss_type: fm
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
-    noise_s: 0.999
-    num_timestep_buckets: 1000
-    num_inference_timesteps: 20
-    diffusion_model_cfg:
-      input_embedding_dim: 1024
-      attention_head_dim: 32
-      num_attention_heads: 32
-      norm_type: "norm"
-      dropout: 0.0
-      final_dropout: true
-      interleave_self_attention: true
-      positional_embeddings: null
+    # Must equal frame_pairs * query_num (stride/horizon 8/32 => 4 pairs * 8 = 32).
+    num_learnable_tokens: 32
+    action_expert_attention: sdpa
+    latent_expert_attention: flash
+    action_dim_mask: null
+    action_expert:
+      hidden_size: 768
+      intermediate_size: 2752
+      num_attention_heads: 16
+      num_key_value_heads: 8
+      head_dim: 128
+      num_layers: null
+      adanorm_time: true
+      final_norm_adanorm: false
 
 datasets:
   vla_data:
@@ -70,8 +74,8 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
-      # Optional: skip on-the-fly Sharla encode when the episode cache is present.
-      embedding_cache_dir: .cache/latent_cache/sharla_a2a_embedding
+      # Soft codebook distributions (not embedding cache).
+      episode_cache_dir: .cache/latent_cache/sharla_soft_kl
       horizon_overrides:
         arx-x5:
           frame_stride: 6
@@ -83,44 +87,43 @@ datasets:
     include_state: true
     data_root_dir: /mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
-    latent_data_mix: hdf5_aloha_clean_random_eef
+    latent_data_mix: hdf5_arx_clean_random_eef
     hdf5_action_type: eef
     action_type: abs_eef
     action_mode: abs
-    per_device_batch_size: 16
-    latent_per_device_batch_size: 16
+    per_device_batch_size: 8
+    latent_per_device_batch_size: 8
     balance_dataset_weights: true
     balance_trajectory_weights: true
     load_all_data_for_training: true
     obs_image_size: [256, 256]
+    precompute_vlm_inputs: true
 
 trainer:
   use_dual_vla_dataloaders: true
-  # action=joint: one forward yields both action_dit_loss and latent_action_loss.
-  # latent=latent: latent-only forward on the secondary mix.
   dataloader_loss_modes:
-    action: joint
     latent: latent
+    action: joint
   dataloader_active_ranges:
     latent:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 100000
+  max_train_steps: 90000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
   eval_num_samples: 512
-  eval_batch_size: 16
+  eval_batch_size: 8
   logging_frequency: 50
   learning_rate:
     base: 5e-05
-    qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05
+    action_model.qwenvl_with_expert.qwenvl: 1.0e-05
+    action_model.qwenvl_with_expert.qwen_expert: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 5.0e-06
-  freeze_modules: ''
+    min_lr: 5e-6
+  freeze_modules: ""
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0
@@ -132,12 +135,11 @@ trainer:
     eps: 1.0e-08
     weight_decay: 1.0e-08
 
-# Offline cache builder options (scripts/cache_sharla_embeddings.py).
-embedding_cache:
-  output_dir: .cache/latent_cache/sharla_a2a_embedding
+# Offline soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
+soft_kl_cache:
+  output_dir: .cache/latent_cache/sharla_soft_kl
   batch_size: 256
   num_workers: 128
   num_gpus: 8
   use_bf16: true
   overwrite: false
-  compute_norm_stats: true
