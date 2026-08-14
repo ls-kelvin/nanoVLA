@@ -3,6 +3,7 @@ import io
 import json
 import os
 import random
+import time
 from pathlib import Path
 
 import h5py
@@ -35,8 +36,63 @@ def _cfg_get(cfg, key, default=None):
     return cfg.get(key, default) if hasattr(cfg, "get") else getattr(cfg, key, default)
 
 
+def _distributed_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    for key in ("RANK", "LOCAL_RANK"):
+        value = os.environ.get(key)
+        if value is not None and str(value).strip() != "":
+            return int(value)
+    return 0
+
+
+def _distributed_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_world_size())
+    value = os.environ.get("WORLD_SIZE")
+    if value is not None and str(value).strip() != "":
+        return max(1, int(value))
+    return 1
+
+
 def _is_main_process() -> bool:
-    return (not dist.is_initialized()) or dist.get_rank() == 0
+    return _distributed_rank() == 0
+
+
+def _refresh_dir_listing(path: Path) -> None:
+    try:
+        os.listdir(path)
+    except FileNotFoundError:
+        try:
+            os.listdir(path.parent)
+        except FileNotFoundError:
+            pass
+
+
+def _cache_required_paths(cache_dir: Path) -> list[Path]:
+    return [
+        cache_dir / "episodes.jsonl",
+        cache_dir / "tasks.jsonl",
+        cache_dir / "info.json",
+        cache_dir / "modality.json",
+        cache_dir / "stats_gr00t.json",
+        cache_dir / "cache_config.json",
+    ]
+
+
+def _wait_for_cache_files(paths: list[Path], timeout_s: float = 3600.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    missing: list[Path] = list(paths)
+    while time.monotonic() < deadline:
+        _refresh_dir_listing(paths[0].parent)
+        missing = [path for path in paths if not path.exists()]
+        if not missing:
+            return
+        time.sleep(0.5)
+    raise FileNotFoundError(
+        "Timed out waiting for HDF5 dataset cache files: "
+        + ", ".join(str(path) for path in missing)
+    )
 
 
 def _natural_episode_id(path: Path) -> int:
@@ -138,10 +194,10 @@ def _data_config_uses_endpose(data_config) -> bool:
 
 def _check_hdf5_action_type_matches_config(hdf5_action_type: str, robot_type: str, data_config) -> None:
     uses_endpose = _data_config_uses_endpose(data_config)
-    if hdf5_action_type == "eef" and not uses_endpose:
+    if hdf5_action_type in {"eef", "eef_rot6d"} and not uses_endpose:
         raise ValueError(
-            "hdf5_action_type='eef' requires an EEF robot_type/DataConfig "
-            f"(for example 'robotwin32_eef'), got robot_type={robot_type!r}."
+            f"hdf5_action_type={hdf5_action_type!r} requires an EEF robot_type/DataConfig "
+            f"(for example 'robotwin32_eef' or 'robotwin32_eef_rot6d'), got robot_type={robot_type!r}."
         )
     if hdf5_action_type == "qpos" and uses_endpose:
         raise ValueError(
@@ -162,7 +218,10 @@ class HDF5SingleDataset(Dataset):
         data_cfg=None,
         dataset_name: str | None = None,
         robot_type: str | None = None,
+        cache_mode: str = "auto",
     ):
+        if cache_mode not in {"auto", "writer", "load"}:
+            raise ValueError(f"cache_mode must be 'auto', 'writer', or 'load', got {cache_mode!r}")
         self.data_cfg = data_cfg
         self.modality_configs = modality_configs
         self.transforms = transforms
@@ -170,8 +229,10 @@ class HDF5SingleDataset(Dataset):
         self._dataset_name = dataset_name or self._dataset_path.name
         self.robot_type = robot_type
         self.hdf5_action_type = str(_cfg_get(data_cfg, "hdf5_action_type", "qpos")).lower()
-        if self.hdf5_action_type not in {"qpos", "eef"}:
-            raise ValueError(f"hdf5_action_type must be 'qpos' or 'eef', got {self.hdf5_action_type!r}")
+        if self.hdf5_action_type not in {"qpos", "eef", "eef_rot6d"}:
+            raise ValueError(
+                f"hdf5_action_type must be 'qpos', 'eef', or 'eef_rot6d', got {self.hdf5_action_type!r}"
+            )
         self.hdf5_image_channel_order = _normalize_image_channel_order(
             _cfg_get(data_cfg, "hdf5_image_channel_order", "bgr")
         )
@@ -183,7 +244,13 @@ class HDF5SingleDataset(Dataset):
         self.curr_traj_data = None
 
         self._init_action_mode()
-        self._ensure_cache()
+        if cache_mode == "writer":
+            self._ensure_cache(build=True, wait=False, barrier=False)
+            return
+        if cache_mode == "load":
+            self._ensure_cache(build=False, wait=True, barrier=False)
+        else:
+            self._ensure_cache(build=_is_main_process(), wait=True, barrier=True)
 
         self._lerobot_modality_meta = self._get_lerobot_modality_meta()
         self._lerobot_info_meta = self._get_lerobot_info_meta()
@@ -258,31 +325,28 @@ class HDF5SingleDataset(Dataset):
             "files_hash": hashlib.md5(repr(files).encode("utf-8")).hexdigest(),
         }
 
-    def _ensure_cache(self) -> None:
-        config_path = self._cache_dir / "cache_config.json"
-        required = [
-            self._cache_dir / "episodes.jsonl",
-            self._cache_dir / "tasks.jsonl",
-            self._cache_dir / "info.json",
-            self._cache_dir / "modality.json",
-            self._cache_dir / "stats_gr00t.json",
-        ]
+    def _ensure_cache(self, *, build: bool, wait: bool, barrier: bool) -> None:
+        required = _cache_required_paths(self._cache_dir)
         config = self._cache_config()
 
         cache_valid = False
-        if config_path.exists() and all(path.exists() for path in required):
-            with open(config_path, "r", encoding="utf-8") as f:
+        if all(path.exists() for path in required):
+            with open(self._cache_dir / "cache_config.json", "r", encoding="utf-8") as f:
                 cache_valid = json.load(f) == config
 
-        if cache_valid:
-            return
-
-        if _is_main_process():
+        if build and not cache_valid:
+            print(
+                f"[hdf5 cache] rank {_distributed_rank()} writing {self._dataset_path} "
+                f"({self.hdf5_action_type})",
+                flush=True,
+            )
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             self._write_cache_files(config)
 
-        if dist.is_initialized():
+        if barrier and dist.is_initialized():
             dist.barrier()
+        if wait and not cache_valid:
+            _wait_for_cache_files(required)
 
     def _write_cache_files(self, config: dict) -> None:
         first_path = self._episode_files[0]
@@ -401,7 +465,48 @@ class HDF5SingleDataset(Dataset):
         }
 
     def _build_modality(self, action_dim: int) -> dict:
-        if self.hdf5_action_type == "eef":
+        if self.hdf5_action_type == "eef_rot6d":
+            state = {
+                "left_endpose_position": {"start": 0, "end": 3, "original_key": "observation.state"},
+                "left_endpose_rotation": {
+                    "start": 3,
+                    "end": 7,
+                    "original_key": "observation.state",
+                    "rotation_type": "quaternion",
+                    "absolute": True,
+                },
+                "left_gripper": {"start": 7, "end": 8, "original_key": "observation.state"},
+                "right_endpose_position": {"start": 8, "end": 11, "original_key": "observation.state"},
+                "right_endpose_rotation": {
+                    "start": 11,
+                    "end": 15,
+                    "original_key": "observation.state",
+                    "rotation_type": "quaternion",
+                    "absolute": True,
+                },
+                "right_gripper": {"start": 15, "end": 16, "original_key": "observation.state"},
+            }
+            action = {
+                "left_endpose_position": {"start": 0, "end": 3, "original_key": "action"},
+                "left_endpose_rotation": {
+                    "start": 3,
+                    "end": 7,
+                    "original_key": "action",
+                    "rotation_type": "quaternion",
+                    "absolute": True,
+                },
+                "left_gripper": {"start": 7, "end": 8, "original_key": "action"},
+                "right_endpose_position": {"start": 8, "end": 11, "original_key": "action"},
+                "right_endpose_rotation": {
+                    "start": 11,
+                    "end": 15,
+                    "original_key": "action",
+                    "rotation_type": "quaternion",
+                    "absolute": True,
+                },
+                "right_gripper": {"start": 15, "end": 16, "original_key": "action"},
+            }
+        elif self.hdf5_action_type == "eef":
             state = {
                 "left_endpose": {"start": 0, "end": 7, "original_key": "observation.state"},
                 "left_gripper": {"start": 7, "end": 8, "original_key": "observation.state"},
@@ -578,8 +683,6 @@ class HDF5SingleDataset(Dataset):
             with open(tmp_path, "wb") as f:
                 pickle.dump({"steps": steps}, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp_path, steps_path)
-        if dist.is_initialized():
-            dist.barrier()
         return steps
 
     def _check_integrity(self) -> None:
@@ -813,6 +916,7 @@ def make_HDF5SingleDataset(
     data_name: str,
     robot_type: str,
     data_cfg=None,
+    cache_mode: str = "auto",
 ) -> HDF5SingleDataset:
     hdf5_action_type = str(_cfg_get(data_cfg, "hdf5_action_type", "qpos")).lower()
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
@@ -827,6 +931,7 @@ def make_HDF5SingleDataset(
         data_cfg=data_cfg,
         dataset_name=data_name,
         robot_type=robot_type,
+        cache_mode=cache_mode,
     )
 
 
@@ -835,6 +940,58 @@ def _mixture_entry_matches_include(d_name: str, robot_type: str, include_pattern
         return True
     match_text = "\n".join([str(d_name), str(robot_type)])
     return any(pattern in match_text for pattern in include_patterns)
+
+
+def _collect_mixture_entries(
+    mixture_spec,
+    include_robot_types: set[str] | None,
+) -> list[tuple[str, float, str]]:
+    entries = []
+    included_datasets = set()
+    for d_name, d_weight, robot_type in mixture_spec:
+        if not _mixture_entry_matches_include(d_name, robot_type, include_robot_types):
+            continue
+        dataset_key = (d_name, robot_type)
+        if dataset_key in included_datasets:
+            print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
+            continue
+        included_datasets.add(dataset_key)
+        entries.append((d_name, d_weight, robot_type))
+    return entries
+
+
+def prebuild_mixture_hdf5_caches(
+    data_root_dir: Path,
+    entries: list[tuple[str, float, str]],
+    data_cfg,
+    make_dataset_fn,
+) -> None:
+    """Each rank writes a disjoint shard of missing HDF5 caches, then all ranks wait.
+
+    The same cache directory is never written by two ranks. After a global barrier,
+    every rank polls until all caches exist so NFS/netdata readers cannot race.
+    """
+    if not entries:
+        return
+
+    rank = _distributed_rank()
+    world_size = _distributed_world_size()
+    owned = [entry for index, entry in enumerate(entries) if index % world_size == rank]
+    print(
+        f"[hdf5 cache] rank {rank}/{world_size} building {len(owned)}/{len(entries)} dataset caches",
+        flush=True,
+    )
+    for d_name, _, robot_type in owned:
+        make_dataset_fn(data_root_dir, d_name, robot_type, data_cfg=data_cfg, cache_mode="writer")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    hdf5_action_type = str(_cfg_get(data_cfg, "hdf5_action_type", "qpos")).lower()
+    for d_name, _, _robot_type in entries:
+        dataset_path = _resolve_hdf5_dataset_path(data_root_dir, d_name)
+        cache_dir = dataset_path / "meta" / "hdf5_dataset" / hdf5_action_type
+        _wait_for_cache_files(_cache_required_paths(cache_dir))
 
 
 def get_vla_dataset(
@@ -850,23 +1007,18 @@ def get_vla_dataset(
     data_mix = data_cfg.data_mix
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     include_robot_types = {str(robot_type) for robot_type in include_robot_types} if include_robot_types else None
-
-    dataset_mixture = []
-    included_datasets = set()
-    for d_name, d_weight, robot_type in mixture_spec:
-        if not _mixture_entry_matches_include(d_name, robot_type, include_robot_types):
-            continue
-        dataset_key = (d_name, robot_type)
-        if dataset_key in included_datasets:
-            print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
-            continue
-        included_datasets.add(dataset_key)
-        dataset_mixture.append((make_HDF5SingleDataset(data_root_dir, d_name, robot_type, data_cfg=data_cfg), d_weight))
-
-    if include_robot_types is not None and not dataset_mixture:
+    entries = _collect_mixture_entries(mixture_spec, include_robot_types)
+    if include_robot_types is not None and not entries:
         raise ValueError(
             f"No datasets in data_mix={data_mix!r} match include_robot_types={sorted(include_robot_types)}."
         )
+
+    prebuild_mixture_hdf5_caches(data_root_dir, entries, data_cfg, make_HDF5SingleDataset)
+
+    dataset_mixture = [
+        (make_HDF5SingleDataset(data_root_dir, d_name, robot_type, data_cfg=data_cfg, cache_mode="load"), d_weight)
+        for d_name, d_weight, robot_type in entries
+    ]
 
     return LeRobotMixtureDataset(
         dataset_mixture,

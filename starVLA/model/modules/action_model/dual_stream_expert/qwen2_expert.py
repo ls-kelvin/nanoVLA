@@ -28,10 +28,11 @@ from .joint_attention import (
 
 
 class AdaRMSNorm(nn.Module):
-    """RMSNorm + FiLM conditioned on the flow-matching time embedding.
+    """RMSNorm + optional FiLM.
 
-    ``gamma`` / ``beta`` are zero-initialised (DiT style) so the layer starts as a
-    plain RMSNorm.
+    ``cond`` is ``None`` (no FiLM, plain RMSNorm), ``[B, D]`` (broadcast, typical
+    time embedding), or ``[B, S, D]`` (per-token). ``gamma`` / ``beta`` are
+    zero-initialised (DiT style) so FiLM starts as identity.
     """
 
     def __init__(self, hidden_size: int, cond_dim: int, eps: float = 1e-6):
@@ -48,14 +49,23 @@ class AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.beta.weight)
         nn.init.zeros_(self.beta.bias)
 
-    def forward(self, hidden_states: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         hidden_states = self.weight * hidden_states
-        gamma = self.gamma(cond).unsqueeze(1).to(torch.float32)
-        beta = self.beta(cond).unsqueeze(1).to(torch.float32)
+        if cond is None:
+            return hidden_states.to(input_dtype)
+        if cond.ndim not in (2, 3):
+            raise ValueError(
+                f"AdaRMSNorm cond must be None, [B, D], or [B, S, D], got {tuple(cond.shape)}."
+            )
+        gamma = self.gamma(cond).to(torch.float32)
+        beta = self.beta(cond).to(torch.float32)
+        if gamma.ndim == 2:
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
         hidden_states = (1 + gamma) * hidden_states + beta
         return hidden_states.to(input_dtype)
 
@@ -102,6 +112,7 @@ class Qwen2ExpertDecoderLayer(GradientCheckpointingLayer):
         flash_meta: Optional[FlashDenseAttentionMeta] = None,
         ada_cond: Optional[torch.Tensor] = None,
         attention_implementation: str = "flex",
+        return_suffix_kv: bool = False,
     ) -> torch.Tensor:
         # Expert is full fp32 end-to-end.
         hidden_states = hidden_states.float()
@@ -130,8 +141,9 @@ class Qwen2ExpertDecoderLayer(GradientCheckpointingLayer):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Prefix K/V are already RoPE'd; concat along the sequence axis.
-        key_states = torch.cat([prefix_key, key_states], dim=2)
-        value_states = torch.cat([prefix_value, value_states], dim=2)
+        suffix_key, suffix_value = key_states, value_states
+        key_states = torch.cat([prefix_key, suffix_key], dim=2)
+        value_states = torch.cat([prefix_value, suffix_value], dim=2)
 
         if attention_implementation == "flex":
             if block_mask is None:
@@ -160,7 +172,10 @@ class Qwen2ExpertDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = _apply_norm(self.post_attention_layernorm, hidden_states, ada_cond)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        hidden_states = residual + hidden_states
+        if return_suffix_kv:
+            return hidden_states, suffix_key, suffix_value
+        return hidden_states
 
 
 class Qwen2ExpertPreTrainedModel(PreTrainedModel):

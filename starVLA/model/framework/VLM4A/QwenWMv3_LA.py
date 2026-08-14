@@ -2,8 +2,8 @@
 # Licensed under the MIT License.
 """QwenWMv3_LA: QwenWMv2_LA with InternVLA-style learnable-token foresight.
 
-Replaces the independent latent flow-matching branch with joint learnable
-tokens that share one expert forward with state + noisy actions.
+Replaces the independent latent flow-matching branch with learnable tokens.
+State and latent are encoded once; action flow-matching reuses their K/V.
 
 Latent supervision is switchable via ``framework.latent_action.loss_type``:
 

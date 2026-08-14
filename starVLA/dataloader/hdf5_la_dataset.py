@@ -11,9 +11,10 @@ from starVLA.dataloader.hdf5_dataset import (
     HDF5SingleDataset,
     _cfg_get,
     _check_hdf5_action_type_matches_config,
-    _mixture_entry_matches_include,
+    _collect_mixture_entries,
     _resolve_hdf5_dataset_path,
     collate_fn,
+    prebuild_mixture_hdf5_caches,
 )
 from starVLA.dataloader.lerobot_la_datasets import (
     _filter_latent_modalities,
@@ -309,6 +310,7 @@ def make_HDF5LatentActionSingleDataset(
     data_name: str,
     robot_type: str,
     data_cfg=None,
+    cache_mode: str = "auto",
 ) -> LatentActionHDF5SingleDataset:
     hdf5_action_type = str(_cfg_get(data_cfg, "hdf5_action_type", "qpos")).lower()
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
@@ -328,6 +330,7 @@ def make_HDF5LatentActionSingleDataset(
         data_cfg=data_cfg,
         dataset_name=data_name,
         robot_type=robot_type,
+        cache_mode=cache_mode,
     )
 
 
@@ -344,28 +347,23 @@ def get_vla_dataset(
     data_mix = data_cfg.data_mix
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     include_robot_types = {str(robot_type) for robot_type in include_robot_types} if include_robot_types else None
-
-    dataset_mixture = []
-    included_datasets = set()
-    for d_name, d_weight, robot_type in mixture_spec:
-        if not _mixture_entry_matches_include(d_name, robot_type, include_robot_types):
-            continue
-        dataset_key = (d_name, robot_type)
-        if dataset_key in included_datasets:
-            print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
-            continue
-        included_datasets.add(dataset_key)
-        dataset_mixture.append(
-            (
-                make_HDF5LatentActionSingleDataset(data_root_dir, d_name, robot_type, data_cfg=data_cfg),
-                d_weight,
-            )
-        )
-
-    if include_robot_types is not None and not dataset_mixture:
+    entries = _collect_mixture_entries(mixture_spec, include_robot_types)
+    if include_robot_types is not None and not entries:
         raise ValueError(
             f"No datasets in data_mix={data_mix!r} match include_robot_types={sorted(include_robot_types)}."
         )
+
+    prebuild_mixture_hdf5_caches(data_root_dir, entries, data_cfg, make_HDF5LatentActionSingleDataset)
+
+    dataset_mixture = [
+        (
+            make_HDF5LatentActionSingleDataset(
+                data_root_dir, d_name, robot_type, data_cfg=data_cfg, cache_mode="load"
+            ),
+            d_weight,
+        )
+        for d_name, d_weight, robot_type in entries
+    ]
 
     return LeRobotMixtureDataset(
         dataset_mixture,

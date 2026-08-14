@@ -133,6 +133,14 @@ class AgilexData48Config(AgilexDataConfig):
         ])
 
 
+_EEF_ROT6D_ROTATION_KEYS = (
+    "state.left_endpose_rotation",
+    "state.right_endpose_rotation",
+    "action.left_endpose_rotation",
+    "action.right_endpose_rotation",
+)
+
+
 class Robotwin32EefDataConfig:
     embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     video_keys = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
@@ -173,6 +181,124 @@ class Robotwin32EefDataConfig:
                     "action.right_endpose": "q99",
                     "action.left_gripper": "min_max",
                     "action.right_gripper": "min_max",
+                },
+            ),
+        ])
+
+
+class Robotwin32EefRot6dDataConfig:
+    """RoboTwin dual-arm EEF with quaternion stored in HDF5 and rot6d used by the model.
+
+    Raw / env layout is still 16D ``xyz + quat(wxyz) + gripper`` per the RoboTwin
+    simulator. The transform converts each 4D quaternion key to 6D rotation, so
+    packed model state/action is 20D. Inference unapplies back to 16D quaternion.
+    """
+
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    video_keys = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
+    state_keys = [
+        "state.left_endpose_position",
+        "state.left_endpose_rotation",
+        "state.right_endpose_position",
+        "state.right_endpose_rotation",
+        "state.left_gripper",
+        "state.right_gripper",
+    ]
+    action_keys = [
+        "action.left_endpose_position",
+        "action.left_endpose_rotation",
+        "action.right_endpose_position",
+        "action.right_endpose_rotation",
+        "action.left_gripper",
+        "action.right_gripper",
+    ]
+    # Env observation is [left_xyzquat, left_gripper, right_xyzquat, right_gripper].
+    state_input_keys = [
+        "state.left_endpose_position",
+        "state.left_endpose_rotation",
+        "state.left_gripper",
+        "state.right_endpose_position",
+        "state.right_endpose_rotation",
+        "state.right_gripper",
+    ]
+    action_key_dims = {
+        "action.left_endpose_position": 3,
+        "action.left_endpose_rotation": 4,
+        "action.right_endpose_position": 3,
+        "action.right_endpose_rotation": 4,
+        "action.left_gripper": 1,
+        "action.right_gripper": 1,
+    }
+    state_key_dims = {
+        "state.left_endpose_position": 3,
+        "state.left_endpose_rotation": 4,
+        "state.right_endpose_position": 3,
+        "state.right_endpose_rotation": 4,
+        "state.left_gripper": 1,
+        "state.right_gripper": 1,
+    }
+    action_model_key_dims = {
+        "action.left_endpose_position": 3,
+        "action.left_endpose_rotation": 6,
+        "action.right_endpose_position": 3,
+        "action.right_endpose_rotation": 6,
+        "action.left_gripper": 1,
+        "action.right_gripper": 1,
+    }
+    state_model_key_dims = {
+        "state.left_endpose_position": 3,
+        "state.left_endpose_rotation": 6,
+        "state.right_endpose_position": 3,
+        "state.right_endpose_rotation": 6,
+        "state.left_gripper": 1,
+        "state.right_gripper": 1,
+    }
+    rotation_types = {key: "quaternion" for key in _EEF_ROT6D_ROTATION_KEYS}
+    target_rotations = {key: "rotation_6d" for key in _EEF_ROT6D_ROTATION_KEYS}
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    action_indices = list(range(32))
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.video_keys),
+            "state": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.state_keys),
+            "action": ModalityConfig(delta_indices=self.action_indices, modality_keys=self.action_keys),
+            "language": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.language_keys),
+        }
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_endpose_position": "q99",
+                    "state.right_endpose_position": "q99",
+                    "state.left_endpose_rotation": "min_max",
+                    "state.right_endpose_rotation": "min_max",
+                    "state.left_gripper": "min_max",
+                    "state.right_gripper": "min_max",
+                },
+                target_rotations={
+                    "state.left_endpose_rotation": "rotation_6d",
+                    "state.right_endpose_rotation": "rotation_6d",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.left_endpose_position": "q99",
+                    "action.right_endpose_position": "q99",
+                    "action.left_endpose_rotation": "min_max",
+                    "action.right_endpose_rotation": "min_max",
+                    "action.left_gripper": "min_max",
+                    "action.right_gripper": "min_max",
+                },
+                target_rotations={
+                    "action.left_endpose_rotation": "rotation_6d",
+                    "action.right_endpose_rotation": "rotation_6d",
                 },
             ),
         ])
@@ -379,6 +505,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "arx_x5": ArxX5DataConfig(),
     "robotwin48": AgilexData48Config(),
     "robotwin32_eef": Robotwin32EefDataConfig(),
+    "robotwin32_eef_rot6d": Robotwin32EefRot6dDataConfig(),
 }
 
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
@@ -444,6 +571,41 @@ DATASET_NAMED_MIXTURES = {
         "robotwin32_eef",
         embodiments=["aloha-agilex"],
         domains=["clean", "randomized"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_clean_eef_rot6d": _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["aloha-agilex"],
+        domains=["clean"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_random_eef_rot6d": _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["aloha-agilex"],
+        domains=["randomized"],
+        layout="hdf5",
+    ),
+    "hdf5_arx_clean_random_eef_rot6d": _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["arx-x5"],
+        domains=["clean", "randomized"],
+        layout="hdf5",
+    ),
+    "hdf5_aloha_clean_random_eef_rot6d": _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["aloha-agilex"],
+        domains=["clean", "randomized"],
+        layout="hdf5",
+    ),
+    "hdf5_arx_clean_random_eef_rot6d+hdf5_aloha_clean_eef_rot6d": _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["arx-x5"],
+        domains=["clean", "randomized"],
+        layout="hdf5",
+    ) + _discover(
+        "robotwin32_eef_rot6d",
+        embodiments=["aloha-agilex"],
+        domains=["clean"],
         layout="hdf5",
     ),
     "robotwin_all": [

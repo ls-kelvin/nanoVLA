@@ -145,6 +145,24 @@ def _infer_key_dims(
     return {k: 1 for k in modality_keys}
 
 
+def _model_key_dims(data_config: Any, raw_dims: Dict[str, int], modality: str) -> Dict[str, int]:
+    """Dims after rotation conversion, used to split model-space tensors.
+
+    ``<modality>_model_key_dims`` on the DataConfig wins when present; otherwise
+    the raw/env dims are reused (no representation change).
+    """
+    attr = f"{modality}_model_key_dims"
+    if hasattr(data_config, attr):
+        model_dims = dict(getattr(data_config, attr))
+        if model_dims:
+            return model_dims
+    return dict(raw_dims)
+
+
+def _rotation_types(data_config: Any) -> Dict[str, str]:
+    return dict(getattr(data_config, "rotation_types", {}) or {})
+
+
 def _build_dataset_metadata(
     stats_for_key: Dict[str, Any],
     embodiment_tag: Any,
@@ -152,6 +170,7 @@ def _build_dataset_metadata(
     state_keys: Sequence[str],
     action_key_dims: Optional[Dict[str, int]] = None,
     state_key_dims: Optional[Dict[str, int]] = None,
+    rotation_types: Optional[Dict[str, str]] = None,
 ) -> DatasetMetadata:
     """Convert the *combined* stats arrays from ``dataset_statistics.json``
     back into a per-subkey :class:`DatasetMetadata` matching what the training
@@ -168,14 +187,20 @@ def _build_dataset_metadata(
         action_keys: Ordered list of full action keys.
         state_keys: Ordered list of full state keys.
         action_key_dims: Per-key dimension dict (``{full_key: dim_k}``).
-            Defaults to dim=1 for every key.
+            Defaults to dim=1 for every key. These are **raw/env** dims used
+            to split ``dataset_statistics.json``.
         state_key_dims: Per-key dimension dict for state keys.
             Defaults to dim=1 for every key.
+        rotation_types: Optional ``{full_key: rotation_rep}`` map so that
+            ``StateActionTransform.target_rotations`` can recover the source
+            representation during inference unapply.
     """
     if action_key_dims is None:
         action_key_dims = {k: 1 for k in action_keys}
     if state_key_dims is None:
         state_key_dims = {k: 1 for k in state_keys}
+    if rotation_types is None:
+        rotation_types = {}
 
     def _split_combined(
         combined: Dict[str, Sequence[float]],
@@ -206,9 +231,10 @@ def _build_dataset_metadata(
                     continue
                 per_key[stat_name] = [float(v) for v in arr[cursor:end]]
             stats_per_subkey[subkey] = per_key
+            rotation_type = rotation_types.get(full_key)
             meta_per_subkey[subkey] = StateActionMetadata(
                 absolute=True,
-                rotation_type=None,
+                rotation_type=rotation_type,
                 shape=(dim_k,),
                 continuous=True,
             )
@@ -308,6 +334,10 @@ class PolicyNormProcessor:
         self._state_key_dims: Dict[str, int] = _infer_key_dims(
             self._data_config, stats_for_unnorm, self._state_keys, "state"
         )
+        self._action_model_key_dims: Dict[str, int] = _model_key_dims(
+            self._data_config, self._action_key_dims, "action"
+        )
+        self._rotation_types: Dict[str, str] = _rotation_types(self._data_config)
 
         # 5) Build & bind metadata.
         ds_meta = _build_dataset_metadata(
@@ -317,17 +347,19 @@ class PolicyNormProcessor:
             state_keys=self._state_keys,
             action_key_dims=self._action_key_dims,
             state_key_dims=self._state_key_dims,
+            rotation_types=self._rotation_types,
         )
         self._transform.set_metadata(ds_meta)
         self._transform.eval()  # mark transforms as eval-mode
 
         logger.info(
             "PolicyNormProcessor ready: robot_type=%s, unnorm_key=%s, "
-            "action_keys=%s (dims=%s), state_keys=%s, state_input_keys=%s",
+            "action_keys=%s (raw_dims=%s, model_dims=%s), state_keys=%s, state_input_keys=%s",
             robot_type,
             unnorm_key,
             self._action_keys,
             [self._action_key_dims[k] for k in self._action_keys],
+            [self._action_model_key_dims[k] for k in self._action_keys],
             self._state_keys,
             self._state_input_keys,
         )
@@ -367,10 +399,13 @@ class PolicyNormProcessor:
 
         Args:
             normalized_actions: shape ``(T, D)`` where
-                ``D == sum(action_key_dims.values())``.
+                ``D == sum(action_model_key_dims.values())``.
 
         Returns:
-            ``(T, D)`` un-normalized actions in env coordinates.
+            ``(T, D_env)`` un-normalized actions in env coordinates.
+            ``D_env == sum(action_key_dims.values())``; this can be smaller than
+            ``D`` when a rotation representation is expanded for the model
+            (e.g. quaternion 4D → rot6d 6D).
         """
         normalized_actions = np.asarray(normalized_actions)
         assert normalized_actions.ndim == 2, (
@@ -381,17 +416,17 @@ class PolicyNormProcessor:
         data: Dict[str, torch.Tensor] = {}
         cursor = 0
         for full_key in self._action_keys:
-            dim_k = self._action_key_dims.get(full_key, 1)
+            dim_k = self._action_model_key_dims.get(full_key, 1)
             slice_ = normalized_actions[..., cursor : cursor + dim_k]
             data[full_key] = torch.as_tensor(slice_, dtype=torch.float32)
             cursor += dim_k
 
         if cursor != normalized_actions.shape[-1]:
             raise ValueError(
-                f"Sum of per-key dims ({cursor}) != action_dim "
+                f"Sum of per-key model dims ({cursor}) != action_dim "
                 f"({normalized_actions.shape[-1]}). "
                 f"action_keys={self._action_keys}, "
-                f"action_key_dims={self._action_key_dims}"
+                f"action_model_key_dims={self._action_model_key_dims}"
             )
 
         out = self._transform.unapply(data)

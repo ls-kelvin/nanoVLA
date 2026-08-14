@@ -18,19 +18,14 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb,
 )
 
+from starVLA.fa4_patch import resolve_attn_implementation
+
 from .joint_attention import build_dense_flash_meta, build_expert_block_mask, build_suffix_attention_mask
 from .qwen2_expert import build_qwen2_expert
 
 
 def _resolve_attn_implementation(attn_implementation: str) -> str:
-    if attn_implementation != "flash_attention_2":
-        return attn_implementation
-    try:
-        import flash_attn  # noqa: F401
-    except ImportError:
-        print("[WARNING] flash_attn not installed, falling back to sdpa for QwenPI_v5 prefix")
-        return "sdpa"
-    return attn_implementation
+    return resolve_attn_implementation(attn_implementation)
 
 
 class QwenVLWithExpert(nn.Module):
@@ -260,13 +255,18 @@ class QwenVLWithExpert(nn.Module):
         suffix_att_masks: torch.Tensor,
         ada_cond: Optional[torch.Tensor] = None,
         attention_implementation: Optional[str] = None,
-    ) -> torch.Tensor:
+        return_suffix_kvs: bool = False,
+    ):
         """Run the action expert over ``[prefix_kv, suffix]``. Returns suffix hidden.
 
         ``attention_implementation`` overrides ``self.expert_attention`` for this
         call so independent streams (e.g. action vs. latent) sharing one expert
         can pick different backends (see ``joint_attention.py`` for ``"flash"``,
         which only fits a fully bidirectional suffix with no block-causal mask).
+
+        When ``return_suffix_kvs`` is true, also returns per-layer suffix K/V
+        (RoPE'd, same layout as prefix K/V) so a later action-only pass can
+        concatenate them onto the prefix cache.
         """
         if len(prefix_kvs) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} prefix K/V pairs, got {len(prefix_kvs)}.")
@@ -311,9 +311,10 @@ class QwenVLWithExpert(nn.Module):
 
         hidden_states = suffix_embs.float()
         ada_cond = ada_cond.float() if ada_cond is not None else None
+        suffix_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx, expert_layer in enumerate(self.qwen_expert.layers):
             prefix_key, prefix_value = prefix_kvs[layer_idx]
-            hidden_states = expert_layer(
+            layer_out = expert_layer(
                 hidden_states,
                 prefix_key=prefix_key.float(),
                 prefix_value=prefix_value.float(),
@@ -323,5 +324,14 @@ class QwenVLWithExpert(nn.Module):
                 flash_meta=flash_meta,
                 ada_cond=ada_cond,
                 attention_implementation=attention_implementation,
+                return_suffix_kv=return_suffix_kvs,
             )
-        return self.qwen_expert.apply_final_norm(hidden_states, ada_cond)
+            if return_suffix_kvs:
+                hidden_states, suffix_key, suffix_value = layer_out
+                suffix_kvs.append((suffix_key, suffix_value))
+            else:
+                hidden_states = layer_out
+        hidden_states = self.qwen_expert.apply_final_norm(hidden_states, ada_cond)
+        if return_suffix_kvs:
+            return hidden_states, suffix_kvs
+        return hidden_states

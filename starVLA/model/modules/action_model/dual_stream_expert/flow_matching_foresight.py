@@ -3,18 +3,22 @@
 """Joint foresight tokens on top of ``DualStreamFlowMatchingWM``.
 
 Replaces the independent latent flow-matching branch with InternVLA-style
-learnable tokens that share one expert forward with state + noisy actions:
+learnable tokens. State and learnable tokens are encoded once (batch ``B``);
+their per-layer K/V are concatenated onto the VLM prefix cache and tiled for
+action flow-matching:
 
-  joint suffix: [state(1), learnable(N), action_time(chunk)]  (pi0 block-causal)
-  latent-only:  [learnable(N)]                                (fully bidirectional)
+  pass 1: [state(1), learnable(N)]     pi0 block-causal, no AdaRMSNorm FiLM
+  pass 2: [action_time(chunk)]         attends to [prefix | state | learnable]
+  latent-only: [learnable(N)]          fully bidirectional, no FiLM, no repeats
+
+State/latent are unmodulated (plain RMSNorm), not AdaRMSNorm at t=0.
+Pass 1 has two attention blocks, so it cannot use flash. Pass 2 is a single
+bidirectional action block and defaults to ``action_denoise_attention=flash``.
 
 Latent readout is switchable via ``framework.latent_action.loss_type``:
 
   - ``embedding``: project learnable hiddens to Sharla embeddings, MSE
   - ``soft_kl``:   project to codebook logits, KL(teacher soft weights || student)
-
-Latent loss in joint mode uses only the first ``B`` rows under
-``repeated_diffusion_steps``; latent-only mode never repeats.
 """
 
 from typing import Optional
@@ -55,14 +59,18 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
                 f"got {loss_type!r}."
             )
         self.foresight_latent_loss_type = loss_type
+        self.action_denoise_attention = str(action_cfg.get("action_denoise_attention", "flash"))
+        if self.action_denoise_attention not in {"flex", "sdpa", "flash"}:
+            raise ValueError(
+                "framework.action_model.action_denoise_attention must be "
+                f"'flex', 'sdpa', or 'flash', got {self.action_denoise_attention!r}."
+            )
 
         self.learnable_tokens = nn.Parameter(
             torch.zeros(self.num_learnable_tokens, self.proj_width)
         )
         nn.init.trunc_normal_(self.learnable_tokens, std=0.02)
         self.learnable_tokens_in_proj = nn.Linear(self.proj_width, self.proj_width)
-        # Fixed AdaRMSNorm condition for the latent-only foresight path (no time).
-        self.foresight_cond = nn.Parameter(torch.zeros(self.proj_width))
 
         self.learnable_to_latent_proj = None
         self.learnable_to_logits_proj = None
@@ -147,19 +155,29 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         denom = valid_mask.sum().clamp_min(1.0)
         return (kl_per_sample * valid_mask).sum() / denom
 
-    # -- joint suffix: [state, learnable, action_time] --------------------
-    def embed_suffix_foresight(self, state, noisy_actions, timestep):
-        """Three-block pi0 suffix used by the joint action+latent path."""
+    # -- joint suffixes: pass 1 [state, learnable], pass 2 [action] -------
+    def embed_suffix_state_latent(self, state: Tensor):
+        """State + learnable suffix. Two pi0 blocks (not flash-compatible); no time."""
         if state.ndim == 3:
             state = state.squeeze(1)
         bsize = state.shape[0]
         device = state.device
-        state = state.float()
+        state_emb = self.state_proj(state.float())
+        lt_emb = self._embed_learnable_tokens(bsize, device)
+        embs = torch.cat([state_emb[:, None], lt_emb], dim=1)
+        suffix_len = 1 + self.num_learnable_tokens
+        pad_masks = torch.ones((bsize, suffix_len), device=device, dtype=torch.bool)
+        att_masks = torch.zeros((bsize, suffix_len), device=device, dtype=torch.bool)
+        att_masks[:, 0] = True
+        att_masks[:, 1] = True
+        return embs, pad_masks, att_masks
+
+    def embed_suffix_action(self, noisy_actions: Tensor, timestep: Tensor):
+        """Action-only suffix with time fused in the embedding (and AdaRMSNorm)."""
         noisy_actions = noisy_actions.float()
         timestep = timestep.float()
-
-        state_emb = self.state_proj(state)
-        lt_emb = self._embed_learnable_tokens(bsize, device)
+        bsize = noisy_actions.shape[0]
+        device = noisy_actions.device
 
         time_emb = create_sinusoidal_pos_embedding(
             timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device
@@ -170,18 +188,47 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         action_time_emb = torch.cat([action_emb, time_emb_rep], dim=-1)
         action_time_emb = F.silu(self.action_time_mlp_in(action_time_emb))
         action_time_emb = self.action_time_mlp_out(action_time_emb)
-        action_time_dim = action_time_emb.shape[1]
-        num_lt = self.num_learnable_tokens
-
-        embs = torch.cat([state_emb[:, None], lt_emb, action_time_emb], dim=1)
-        suffix_len = 1 + num_lt + action_time_dim
-        pad_masks = torch.ones((bsize, suffix_len), device=device, dtype=torch.bool)
-        # Blocks: state | learnable | action (first token of each opens a block).
-        att_masks = torch.zeros((bsize, suffix_len), device=device, dtype=torch.bool)
+        action_len = action_time_emb.shape[1]
+        pad_masks = torch.ones((bsize, action_len), device=device, dtype=torch.bool)
+        att_masks = torch.zeros((bsize, action_len), device=device, dtype=torch.bool)
         att_masks[:, 0] = True
-        att_masks[:, 1] = True
-        att_masks[:, 1 + num_lt] = True
-        return time_emb, embs, pad_masks, att_masks
+        return time_emb, action_time_emb, pad_masks, att_masks
+
+    @staticmethod
+    def _cat_kvs(prefix_kvs, suffix_kvs):
+        if len(prefix_kvs) != len(suffix_kvs):
+            raise ValueError(
+                f"prefix K/V layers ({len(prefix_kvs)}) != suffix K/V layers ({len(suffix_kvs)})."
+            )
+        return [
+            (torch.cat([pk, sk], dim=2), torch.cat([pv, sv], dim=2))
+            for (pk, pv), (sk, sv) in zip(prefix_kvs, suffix_kvs)
+        ]
+
+    @staticmethod
+    def _repeat_kvs(kvs, repeats: int):
+        if repeats <= 1:
+            return kvs
+        return [(key.repeat(repeats, 1, 1, 1), value.repeat(repeats, 1, 1, 1)) for key, value in kvs]
+
+    @staticmethod
+    def _expand_prefix_dict(prefix: dict, repeats: int) -> dict:
+        if repeats <= 1:
+            return prefix
+        return {
+            **prefix,
+            "position_ids": prefix["position_ids"].repeat(1, repeats, 1),
+            "prompt_pad_masks": prefix["prompt_pad_masks"].repeat(repeats, 1),
+        }
+
+    def _resolve_block_causal_attention(self, attention_implementation: Optional[str]) -> str:
+        """Pass 1 is ``state | latent`` block-causal; flash is not valid."""
+        impl = attention_implementation or self.qwenvl_with_expert.expert_attention
+        if impl == "flash":
+            raise ValueError(
+                "state/learnable suffix is pi0 block-causal (two blocks) and cannot use flash."
+            )
+        return impl
 
     # -- latent-only suffix: [learnable(N)] -------------------------------
     def embed_suffix_learnable_only(self, bsize: int, device: torch.device):
@@ -195,31 +242,74 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         return lt_emb, pad_masks, att_masks
 
     # -- expert runners ---------------------------------------------------
-    def run_expert_foresight(
+    def encode_state_latent_kv(
         self,
         prefix: dict,
         prefix_kvs,
         state: Tensor,
-        x_t: Tensor,
-        timestep: Tensor,
         attention_implementation: Optional[str] = None,
-    ) -> Tensor:
-        """Joint expert forward; returns full suffix hidden states."""
-        time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_foresight(
-            state, x_t, timestep
-        )
+    ):
+        """Pass 1: encode ``[state | learnable]`` once. Returns learnable hidden + cache.
+
+        Cache is VLM prefix K/V concatenated with state/learnable suffix K/V, plus
+        the matching pad mask, so pass 2 can treat them as extra prefix tokens.
+        No AdaRMSNorm FiLM (unmodulated RMSNorm, not t=0). Attention is
+        block-causal, so flash is rejected.
+        """
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_state_latent(state)
         suffix_position_ids = self._build_suffix_position_ids(
             prefix["position_ids"], prefix["prompt_pad_masks"], suffix_pad_masks
         )
-        return self.qwenvl_with_expert.run_expert(
+        suffix_out, suffix_kvs = self.qwenvl_with_expert.run_expert(
             suffix_embs=suffix_embs,
             prefix_kvs=prefix_kvs,
             suffix_position_ids=suffix_position_ids,
             prefix_pad_masks=prefix["prompt_pad_masks"],
             suffix_pad_masks=suffix_pad_masks,
             suffix_att_masks=suffix_att_masks,
+            ada_cond=None,
+            attention_implementation=self._resolve_block_causal_attention(attention_implementation),
+            return_suffix_kvs=True,
+        )
+        learnable_out = suffix_out[:, 1 : 1 + self.num_learnable_tokens]
+        combined_kvs = self._cat_kvs(prefix_kvs, suffix_kvs)
+        combined_pad = torch.cat([prefix["prompt_pad_masks"], suffix_pad_masks], dim=1)
+        return learnable_out, combined_kvs, combined_pad
+
+    def run_expert_action(
+        self,
+        prefix: dict,
+        prefix_kvs,
+        prefix_pad_masks: Tensor,
+        x_t: Tensor,
+        timestep: Tensor,
+        attention_implementation: Optional[str] = None,
+    ) -> Tensor:
+        """Pass 2: action tokens attending to ``[prefix | state | learnable]`` K/V.
+
+        ``prefix`` still holds the original VLM ``position_ids`` / prompt pads so
+        RoPE continues after the state+learnable block. ``prefix_kvs`` /
+        ``prefix_pad_masks`` are the concatenated cache from pass 1.
+
+        Attention defaults to ``action_denoise_attention`` (flash): the action
+        suffix is a single bidirectional block, unlike pass 1.
+        """
+        time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_action(
+            x_t, timestep
+        )
+        suffix_position_ids = self._build_suffix_position_ids(
+            prefix["position_ids"], prefix["prompt_pad_masks"], suffix_pad_masks
+        )
+        suffix_position_ids = suffix_position_ids + (1 + self.num_learnable_tokens)
+        return self.qwenvl_with_expert.run_expert(
+            suffix_embs=suffix_embs,
+            prefix_kvs=prefix_kvs,
+            suffix_position_ids=suffix_position_ids,
+            prefix_pad_masks=prefix_pad_masks,
+            suffix_pad_masks=suffix_pad_masks,
+            suffix_att_masks=suffix_att_masks,
             ada_cond=time_embs if self.adanorm_time else None,
-            attention_implementation=attention_implementation,
+            attention_implementation=attention_implementation or self.action_denoise_attention,
         )
 
     def run_expert_learnable_only(
@@ -237,9 +327,6 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         suffix_position_ids = self._build_suffix_position_ids(
             prefix["position_ids"], prefix["prompt_pad_masks"], suffix_pad_masks
         )
-        ada_cond = None
-        if self.adanorm_time:
-            ada_cond = self.foresight_cond.float()[None].expand(bsize, -1)
         return self.qwenvl_with_expert.run_expert(
             suffix_embs=suffix_embs,
             prefix_kvs=prefix_kvs,
@@ -247,16 +334,9 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
             prefix_pad_masks=prefix["prompt_pad_masks"],
             suffix_pad_masks=suffix_pad_masks,
             suffix_att_masks=suffix_att_masks,
-            ada_cond=ada_cond,
+            ada_cond=None,
             attention_implementation=attention_implementation or self.latent_expert_attention,
         )
-
-    @staticmethod
-    def _split_foresight_outputs(suffix_out: Tensor, num_lt: int, action_len: int):
-        """Slice ``[state | learnable | action]`` hidden states."""
-        learnable_out = suffix_out[:, 1 : 1 + num_lt]
-        action_out = suffix_out[:, 1 + num_lt : 1 + num_lt + action_len]
-        return learnable_out, action_out
 
     # -- training: joint --------------------------------------------------
     def flow_matching_loss_joint_foresight(
@@ -273,9 +353,9 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         attention_implementation: Optional[str] = None,
         latent_valid_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
-        """One joint expert pass -> ``(action_loss, latent_loss)``.
+        """State/latent once at ``B``, then action flow-matching at ``B*r``.
 
-        Latent loss uses only the first ``B`` rows when ``repeats > 1``.
+        Learnable readout does not see action tokens, so it is not repeated.
         """
         actions = actions.float()
         action_mask = action_mask.float()
@@ -298,16 +378,24 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
             )
 
         with torch.autocast("cuda", dtype=torch.float32):
+            if state is None:
+                state = torch.zeros(
+                    bsize, self.max_state_dim, device=device, dtype=torch.float32
+                )
+            elif state.ndim == 3:
+                state = state.squeeze(1)
+            if state.shape[0] != bsize:
+                raise ValueError(
+                    f"state batch {state.shape[0]} must match actions batch {bsize} before repeats."
+                )
+
+            learnable_out, combined_kvs, combined_pad = self.encode_state_latent_kv(
+                prefix, prefix_kvs, state, attention_implementation=attention_implementation
+            )
+
             if repeats > 1:
                 actions = actions.repeat(repeats, 1, 1)
                 action_mask = action_mask.repeat(repeats, 1, 1)
-                if state is not None:
-                    state = state.repeat(repeats, 1)
-
-            if state is None:
-                state = torch.zeros(
-                    actions.shape[0], self.max_state_dim, device=device, dtype=torch.float32
-                )
 
             if noise is None:
                 noise = torch.randn(actions.shape, device=device, dtype=torch.float32)
@@ -322,17 +410,14 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
             x_t = time_expanded * noise + (1 - time_expanded) * actions
             u_t = noise - actions
 
-            expert_prefix, expert_kvs = self._expand_prefix_for_repeats(prefix, prefix_kvs, repeats)
-            suffix_out = self.run_expert_foresight(
+            expert_prefix = self._expand_prefix_dict(prefix, repeats)
+            action_out = self.run_expert_action(
                 expert_prefix,
-                expert_kvs,
-                state,
+                self._repeat_kvs(combined_kvs, repeats),
+                combined_pad.repeat(repeats, 1) if repeats > 1 else combined_pad,
                 x_t,
                 time,
                 attention_implementation=attention_implementation,
-            )
-            learnable_out, action_out = self._split_foresight_outputs(
-                suffix_out, self.num_learnable_tokens, x_t.shape[1]
             )
 
             v_t = self.action_out_proj(action_out).float()
@@ -341,11 +426,8 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
             else:
                 losses = F.mse_loss(u_t, v_t, reduction="none")
             action_loss = (losses * action_mask).sum() / action_mask.sum().clamp_min(1.0)
-
-            # Causal: learnable tokens never see the action block, so repeats are
-            # identical; only the original B rows contribute to latent loss.
             latent_loss = self._latent_loss_from_learnable(
-                learnable_out[:bsize], latent_targets, valid_mask=latent_valid_mask
+                learnable_out, latent_targets, valid_mask=latent_valid_mask
             )
 
         return action_loss, latent_loss
@@ -388,7 +470,7 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         noise: Optional[Tensor] = None,
         attention_implementation: Optional[str] = None,
     ) -> Tensor:
-        """Euler sampling with foresight tokens present (matches joint training)."""
+        """Euler sampling; state/learnable K/V are encoded once, then reused."""
         bsize = state.shape[0]
         device = state.device
 
@@ -402,21 +484,21 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         prefix, _, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens=0)
 
         with torch.autocast("cuda", dtype=torch.float32):
+            _, combined_kvs, combined_pad = self.encode_state_latent_kv(
+                prefix, prefix_kvs, state, attention_implementation=attention_implementation
+            )
             dt = -1.0 / self.num_steps
             x_t = noise
             time = torch.tensor(1.0, dtype=torch.float32, device=device)
             while time >= -dt / 2:
                 expanded_time = time.expand(bsize)
-                suffix_out = self.run_expert_foresight(
+                action_out = self.run_expert_action(
                     prefix,
-                    prefix_kvs,
-                    state,
+                    combined_kvs,
+                    combined_pad,
                     x_t,
                     expanded_time,
                     attention_implementation=attention_implementation,
-                )
-                _, action_out = self._split_foresight_outputs(
-                    suffix_out, self.num_learnable_tokens, x_t.shape[1]
                 )
                 v_t = self.action_out_proj(action_out).float()
                 x_t = x_t + dt * v_t
