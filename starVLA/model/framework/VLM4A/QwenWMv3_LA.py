@@ -2,8 +2,8 @@
 # Licensed under the MIT License.
 """QwenWMv3_LA: QwenWMv2_LA with InternVLA-style learnable-token foresight.
 
-Replaces the independent latent flow-matching branch with learnable tokens.
-State and latent are encoded once; action flow-matching reuses their K/V.
+Replaces the independent latent flow-matching branch with joint learnable
+tokens that share one expert forward with state + noisy actions.
 
 Latent supervision is switchable via ``framework.latent_action.loss_type``:
 
@@ -26,6 +26,9 @@ logger = initialize_overwatch(__name__)
 @FRAMEWORK_REGISTRY.register("QwenWMv3_LA")
 class Qwen_WMv3_LA(Qwen_WMv2_LA):
     """v5 prefix-KV expert + joint learnable-token foresight for Sharla latents."""
+
+    _framework_name = "QwenWMv3_LA"
+    _action_model_cls = DualStreamFlowMatchingForesight
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         super().__init__(config=config, **kwargs)
@@ -55,12 +58,13 @@ class Qwen_WMv3_LA(Qwen_WMv2_LA):
                         f"encoder codebook_size={encoder_size}."
                     )
             logger.info(
-                "QwenWMv3_LA foresight latent loss_type=soft_kl (codebook_size=%d, cached=%s)",
+                "%s foresight latent loss_type=soft_kl (codebook_size=%d, cached=%s)",
+                self._framework_name,
                 self.codebook_size,
                 self.use_cached_soft_distribution,
             )
         else:
-            logger.info("QwenWMv3_LA foresight latent loss_type=embedding")
+            logger.info("%s foresight latent loss_type=embedding", self._framework_name)
 
     def _ensure_latent_action_defaults(self) -> None:
         from omegaconf import OmegaConf
@@ -99,19 +103,19 @@ class Qwen_WMv3_LA(Qwen_WMv2_LA):
             backend = str(self.config.framework.latent_action.get("backend", "sharla")).lower()
             if backend != "sharla":
                 raise ValueError(
-                    "QwenWMv3_LA soft_kl currently requires latent_action.backend='sharla', "
+                    f"{self._framework_name} soft_kl currently requires latent_action.backend='sharla', "
                     f"got {backend!r}."
                 )
         return loss_type
 
-    def _build_action_model(self) -> DualStreamFlowMatchingForesight:
+    def _build_action_model(self):
         """Same latent_dim wiring as WMv2, but build the foresight action model."""
         self._ensure_latent_action_defaults()
         self.latent_action_cfg = self.config.framework.latent_action
         latent_dim = self.latent_action_cfg.get("latent_dim", None)
         if latent_dim is None:
             raise ValueError(
-                "framework.latent_action.latent_dim is required for QwenWMv3_LA (e.g. the Sharla "
+                f"framework.latent_action.latent_dim is required for {self._framework_name} (e.g. the Sharla "
                 "codebook_dim). It cannot be auto-inferred from the encoder here because that would "
                 "require constructing the action model (which owns the VLM) twice."
             )
@@ -124,7 +128,7 @@ class Qwen_WMv3_LA(Qwen_WMv2_LA):
                     "framework.latent_action.codebook_size is required when loss_type='soft_kl'."
                 )
             self.config.framework.action_model.codebook_size = int(codebook_size)
-        return DualStreamFlowMatchingForesight(global_config=self.config)
+        return self._action_model_cls(global_config=self.config)
 
     def _load_latent_norm_stats(self, latent_action_dim: int) -> None:
         """Skip embedding norm stats when foresight uses soft_kl (no embedding targets)."""

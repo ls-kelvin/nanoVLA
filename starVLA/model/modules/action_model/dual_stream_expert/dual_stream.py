@@ -18,14 +18,19 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb,
 )
 
-from starVLA.fa4_patch import resolve_attn_implementation
-
 from .joint_attention import build_dense_flash_meta, build_expert_block_mask, build_suffix_attention_mask
 from .qwen2_expert import build_qwen2_expert
 
 
 def _resolve_attn_implementation(attn_implementation: str) -> str:
-    return resolve_attn_implementation(attn_implementation)
+    if attn_implementation != "flash_attention_2":
+        return attn_implementation
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        print("[WARNING] flash_attn not installed, falling back to sdpa for QwenPI_v5 prefix")
+        return "sdpa"
+    return attn_implementation
 
 
 class QwenVLWithExpert(nn.Module):

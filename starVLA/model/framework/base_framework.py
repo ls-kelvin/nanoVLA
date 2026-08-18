@@ -74,6 +74,7 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
     if framework_id not in {
         "QwenPI_v3_LA", "QwenPI_v4_LA", "QwenPI_v5_LA", "QwenMetaQuery_LA", "QwenWM_LA", "QwenWMv2_LA",
         "QwenWMv3_LA",
+        "QwenWMv31_LA",
     }:
         constructor_kwargs.pop("load_latent_action_encoder", None)
     return model_class(cfg, **constructor_kwargs)

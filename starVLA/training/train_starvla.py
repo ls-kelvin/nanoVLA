@@ -83,6 +83,7 @@ def _supports_dual_vla_dataloaders(cfg) -> bool:
         "QwenWM_LA",
         "QwenWMv2_LA",
         "QwenWMv3_LA",
+        "QwenWMv31_LA",
     }
 
 
@@ -173,7 +174,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
         raise ValueError(
             "trainer.use_dual_vla_dataloaders=true is only supported for "
             "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA', 'QwenPI_v4_LA', 'QwenPI_v5_LA', "
-            "'QwenWM_LA', 'QwenWMv2_LA', 'QwenWMv3_LA'}."
+            "'QwenWM_LA', 'QwenWMv2_LA', 'QwenWMv3_LA', 'QwenWMv31_LA'}."
         )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
