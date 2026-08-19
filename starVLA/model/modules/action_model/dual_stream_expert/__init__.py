@@ -5,11 +5,13 @@
 from .flow_matching import DualStreamFlowMatching
 from .flow_matching_foresight import DualStreamFlowMatchingForesight
 from .flow_matching_foresight_v31 import DualStreamFlowMatchingForesightV31
+from .flow_matching_foresight_v32 import DualStreamFlowMatchingForesightV32
 from .flow_matching_wm import DualStreamFlowMatchingWM
 
 __all__ = [
     "DualStreamFlowMatching",
     "DualStreamFlowMatchingForesight",
     "DualStreamFlowMatchingForesightV31",
+    "DualStreamFlowMatchingForesightV32",
     "DualStreamFlowMatchingWM",
 ]
