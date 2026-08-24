@@ -1,18 +1,18 @@
-run_id: qwenwmv3_hdf5_aloha_clean_random_la_sharla_a2a_eef_foresight_soft_kl
+run_id: qwenwmv33_hdf5_aloha_clean_random_la_sharla0818_eef_foresight_soft_kl
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenWMv3_LA foresight + soft_kl (PI_v4/v5-style codebook distribution KL).
-# Same joint learnable-token suffix as the embedding foresight config, but the
-# readout head predicts codebook logits and is supervised with
-# KL(teacher soft weights || student) instead of embedding MSE.
+# QwenWMv33_LA foresight + soft_kl on the 0818_align_sqrt_weights_stopgrad
+# Sharla tokenizer. Query-first two-pass: [query] (no FiLM) encoded once, its
+# detached K/V prepended to the [state | action] block-causal pass, so the
+# action loss never backpropagates into the query tokens.
 # Requires a soft_kl episode cache (scripts/cache_sharla_soft_kl_episodes.sh);
 # embedding norm_stats are not used in this mode.
 framework:
-  name: QwenWMv3_LA
+  name: QwenWMv33_LA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
@@ -49,8 +49,9 @@ framework:
     loss_type: fm
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
-    # Must equal frame_pairs * query_num (stride/horizon 8/32 => 4 pairs * 8 = 32).
+    # Must equal frame_pairs * query_num (stride/horizon 6/24 => 4 pairs * 8 = 32).
     num_learnable_tokens: 32
+    # Pass 2 is [state | action] block-causal (two blocks) -> no flash.
     action_expert_attention: sdpa
     latent_expert_attention: sdpa
     action_dim_mask: null
@@ -88,6 +89,10 @@ datasets:
     data_root_dir: /mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
     latent_data_mix: hdf5_arx_clean_random_eef
+    # Extra validation sets scored separately at each eval_interval, logged as
+    # validation/<tag>/mse_score (here: held-out aloha randomized domain).
+    eval_data_mixes:
+      aloha_random: hdf5_aloha_random_eef
     hdf5_action_type: eef
     action_type: abs_eef
     action_mode: abs
@@ -136,10 +141,11 @@ trainer:
     weight_decay: 1.0e-08
 
 # Offline soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
+# output_dir must stay in sync with datasets.vla_data.latent_action.episode_cache_dir.
 soft_kl_cache:
-  output_dir: .cache/latent_cache/sharla_soft_kl
+  output_dir: .cache/latent_cache/sharla0818_soft_kl
   batch_size: 256
-  num_workers: 128
-  num_gpus: 8
+  num_workers: 12
+  num_gpus: 2
   use_bf16: true
   overwrite: false

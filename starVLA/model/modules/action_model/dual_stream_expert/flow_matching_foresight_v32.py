@@ -181,7 +181,11 @@ class DualStreamFlowMatchingForesightV32(DualStreamFlowMatchingForesight):
         attention_implementation: Optional[str] = None,
         latent_valid_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Learnable-token readout over ``repeats`` independently sampled-t copies."""
+        """Single learnable-token readout with one independently sampled timestep.
+
+        ``repeated_diffusion_steps`` is used by the joint action path, but the
+        latent-only path intentionally never repeats.
+        """
         latent_targets = latent_targets.float()
         self._check_latent_token_count(latent_targets)
 
@@ -190,9 +194,9 @@ class DualStreamFlowMatchingForesightV32(DualStreamFlowMatchingForesight):
                 f"latent_targets batch {latent_targets.shape[0]} must match prefix batch "
                 f"{prefix['prompt_pad_masks'].shape[0]}."
             )
-        repeats = int(self.repeated_diffusion_steps if num_repeats is None else num_repeats)
-        if repeats < 1:
-            raise ValueError(f"num_repeats must be >= 1, got {repeats}.")
+        # Keep the argument for call-site compatibility, but latent-only must
+        # remain a single pass regardless of the action repeat setting.
+        repeats = 1
 
         with torch.autocast("cuda", dtype=torch.float32):
             if repeats > 1:

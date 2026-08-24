@@ -1,18 +1,23 @@
-run_id: qwenwmv3_hdf5_aloha_clean_random_la_sharla_a2a_eef_foresight_soft_kl
+run_id: qwenwmv34_hdf5_aloha_clean_random_la_sharla0818_eef_foresight_soft_kl
 run_root_dir: results/Checkpoints2
 seed: 42
 wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenWMv3_LA foresight + soft_kl (PI_v4/v5-style codebook distribution KL).
-# Same joint learnable-token suffix as the embedding foresight config, but the
-# readout head predicts codebook logits and is supervised with
-# KL(teacher soft weights || student) instead of embedding MSE.
+# QwenWMv34_LA foresight + soft_kl on the 0818_align_sqrt_weights_stopgrad
+# Sharla tokenizer. Like WMv33 (query-first, no FiLM on query), plus
+# ground-truth codebook latent tokens inserted after query: the action pass is
+# [latent | state | action] block-causal and never attends to query; state and
+# action attend to the latent tokens (soft distribution @ row-normalized
+# Sharla codebook -> latent_in_proj). With latent_drop_prob > 0, dropped
+# samples run a
+# [state | action] pass that cannot see latent at all (CFG-style dropout).
+# Inference is two-stage (query predicts latents).
 # Requires a soft_kl episode cache (scripts/cache_sharla_soft_kl_episodes.sh);
 # embedding norm_stats are not used in this mode.
 framework:
-  name: QwenWMv3_LA
+  name: QwenWMv34_LA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
@@ -26,7 +31,7 @@ framework:
     loss_type: soft_kl
     train_latent: true
     train_action: true
-    latent_loss_weight: 0.1
+    latent_loss_weight: 1.0
     action_loss_weight: 1.0
     detach_vl_embs_for_action_head: false
     action_train_robot_types: ["aloha-agilex"]
@@ -49,8 +54,12 @@ framework:
     loss_type: fm
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
-    # Must equal frame_pairs * query_num (stride/horizon 8/32 => 4 pairs * 8 = 32).
+    # Must equal frame_pairs * query_num (stride/horizon 6/24 => 4 pairs * 8 = 32).
     num_learnable_tokens: 32
+    # Per-sample probability of dropping latent tokens (state/action run a
+    # separate [state | action] pass and cannot see them). 0 disables.
+    latent_drop_prob: 0.5
+    # Action pass is [latent | state | action] block-causal (three blocks) -> no flash.
     action_expert_attention: sdpa
     latent_expert_attention: sdpa
     action_dim_mask: null
@@ -88,6 +97,10 @@ datasets:
     data_root_dir: /mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
     data_mix: hdf5_aloha_clean_eef
     latent_data_mix: hdf5_arx_clean_random_eef
+    # Extra validation sets scored separately at each eval_interval, logged as
+    # validation/<tag>/mse_score (here: held-out aloha randomized domain).
+    eval_data_mixes:
+      aloha_random: hdf5_aloha_random_eef
     hdf5_action_type: eef
     action_type: abs_eef
     action_mode: abs
@@ -136,10 +149,11 @@ trainer:
     weight_decay: 1.0e-08
 
 # Offline soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
+# output_dir must stay in sync with datasets.vla_data.latent_action.episode_cache_dir.
 soft_kl_cache:
-  output_dir: .cache/latent_cache/sharla_soft_kl
+  output_dir: .cache/latent_cache/sharla0818_soft_kl
   batch_size: 256
-  num_workers: 128
-  num_gpus: 8
+  num_workers: 12
+  num_gpus: 2
   use_bf16: true
   overwrite: false

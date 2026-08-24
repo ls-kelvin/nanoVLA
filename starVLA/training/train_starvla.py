@@ -74,17 +74,23 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
     return str(cfg.framework.name) == "QwenMetaQuery_LA"
 
 
+DUAL_VLA_DATALOADER_FRAMEWORKS = {
+    "QwenMetaQuery_LA",
+    "QwenPI_v3_LA",
+    "QwenPI_v4_LA",
+    "QwenPI_v5_LA",
+    "QwenWM_LA",
+    "QwenWMv2_LA",
+    "QwenWMv3_LA",
+    "QwenWMv31_LA",
+    "QwenWMv32_LA",
+    "QwenWMv33_LA",
+    "QwenWMv34_LA",
+}
+
+
 def _supports_dual_vla_dataloaders(cfg) -> bool:
-    return str(cfg.framework.name) in {
-        "QwenMetaQuery_LA",
-        "QwenPI_v3_LA",
-        "QwenPI_v4_LA",
-        "QwenPI_v5_LA",
-        "QwenWM_LA",
-        "QwenWMv2_LA",
-        "QwenWMv3_LA",
-        "QwenWMv31_LA",
-    }
+    return str(cfg.framework.name) in DUAL_VLA_DATALOADER_FRAMEWORKS
 
 
 def _dataloader_loss_modes(cfg) -> dict:
@@ -120,8 +126,12 @@ def _make_action_dataloader_cfg(cfg):
     return action_cfg
 
 
-def _make_eval_dataloader_cfg(cfg, action_cfg=None):
-    """Build eval dataloader config: action/state for MSE, no la_frames packing."""
+def _make_eval_dataloader_cfg(cfg, action_cfg=None, data_mix: str | None = None):
+    """Build eval dataloader config: action/state for MSE, no la_frames packing.
+
+    `data_mix` optionally overrides datasets.vla_data.data_mix so extra eval
+    sets (e.g. the aloha randomized domain) can be scored separately.
+    """
     base = action_cfg if action_cfg is not None else cfg
     base_cfg = base.unwrap() if isinstance(base, AccessTrackedConfig) else base
     eval_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
@@ -132,6 +142,8 @@ def _make_eval_dataloader_cfg(cfg, action_cfg=None):
     latent_action_cfg.enabled = False
     latent_action_cfg.load_action = True
     latent_action_cfg.load_state = True
+    if data_mix is not None and str(data_mix).strip() != "":
+        eval_cfg.datasets.vla_data.data_mix = str(data_mix).strip()
     return eval_cfg
 
 
@@ -165,7 +177,24 @@ def _get_vla_dataloader_batch_size(cfg, dataloader_name: str) -> int | None:
     return int(override_batch_size)
 
 
-def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
+def _get_extra_eval_data_mixes(cfg) -> dict[str, str]:
+    """Read optional datasets.vla_data.eval_data_mixes ({metric_tag: data_mix})."""
+    vla_data_cfg = cfg.datasets.vla_data
+    extra_mixes = vla_data_cfg.get("eval_data_mixes", None)
+    if extra_mixes is None:
+        return {}
+    if isinstance(extra_mixes, str):
+        extra_mixes = {Path(extra_mixes).name: extra_mixes}
+    resolved = {}
+    for tag, mix in dict(extra_mixes).items():
+        tag = str(tag).strip()
+        mix = str(mix).strip()
+        if tag and mix:
+            resolved[tag] = mix
+    return resolved
+
+
+def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], dict]:
     """Prepare VLA training data."""
     data_cfg = cfg
     is_metaquery_la = _is_qwen_metaquery_la_training(cfg)
@@ -173,8 +202,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     if use_dual_dataloaders and not _supports_dual_vla_dataloaders(cfg):
         raise ValueError(
             "trainer.use_dual_vla_dataloaders=true is only supported for "
-            "framework.name in {'QwenMetaQuery_LA', 'QwenPI_v3_LA', 'QwenPI_v4_LA', 'QwenPI_v5_LA', "
-            "'QwenWM_LA', 'QwenWMv2_LA', 'QwenWMv3_LA', 'QwenWMv31_LA'}."
+            f"framework.name in {sorted(DUAL_VLA_DATALOADER_FRAMEWORKS)}."
         )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
@@ -219,9 +247,24 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
         seed=cfg.seed,
     )
 
+    extra_eval_dataloaders = {}
+    for eval_tag, eval_data_mix in _get_extra_eval_data_mixes(cfg).items():
+        extra_eval_cfg = _make_eval_dataloader_cfg(cfg, action_cfg=action_cfg, data_mix=eval_data_mix)
+        logger.info(
+            "Creating extra VLA eval Dataset `%s` with Mixture `%s`",
+            eval_tag,
+            eval_data_mix,
+        )
+        extra_eval_dataloaders[eval_tag] = build_vla_eval_dataloader(
+            cfg=extra_eval_cfg,
+            num_samples=getattr(cfg.trainer, "eval_num_samples", None),
+            batch_size=getattr(cfg.trainer, "eval_batch_size", None),
+            seed=cfg.seed,
+        )
+
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader
+    return vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader, extra_eval_dataloaders
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -264,12 +307,14 @@ class VLATrainer(TrainerUtils):
         lr_scheduler,
         accelerator,
         vla_action_train_dataloader=None,
+        vla_extra_eval_dataloaders=None,
     ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
         self.vla_action_train_dataloader = vla_action_train_dataloader
         self.vla_eval_dataloader = vla_eval_dataloader
+        self.vla_extra_eval_dataloaders = dict(vla_extra_eval_dataloaders or {})
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -836,20 +881,71 @@ class VLATrainer(TrainerUtils):
         was_training = self.model.training
         self.model.eval()
 
-        total_squared_error = 0.0
-        total_elements = 0
-        total_samples = 0
-        total_batches = 0
         action_eval_robot_types = (
             model._get_action_train_robot_types()
             if hasattr(model, "_get_action_train_robot_types")
             else None
         )
 
+        eval_results = {}
+        try:
+            eval_results[""] = self._accumulate_action_mse(
+                self.vla_eval_dataloader, model, action_eval_robot_types
+            )
+            for eval_tag, eval_dataloader in self.vla_extra_eval_dataloaders.items():
+                eval_results[eval_tag] = self._accumulate_action_mse(
+                    eval_dataloader, model, action_eval_robot_types
+                )
+        finally:
+            if was_training:
+                self.model.train()
+
+        for eval_tag, (totals, eval_error) in eval_results.items():
+            eval_totals = torch.tensor(totals, dtype=torch.float64, device=self.accelerator.device)
+            eval_error_flag = torch.tensor(
+                1 if eval_error is not None else 0,
+                dtype=torch.int64,
+                device=self.accelerator.device,
+            )
+            if dist.is_initialized():
+                dist.all_reduce(eval_totals, op=dist.ReduceOp.SUM)
+                dist.all_reduce(eval_error_flag, op=dist.ReduceOp.MAX)
+
+            if self.accelerator.is_main_process:
+                global_squared_error, global_elements, global_samples, global_batches = eval_totals.tolist()
+                if eval_tag:
+                    mse_key = f"validation/{eval_tag}/mse_score"
+                    skipped_key = f"validation/{eval_tag}/skipped_action_mse"
+                    samples_key = f"validation/{eval_tag}/num_samples"
+                    batches_key = f"validation/{eval_tag}/num_batches"
+                else:
+                    mse_key = "mse_score"
+                    skipped_key = "validation/skipped_action_mse"
+                    samples_key = "validation/num_samples"
+                    batches_key = "validation/num_batches"
+                if int(eval_error_flag.item()) > 0:
+                    step_metrics[skipped_key] = 1
+                elif global_elements > 0:
+                    step_metrics[mse_key] = global_squared_error / global_elements
+                else:
+                    step_metrics[skipped_key] = 1
+                step_metrics[samples_key] = int(global_samples)
+                step_metrics[batches_key] = int(global_batches)
+
+        if dist.is_initialized():
+            dist.barrier()
+        return step_metrics
+
+    def _accumulate_action_mse(self, eval_dataloader, model, action_eval_robot_types):
+        """Run action prediction over one eval dataloader and accumulate MSE totals."""
+        total_squared_error = 0.0
+        total_elements = 0
+        total_samples = 0
+        total_batches = 0
         eval_error = None
         try:
             with torch.inference_mode():
-                for examples in self.vla_eval_dataloader:
+                for examples in eval_dataloader:
                     if action_eval_robot_types is not None:
                         examples = [
                             example
@@ -889,38 +985,7 @@ class VLATrainer(TrainerUtils):
             total_elements = 0
             total_samples = 0
             total_batches = 0
-        finally:
-            if was_training:
-                self.model.train()
-
-        eval_totals = torch.tensor(
-            [total_squared_error, total_elements, total_samples, total_batches],
-            dtype=torch.float64,
-            device=self.accelerator.device,
-        )
-        eval_error_flag = torch.tensor(
-            1 if eval_error is not None else 0,
-            dtype=torch.int64,
-            device=self.accelerator.device,
-        )
-        if dist.is_initialized():
-            dist.all_reduce(eval_totals, op=dist.ReduceOp.SUM)
-            dist.all_reduce(eval_error_flag, op=dist.ReduceOp.MAX)
-
-        if self.accelerator.is_main_process:
-            global_squared_error, global_elements, global_samples, global_batches = eval_totals.tolist()
-            if int(eval_error_flag.item()) > 0:
-                step_metrics["validation/skipped_action_mse"] = 1
-            elif global_elements > 0:
-                step_metrics["mse_score"] = global_squared_error / global_elements
-            else:
-                step_metrics["validation/skipped_action_mse"] = 1
-            step_metrics["validation/num_samples"] = int(global_samples)
-            step_metrics["validation/num_batches"] = int(global_batches)
-
-        if dist.is_initialized():
-            dist.barrier()
-        return step_metrics
+        return (total_squared_error, total_elements, total_samples, total_batches), eval_error
 
     def _log_training_config(self):
         """Record training config."""
@@ -1098,10 +1163,12 @@ def main(cfg) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader = prepare_data(
-        cfg=cfg,
-        accelerator=accelerator,
-        output_dir=output_dir,
+    vla_train_dataloader, vla_eval_dataloader, vla_action_train_dataloader, extra_eval_dataloaders = (
+        prepare_data(
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=output_dir,
+        )
     )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
@@ -1114,6 +1181,7 @@ def main(cfg) -> None:
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
         vla_action_train_dataloader=vla_action_train_dataloader,
+        vla_extra_eval_dataloaders=extra_eval_dataloaders,
     )
 
     trainer.prepare_training()
