@@ -16,8 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from starVLA.model.modules.wan import WanVideoBranch
-
 from .flow_matching_foresight_v32 import DualStreamFlowMatchingForesightV32
 from .joint_attention import create_sinusoidal_pos_embedding
 
@@ -65,8 +63,14 @@ class DualStreamFlowMatchingForesightV4(DualStreamFlowMatchingForesightV32):
         self.wm_query_in_proj = nn.Linear(self.proj_width, self.proj_width)
 
         self.wan_video = None
+        wan_enabled = bool(_cfg_get(wan_cfg, "enabled", True))
         wan_model_path = _optional_path(_cfg_get(wan_cfg, "wan_model_path", None))
-        if wan_model_path is not None:
+        # Training keeps enabled + wan_model_path. Action inference passes
+        # load_wan=False (from_pretrained default), which disables the branch
+        # before this constructor runs.
+        if wan_enabled and wan_model_path is not None:
+            from starVLA.model.modules.wan import WanVideoBranch
+
             self.wan_video = WanVideoBranch(
                 wan_model_path=wan_model_path,
                 query_width=self.proj_width,

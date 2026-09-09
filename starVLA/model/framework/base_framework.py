@@ -81,6 +81,8 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
         "QwenWMv4_LA",
     }:
         constructor_kwargs.pop("load_latent_action_encoder", None)
+    if framework_id != "QwenWMv4_LA":
+        constructor_kwargs.pop("load_wan", None)
     return model_class(cfg, **constructor_kwargs)
 
 
@@ -233,6 +235,8 @@ class baseframework(PreTrainedModel):
         Args:
             pretrained_checkpoint: Path to .pt file inside run/checkpoints directory.
             **kwargs: Extra constructor overrides passed to subclass.
+                ``load_wan`` defaults to False here (action inference does not
+                use Wan2.1). Training ``build_framework`` keeps the default True.
 
         Returns:
             baseframework: Instantiated model (left on CPU; caller decides device).
@@ -246,7 +250,8 @@ class baseframework(PreTrainedModel):
         config = dict_to_namespace(model_config)
         model_config = config
         model_config.trainer.pretrained_checkpoint = None
-        
+        kwargs.setdefault("load_wan", False)
+
         FrameworkModel = build_framework(cfg=model_config, **kwargs)
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats

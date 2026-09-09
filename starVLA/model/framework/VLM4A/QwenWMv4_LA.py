@@ -3,8 +3,9 @@
 """QwenWMv4_LA: QwenWMv32_LA with world-model queries feeding a Wan2.1 DiT.
 
 Joint suffix is ``[state | LA query | WM query | action]``. WM query hidden
-states condition ``WanVideoBranch``. There is no separate latent-action
-inference path; ``predict_action`` keeps both query groups in the suffix.
+states condition ``WanVideoBranch`` at train time. Action inference keeps both
+query groups in the suffix but does not load WAN: pass ``load_wan=False``
+(the ``from_pretrained`` default) before the action model is constructed.
 """
 
 from typing import List, Optional
@@ -40,6 +41,9 @@ class Qwen_WMv4_LA(Qwen_WMv32_LA):
     _action_model_cls = DualStreamFlowMatchingForesightV4
 
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
+        load_wan = bool(kwargs.pop("load_wan", True))
+        if not load_wan:
+            self._disable_wan_weights(config)
         super().__init__(config=config, **kwargs)
         wan_cfg = _cfg_get(self.config.framework, "wan", {}) or {}
         self.wan_cfg = wan_cfg
@@ -54,6 +58,24 @@ class Qwen_WMv4_LA(Qwen_WMv32_LA):
             int(_cfg_get(wan_cfg, "num_wm_queries", 32)),
             self.video_loss_weight,
         )
+
+    @staticmethod
+    def _disable_wan_weights(config) -> None:
+        """Drop WAN disk weights before the action model is constructed."""
+        if config is None:
+            return
+        framework = getattr(config, "framework", None)
+        if framework is None and isinstance(config, dict):
+            framework = config.get("framework")
+        wan_cfg = _cfg_get(framework, "wan", None) if framework is not None else None
+        if wan_cfg is None:
+            return
+        if hasattr(wan_cfg, "get") and not hasattr(wan_cfg, "enabled"):
+            wan_cfg["enabled"] = False
+            wan_cfg["wan_model_path"] = None
+            return
+        wan_cfg.enabled = False
+        wan_cfg.wan_model_path = None
 
     def _ensure_wan_defaults(self) -> None:
         from omegaconf import OmegaConf
