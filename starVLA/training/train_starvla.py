@@ -86,6 +86,7 @@ DUAL_VLA_DATALOADER_FRAMEWORKS = {
     "QwenWMv32_LA",
     "QwenWMv33_LA",
     "QwenWMv34_LA",
+    "QwenWMv4_LA",
 }
 
 
@@ -1016,6 +1017,7 @@ class VLATrainer(TrainerUtils):
         backward_optim_start = None
         action_dit_loss = None
         latent_action_loss = None
+        video_loss = None
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 if self.use_dual_vla_dataloaders:
@@ -1056,6 +1058,8 @@ class VLATrainer(TrainerUtils):
                         output_dict.update(latent_output)
                         if "latent_action_loss" in latent_output:
                             latent_action_loss = latent_output["latent_action_loss"]
+                        if "video_loss" in latent_output:
+                            video_loss = latent_output["video_loss"]
 
                     if action_output is not None:
                         total_loss = (
@@ -1071,6 +1075,13 @@ class VLATrainer(TrainerUtils):
                                 if latent_action_loss is None
                                 else latent_action_loss + action_latent
                             )
+                        if "video_loss" in action_output:
+                            action_video = action_output["video_loss"]
+                            video_loss = (
+                                action_video
+                                if video_loss is None
+                                else video_loss + action_video
+                            )
                         action_dit_loss = self._extract_action_dit_loss(action_output)
 
                     if total_loss is None:
@@ -1080,12 +1091,21 @@ class VLATrainer(TrainerUtils):
                         # Keep the summed dual-stream latent loss; do not keep the
                         # overwritten single-stream value from ``output_dict.update``.
                         output_dict["latent_action_loss"] = latent_action_loss
+                    if video_loss is not None:
+                        output_dict["video_loss"] = video_loss
+                    for key in ("wan_cache_hits", "wan_cache_samples"):
+                        values = [out[key] for out in (latent_output, action_output)
+                                  if out is not None and key in out]
+                        if values:
+                            output_dict[key] = sum(values)
                 else:
                     output_dict = self.model.forward(batch_vla)
                     total_loss = output_dict["total_loss"] if "total_loss" in output_dict else output_dict["action_loss"]
                     action_dit_loss = self._extract_action_dit_loss(output_dict)
                     if "latent_action_loss" in output_dict:
                         latent_action_loss = output_dict["latent_action_loss"]
+                    if "video_loss" in output_dict:
+                        video_loss = output_dict["video_loss"]
 
             if profile_la_timing:
                 if torch.cuda.is_available():
@@ -1118,8 +1138,12 @@ class VLATrainer(TrainerUtils):
             log_dict["action_dit_loss"] = action_dit_loss.detach()
         if latent_action_loss is not None:
             log_dict["latent_action_loss"] = latent_action_loss.detach()
+        if video_loss is not None:
+            log_dict["video_loss"] = video_loss.detach()
         if "action_train_batch_size" in output_dict:
             log_dict["action_train_batch_size"] = output_dict["action_train_batch_size"]
+        if output_dict.get("wan_cache_samples", 0):
+            log_dict["wan_cache_hit_rate"] = output_dict.get("wan_cache_hits", 0) / output_dict["wan_cache_samples"]
         for key, value in output_dict.items():
             if key.startswith("timing/"):
                 log_dict[key] = float(value)

@@ -90,6 +90,12 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
         max_length = int(self.trajectory_lengths[trajectory_index])
         sample["la_padded"] = bool(int(base_index) + int(offsets[-1]) > max_length - 1)
 
+        # WAN frames are independent of the soft_kl cache shortcut that leaves
+        # ``la_frames`` as None placeholders.
+        self._maybe_pack_wm_frames(
+            sample, int(trajectory_id), int(base_index), robot_type, la_horizon
+        )
+
         episode_cache_dir = _cfg_get(la_cfg, "episode_cache_dir", None)
         if episode_cache_dir is not None and str(episode_cache_dir) not in ("", "null", "None"):
             cached_distribution = self._load_episode_soft_kl_cache(
@@ -160,6 +166,67 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
             ]
         sample["la_frame_offsets"] = offsets
         return sample
+
+    def _maybe_pack_wm_frames(
+        self,
+        sample: dict,
+        trajectory_id: int,
+        base_index: int,
+        robot_type: str | None,
+        la_horizon: int,
+    ) -> None:
+        """Pack current + uniformly spaced future frames for the WAN branch.
+
+        ``num_future_latents`` future VAE latents (default 2) need
+        ``num_future_latents * vae_temporal_stride`` pixel frames spread over
+        the robot horizon. Aloha 32 / 8 = 4x, arx 24 / 8 = 3x; both stacks
+        are 9 pixel frames → 3 latents (current pinned, 2 future supervised).
+        """
+        wan_cfg = _cfg_get(self.data_cfg, "wan", {}) or {}
+        if not _cfg_get(wan_cfg, "enabled", False):
+            return
+
+        num_future_latents = int(_cfg_get(wan_cfg, "num_future_latents", 2))
+        vae_stride = int(_cfg_get(wan_cfg, "vae_temporal_stride", 4))
+        if num_future_latents < 1:
+            raise ValueError(f"wan.num_future_latents must be >= 1, got {num_future_latents}.")
+        if vae_stride < 1:
+            raise ValueError(f"wan.vae_temporal_stride must be >= 1, got {vae_stride}.")
+        future_pixels = num_future_latents * vae_stride
+        horizon = int(la_horizon)
+        if horizon % future_pixels != 0:
+            raise ValueError(
+                f"WAN horizon={horizon} must be divisible by "
+                f"num_future_latents*vae_temporal_stride={future_pixels} "
+                f"(robot_type={robot_type})."
+            )
+        step = horizon // future_pixels
+        wm_offsets = list(range(0, horizon + 1, step))
+        if wm_offsets[-1] != horizon or len(wm_offsets) != 1 + future_pixels:
+            raise ValueError(
+                f"WAN uniform offsets {wm_offsets} do not cover horizon={horizon} "
+                f"with {future_pixels} future pixels (robot_type={robot_type})."
+            )
+
+        video_keys_cfg = _cfg_get(wan_cfg, "video_keys", None)
+        if video_keys_cfg is None or len(video_keys_cfg) == 0:
+            la_cfg = _cfg_get(self.data_cfg, "latent_action", {}) or {}
+            video_keys_cfg = _cfg_get(la_cfg, "video_keys", None)
+        if video_keys_cfg is not None and len(video_keys_cfg) > 0:
+            video_key = video_keys_cfg[0]
+        else:
+            video_key = _cfg_get(wan_cfg, "video_key", None) or self.modality_keys["video"][0]
+        if not str(video_key).startswith("video."):
+            video_key = f"video.{video_key}"
+
+        image_size = tuple(int(v) for v in _cfg_get(wan_cfg, "image_size", [256, 256]))
+        sample["wm_frames"] = [
+            frame.resize(image_size)
+            for frame in self.get_video_frames_by_offsets(
+                int(trajectory_id), str(video_key), int(base_index), wm_offsets
+            )
+        ]
+        sample["wm_frame_offsets"] = wm_offsets
 
     def _load_episode_soft_kl_cache(
         self,

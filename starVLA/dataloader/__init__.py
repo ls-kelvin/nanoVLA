@@ -8,6 +8,7 @@ import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 from starVLA.dataloader.vlm_input_collator import build_vlm_input_collator
+from starVLA.dataloader.wan_frame_collator import build_wan_frame_collator
 
 logger = get_logger(__name__)
 
@@ -66,6 +67,7 @@ def build_dataloader(
             else int(cfg.datasets.vla_data.per_device_batch_size)
         )
         collate_fn = build_vlm_input_collator(cfg, collate_fn)
+        collate_fn = build_wan_frame_collator(cfg, collate_fn)
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=effective_batch_size,
@@ -179,7 +181,7 @@ def build_vla_eval_dataloader(
     return DataLoader(
         eval_dataset,
         batch_size=int(eval_batch_size),
-        collate_fn=collate_fn,
+        collate_fn=build_wan_frame_collator(cfg, collate_fn),
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,

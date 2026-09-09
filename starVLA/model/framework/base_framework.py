@@ -78,6 +78,7 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
         "QwenWMv32_LA",
         "QwenWMv33_LA",
         "QwenWMv34_LA",
+        "QwenWMv4_LA",
     }:
         constructor_kwargs.pop("load_latent_action_encoder", None)
     return model_class(cfg, **constructor_kwargs)

@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .dual_stream import QwenVLWithExpert
+from .dual_stream import CapturedPrefixKVs, QwenVLWithExpert
 from .joint_attention import create_sinusoidal_pos_embedding, sample_beta
 
 
@@ -137,7 +137,8 @@ class DualStreamFlowMatching(nn.Module):
         """Per-layer prompt K/V for the expert, optionally for a batch-row subset."""
         rows = slice(None) if rows is None else rows
         return self.qwenvl_with_expert.build_prefix_kv(
-            [hidden[rows] for hidden in layer_inputs],
+            (layer_inputs.select(rows) if isinstance(layer_inputs, CapturedPrefixKVs)
+             else [hidden[rows] for hidden in layer_inputs]),
             prefix["position_ids"][:, rows],
             prefix["prompt_len"],
         )

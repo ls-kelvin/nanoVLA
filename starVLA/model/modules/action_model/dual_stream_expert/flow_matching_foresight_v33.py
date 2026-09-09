@@ -1,6 +1,6 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License.
-"""QwenWMv33_LA foresight: query-first two-pass with stop-gradient on queries.
+"""QwenWMv33_LA foresight: query-first two-pass.
 
 Logical suffix order is ``[query(N) | state(1) | action(chunk)]`` with pi0
 block-causal semantics, implemented as two expert passes on top of the V31
@@ -8,14 +8,14 @@ KV-cache plumbing:
 
   pass 1: [query(N)]              single bidirectional block, no AdaRMSNorm FiLM
   pass 2: [state(1), action(chunk)] block-causal, time-FiLM, attends to
-                                  [prefix | query(detached)] K/V
+                                  [prefix | query] K/V
   latent-only: [query(N)]         fully bidirectional, no FiLM, no repeats
 
 Pass 1 is unmodulated (plain RMSNorm, not AdaRMSNorm at t=0). Its per-layer
-K/V are detached before being concatenated onto the prefix cache, so the
-action loss never backpropagates into the learnable query tokens: queries are
-trained only by their own latent readout loss (embedding MSE or soft_kl).
-Pass 2 keeps the sampled-timestep FiLM (``ada_cond=time``) for state+action.
+K/V are concatenated onto the prefix cache with gradients, so the action loss
+also backpropagates into the learnable query tokens (in addition to the
+latent readout loss). Pass 2 keeps the sampled-timestep FiLM
+(``ada_cond=time``) for state+action.
 
 Pass 2 has two attention blocks, so it cannot use flash. Pass 1 is a single
 bidirectional block and follows ``latent_expert_attention``.
@@ -33,7 +33,7 @@ from .joint_attention import create_sinusoidal_pos_embedding
 
 
 class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
-    """V31 two-pass foresight with query-first order and detached query K/V."""
+    """V31 two-pass foresight with query-first order."""
 
     # -- pass 1: [query(N)] -------------------------------------------------
     def encode_query_kv(
@@ -45,8 +45,8 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
         """Pass 1: encode ``[query]`` once. Returns query hidden + its K/V cache.
 
         No AdaRMSNorm FiLM (unmodulated RMSNorm, not t=0). The returned suffix
-        K/V still carry gradients (the latent readout loss backprops through
-        them); callers must detach before reusing them as pass-2 prefix.
+        K/V keep gradients so pass 2 can backpropagate the action loss into
+        the learnable query tokens.
         """
         bsize = prefix["prompt_pad_masks"].shape[0]
         device = prefix["prompt_pad_masks"].device
@@ -119,7 +119,7 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
         RoPE continues after the query block (offset by ``num_learnable_tokens``;
         pass ``position_offset=0`` when no query K/V precede this suffix).
         ``prefix_kvs`` / ``prefix_pad_masks`` are the concatenated cache from
-        pass 1 (query K/V already detached by the caller).
+        pass 1 (query K/V included, with gradients).
 
         Attention is block-causal (state | action), so flash is rejected.
         """
@@ -144,10 +144,6 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
         )
         return suffix_out[:, -x_t.shape[1] :]
 
-    @staticmethod
-    def _detach_kvs(kvs):
-        return [(key.detach(), value.detach()) for key, value in kvs]
-
     # -- training: joint ----------------------------------------------------
     def flow_matching_loss_joint_foresight(
         self,
@@ -165,9 +161,8 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
     ) -> tuple[Tensor, Tensor]:
         """Query pass at ``B``, then state+action flow-matching at ``B*r``.
 
-        Query K/V are detached before pass 2, so the action loss does not
-        backpropagate into the learnable query tokens; queries are trained
-        only by the latent readout loss (which never sees state/action).
+        Query K/V are reused as pass-2 prefix without stop-gradient, so the
+        action loss also backpropagates into the learnable query tokens.
         """
         actions = actions.float()
         action_mask = action_mask.float()
@@ -197,9 +192,7 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
                 query_out, latent_targets, valid_mask=latent_valid_mask
             )
 
-            # Stop gradient: later blocks attend to query K/V but never
-            # backprop into the query tokens.
-            combined_kvs = self._cat_kvs(prefix_kvs, self._detach_kvs(query_kvs))
+            combined_kvs = self._cat_kvs(prefix_kvs, query_kvs)
             combined_pad = torch.cat([prefix["prompt_pad_masks"], query_pad], dim=1)
 
             if state is None:
@@ -260,7 +253,7 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
         noise: Optional[Tensor] = None,
         attention_implementation: Optional[str] = None,
     ) -> Tensor:
-        """Euler sampling; query K/V are encoded once, then reused (detached)."""
+        """Euler sampling; query K/V are encoded once, then reused."""
         bsize = state.shape[0]
         device = state.device
 
@@ -277,7 +270,7 @@ class DualStreamFlowMatchingForesightV33(DualStreamFlowMatchingForesightV31):
             _, query_kvs, query_pad = self.encode_query_kv(
                 prefix, prefix_kvs, attention_implementation=attention_implementation
             )
-            combined_kvs = self._cat_kvs(prefix_kvs, self._detach_kvs(query_kvs))
+            combined_kvs = self._cat_kvs(prefix_kvs, query_kvs)
             combined_pad = torch.cat([prefix["prompt_pad_masks"], query_pad], dim=1)
 
             dt = -1.0 / self.num_steps

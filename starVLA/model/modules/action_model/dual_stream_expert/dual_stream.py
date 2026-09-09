@@ -22,6 +22,26 @@ from .joint_attention import build_dense_flash_meta, build_expert_block_mask, bu
 from .qwen2_expert import build_qwen2_expert
 
 
+class CapturedPrefixKVs:
+    """Per-forward, differentiable K/V capture through Qwen's cache interface.
+
+    This is not an autoregressive history: update returns the exact tensors
+    passed by attention, without concatenation, mutation, detach, or cloning.
+    """
+
+    def __init__(self, kvs=None):
+        self.kvs = [] if kvs is None else kvs
+
+    def update(self, key, value, layer_idx, cache_kwargs=None):
+        if layer_idx != len(self.kvs):
+            raise RuntimeError("Prefix K/V capture requires one forward visit per layer")
+        self.kvs.append((key, value))
+        return key, value
+
+    def select(self, rows):
+        return CapturedPrefixKVs([(key[rows], value[rows]) for key, value in self.kvs])
+
+
 def _resolve_attn_implementation(attn_implementation: str) -> str:
     if attn_implementation != "flash_attention_2":
         return attn_implementation
@@ -156,13 +176,15 @@ class QwenVLWithExpert(nn.Module):
         position_ids: torch.Tensor,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor] | CapturedPrefixKVs]:
         """Run the stock Qwen3-VL text tower and return ``(last_hidden, layer_inputs)``.
 
         ``layer_inputs[i]`` is the real input to layer ``i`` (already includes any
         deepstack injection from layer ``i-1``). Collecting these ourselves avoids
         the stock ``output_hidden_states`` path, which records layer outputs
         *before* deepstack and would therefore give the wrong K/V inputs.
+        With ``reuse_prefix_kv`` enabled, the second return value instead holds
+        the differentiable K/V emitted by attention at those same layer inputs.
         """
         language_model = self.qwenvl.model.language_model
         batch_size, seq_len = inputs_embeds.shape[:2]
@@ -190,13 +212,21 @@ class QwenVLWithExpert(nn.Module):
         position_embeddings = language_model.rotary_emb(hidden_states, rope_position_ids)
 
         layer_inputs: List[torch.Tensor] = []
+        # Checkpoint recomputation must never mutate an external cache. Retain
+        # the original hidden-input/reprojection path whenever it is enabled.
+        checkpointed = self.training and any(
+            getattr(layer, "gradient_checkpointing", False) for layer in language_model.layers
+        )
+        captured = (CapturedPrefixKVs() if getattr(self, "reuse_prefix_kv", False)
+                    and not checkpointed else None)
         for layer_idx, decoder_layer in enumerate(language_model.layers):
-            layer_inputs.append(hidden_states)
+            if captured is None:
+                layer_inputs.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=text_position_ids,
-                past_key_values=None,
+                past_key_values=captured,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
@@ -212,11 +242,11 @@ class QwenVLWithExpert(nn.Module):
                 )
 
         last_hidden = language_model.norm(hidden_states)
-        return last_hidden, layer_inputs
+        return last_hidden, captured if captured is not None else layer_inputs
 
     def build_prefix_kv(
         self,
-        layer_inputs: List[torch.Tensor],
+        layer_inputs: List[torch.Tensor] | CapturedPrefixKVs,
         position_ids: torch.Tensor,
         prompt_len: int,
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
@@ -227,6 +257,9 @@ class QwenVLWithExpert(nn.Module):
         dropped so the action expert never sees them.
         """
         language_model = self.qwenvl.model.language_model
+        if isinstance(layer_inputs, CapturedPrefixKVs):
+            return [(key[:, :, :prompt_len], value[:, :, :prompt_len])
+                    for key, value in layer_inputs.kvs]
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             rope_position_ids = position_ids[1:, :, :prompt_len]
         else:
