@@ -374,3 +374,18 @@ class DualStreamFlowMatchingForesightV4(DualStreamFlowMatchingForesightV32):
             if self.foresight_latent_loss_type == "embedding":
                 return self.learnable_to_latent_proj(learnable_out).float()
             return self.learnable_to_logits_proj(learnable_out).float()
+
+    @torch.no_grad()
+    def sample_wm_hidden(self, prefix: dict, prefix_kvs) -> Tensor:
+        """Read out only the WM query tokens from the latent-only ``[LA | WM]`` suffix.
+
+        Deterministic (timestep 0, no actions/noise needed); the result
+        conditions ``WanVideoBranch.generate_video`` at inference time.
+        """
+        bsize = prefix["prompt_pad_masks"].shape[0]
+        device = prefix["prompt_pad_masks"].device
+        with torch.autocast("cuda", dtype=torch.float32):
+            timestep = torch.zeros(bsize, dtype=torch.float32, device=device)
+            suffix_out = self.run_expert_learnable_only(prefix, prefix_kvs, timestep=timestep)
+            _, wm_out = self._split_learnable_only_outputs(suffix_out)
+        return wm_out

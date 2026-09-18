@@ -15,11 +15,13 @@ import torch.distributed as dist
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
 
+from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenWMv32_LA import Qwen_WMv32_LA
 from starVLA.model.modules.action_model.dual_stream_expert import DualStreamFlowMatchingForesightV4
 from starVLA.model.modules.vlm.QWen3 import merge_qwen3_vl_inputs
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
+from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 logger = initialize_overwatch(__name__)
 
@@ -385,3 +387,100 @@ class Qwen_WMv4_LA(Qwen_WMv32_LA):
             outputs[stream["name"]].update(self._cache_metrics(stream["examples"], stream["compute_latent"]))
 
         return {"streams": outputs}
+
+    # ------------------------------------------------------------------
+    # inference: world-model video
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def predict_video(
+        self,
+        examples: List[dict] = None,
+        num_inference_steps: Optional[int] = None,
+        num_future_frames: Optional[int] = None,
+    ) -> dict:
+        """Generate future video frames from the current observation + instruction.
+
+        WM query hidden states come from the deterministic latent-only
+        ``[LA | WM]`` suffix (``sample_wm_hidden``, timestep 0; no actions or
+        action noise involved). The WAN DiT then denoises future latents with
+        the clean current frame pinned as the first latent (TI2V), matching
+        the train-time video-loss conditioning.
+
+        Requires the WAN branch: build the model with ``load_wan=True``
+        (``from_pretrained`` defaults to ``load_wan=False`` for action-only
+        inference).
+
+        Per-example first frame resolution order: ``first_frame``,
+        collated ``wm_pixel_values[:, 0]``, then ``wm_frames[0]``.
+
+        Returns ``{"video": uint8 ndarray (B, 1 + num_future_frames, H, W, 3)}``.
+        """
+        wan_video = getattr(self.action_model, "wan_video", None)
+        if wan_video is None:
+            raise RuntimeError(
+                "WAN video branch is not loaded. Rebuild with load_wan=True "
+                "(from_pretrained defaults to load_wan=False for action inference)."
+            )
+        if not isinstance(examples, list):
+            examples = [examples]
+
+        batch_images = [to_pil_preserve(example["image"]) for example in examples]
+        instructions = [example["lang"] for example in examples]
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+        inputs = self._build_vlm_inputs(batch_images, instructions)
+        device = inputs["input_ids"].device
+
+        first_frame = self._prepare_first_frame(examples, device)
+        if num_future_frames is None:
+            num_future_frames = self._default_wan_future_frames()
+
+        # Same autocast pattern as predict_action: the unwrapped module must
+        # re-establish autocast for low-precision weights.
+        param_dtype = self.action_model.state_proj.weight.dtype
+        with torch.autocast(
+            device.type,
+            dtype=param_dtype,
+            enabled=param_dtype in (torch.bfloat16, torch.float16),
+        ):
+            prefix, _, prefix_kvs = self.action_model.encode_prefix_context(inputs, num_latent_tokens=0)
+            wm_out = self.action_model.sample_wm_hidden(prefix, prefix_kvs)
+            video = wan_video.generate_video(
+                wm_out,
+                first_frame,
+                num_future_frames,
+                num_inference_steps=num_inference_steps,
+            )
+        video = video.clamp(0, 1).mul(255.0).round().byte().permute(0, 1, 3, 4, 2).cpu().numpy()
+        return {"video": video}
+
+    def _prepare_first_frame(self, examples: List[dict], device) -> torch.Tensor:
+        """Stack per-example current frames into ``(B, 1, 3, H, W)`` in [-1, 1]."""
+        packed = examples[0].get("wm_pixel_values", None)
+        if packed is not None:
+            if packed.dtype != torch.uint8 or packed.ndim != 5:
+                raise ValueError("wm_pixel_values must be uint8 (B, T, 3, H, W).")
+            first = packed[:, 0].to(device=device).float()
+            return first.div_(255.0).mul_(2.0).sub_(1.0).unsqueeze(1)
+        frames = []
+        for example in examples:
+            frame = example.get("first_frame", None)
+            if frame is None:
+                wm_frames = example.get("wm_frames", None)
+                if wm_frames:
+                    frame = wm_frames[0]
+            if frame is None:
+                raise RuntimeError(
+                    "predict_video needs a current frame per example: provide "
+                    "'first_frame', 'wm_frames', or collated 'wm_pixel_values'."
+                )
+            frames.append(self._frame_to_wan_tensor(frame))
+        return torch.stack(frames, dim=0).unsqueeze(1).to(device=device, dtype=torch.float32)
+
+    def _default_wan_future_frames(self) -> int:
+        """Training packing: ``num_future_latents * vae_temporal_stride`` pixels."""
+        wan_data_cfg = _cfg_get(self.config.datasets.vla_data, "wan", {}) or {}
+        num_future_latents = int(_cfg_get(wan_data_cfg, "num_future_latents", 2))
+        vae_stride = int(_cfg_get(wan_data_cfg, "vae_temporal_stride", 4))
+        return num_future_latents * vae_stride
