@@ -1,0 +1,150 @@
+run_id: qwenpiv51_hdf5_aloha_clean_random_la_sharla_a2a_eef
+run_root_dir: results/Checkpoints2
+seed: 42
+wandb_project: starVLA_Robotwin
+is_debug: false
+version_id: "0.21"
+
+# QwenPI_v51_LA + frozen Sharla teacher (models/sharla_a2a).
+# v51 moves the robot state into the VLM prefix as a `<state>` token placed
+# before the latent-action bridge tokens (processed by VLM parameters; pure
+# video batches omit it and positions simply continue), lets the action expert
+# attend over the full sequence K/V (prompt + state + LA queries), and drops
+# the state token from the expert suffix.
+framework:
+  name: QwenPI_v51_LA
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
+    freeze_vision_encoder: false
+    train_expert_only: false
+    gradient_checkpointing: false
+
+  latent_action:
+    enabled: true
+    backend: sharla
+    loss_type: soft_kl
+    train_latent: true
+    train_action: true
+    latent_loss_weight: 0.1
+    action_loss_weight: 1.0
+    action_train_robot_types: ["aloha-agilex"]
+    num_bridge_tokens: 8
+    num_codebooks: 1
+    codebook_size: 256
+    strict_num_bridge_tokens: true
+    qwenpi_v5_la:
+      token_format: "<latent_action_{i}>"
+      head_dropout: 0.0
+    sharla:
+      config_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
+      ckpt_path: /mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
+      image_size: [224, 224]
+      strict_load: true
+      kl_eps: 1.0e-08
+
+  action_model:
+    action_dim: 16
+    state_dim: 16
+    action_horizon: 32
+    num_inference_timesteps: 20
+    repeated_diffusion_steps: 8
+    loss_type: fm
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    expert_attention: sdpa
+    action_dim_mask: null
+    action_expert:
+      hidden_size: 768
+      intermediate_size: 2752
+      num_attention_heads: 16
+      num_key_value_heads: 8
+      head_dim: 128
+      num_layers: null
+      adanorm_time: true
+      final_norm_adanorm: false
+
+datasets:
+  vla_data:
+    dataset_py: hdf5_la_dataset
+    latent_action:
+      enabled: true
+      stride: 8
+      horizon: 32
+      video_keys: [cam_high]
+      include_terminal_frame: true
+      image_size: [224, 224]
+      # Soft codebook distributions (not embedding cache).
+      episode_cache_dir: .cache/latent_cache/sharla_soft_kl
+      horizon_overrides:
+        arx-x5:
+          frame_stride: 6
+          horizon: 24
+    history_frame:
+      enabled: true
+      offset: 8
+      video_keys: [cam_high]
+    include_state: true
+    data_root_dir: /mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
+    data_mix: hdf5_aloha_clean_eef
+    latent_data_mix: hdf5_arx_clean_random_eef
+    hdf5_action_type: eef
+    action_type: abs_eef
+    action_mode: abs
+    per_device_batch_size: 8
+    latent_per_device_batch_size: 8
+    balance_dataset_weights: true
+    balance_trajectory_weights: true
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    precompute_vlm_inputs: true
+    eval_data_mixes:
+      aloha_random: hdf5_aloha_random_eef
+
+trainer:
+  use_dual_vla_dataloaders: true
+  dataloader_loss_modes:
+    latent: latent
+    action: joint
+  dataloader_active_ranges:
+    latent:
+      - [0, null]
+    action:
+      - [0, null]
+  max_train_steps: 90000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 1000
+  eval_num_samples: 512
+  eval_batch_size: 8
+  logging_frequency: 50
+  learning_rate:
+    base: 5e-05
+    # v51 keeps the v5 module tree: VLM/expert live nested under
+    # `action_model.qwenvl_with_expert`. The new `action_model.state_vlm_proj`
+    # falls through to `base`.
+    action_model.qwenvl_with_expert.qwenvl: 1.0e-05
+    action_model.qwenvl_with_expert.qwen_expert: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5e-6
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+# Offline soft_kl episode-cache builder (scripts/cache_sharla_soft_kl_episodes.sh).
+soft_kl_cache:
+  output_dir: .cache/latent_cache/sharla_soft_kl
+  batch_size: 256
+  num_workers: 32
+  num_gpus: 2
+  use_bf16: true
+  overwrite: false

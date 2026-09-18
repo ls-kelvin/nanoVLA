@@ -79,6 +79,7 @@ DUAL_VLA_DATALOADER_FRAMEWORKS = {
     "QwenPI_v3_LA",
     "QwenPI_v4_LA",
     "QwenPI_v5_LA",
+    "QwenPI_v51_LA",
     "QwenWM_LA",
     "QwenWMv2_LA",
     "QwenWMv3_LA",
