@@ -387,6 +387,7 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         state: Tensor,
         noise: Optional[Tensor] = None,
         attention_implementation: Optional[str] = None,
+        extra_embs: Optional[Tensor] = None,
     ) -> Tensor:
         """Euler sampling with foresight tokens present (matches joint training)."""
         bsize = state.shape[0]
@@ -399,7 +400,9 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         else:
             noise = noise.float()
 
-        prefix, _, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens=0)
+        prefix, _, prefix_kvs = self.encode_prefix_context(
+            inputs, num_latent_tokens=0, extra_embs=extra_embs
+        )
 
         with torch.autocast("cuda", dtype=torch.float32):
             dt = -1.0 / self.num_steps

@@ -331,6 +331,22 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
     # ------------------------------------------------------------------ #
     # forward
     # ------------------------------------------------------------------ #
+    def _encode_training_prefix(self, inputs: dict, examples: List[dict], device):
+        """Encode the VLM prefix and build per-layer K/V for one stream.
+
+        Split out so subclasses can inject extra prefix embeddings (e.g.
+        la_mem history tokens) without copying the forward body.
+        """
+        prefix, _, prefix_kvs = self.action_model.encode_prefix_context(inputs, num_latent_tokens=0)
+        return prefix, prefix_kvs
+
+    def _encode_merged_prefix(self, merged_inputs: dict, stream_examples: List[List[dict]]):
+        """Encode the merged dual-stream VLM prefix; overridable like above."""
+        prefix, _, layer_inputs = self.action_model.encode_prefix_hidden(
+            merged_inputs, num_latent_tokens=0
+        )
+        return prefix, layer_inputs
+
     def _resolve_loss_flags(self, loss_mode: str) -> tuple[bool, bool]:
         if loss_mode not in {"joint", "latent", "action"}:
             raise ValueError(f"loss_mode must be 'joint', 'latent', or 'action', got {loss_mode!r}.")
@@ -393,7 +409,7 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
         )
         device = inputs["input_ids"].device
 
-        prefix, _, prefix_kvs = self.action_model.encode_prefix_context(inputs, num_latent_tokens=0)
+        prefix, prefix_kvs = self._encode_training_prefix(inputs, examples, device)
         prefix_kvs = self._maybe_detach_prefix_kvs(prefix_kvs)
         self._print_training_sample_once(examples, instructions)
 
@@ -489,7 +505,9 @@ class Qwen_WMv2_LA(Qwen_PI_v5):
 
         pad_token_id = int(self.processor.tokenizer.pad_token_id)
         merged = merge_qwen3_vl_inputs([stream["inputs"] for stream in streams], pad_token_id)
-        prefix, _, layer_inputs = self.action_model.encode_prefix_hidden(merged, num_latent_tokens=0)
+        prefix, layer_inputs = self._encode_merged_prefix(
+            merged, [stream["examples"] for stream in streams]
+        )
         device = prefix["position_ids"].device
 
         row = 0

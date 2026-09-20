@@ -76,12 +76,21 @@ class DualStreamFlowMatching(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     # -- prefix (chat-template context) -----------------------------------
-    def embed_prefix(self, inputs: dict, num_latent_tokens: int = 0) -> dict:
+    def embed_prefix(
+        self,
+        inputs: dict,
+        num_latent_tokens: int = 0,
+        extra_embs: Optional[Tensor] = None,
+    ) -> dict:
         """Build prefix embeddings from Qwen3-VL processor outputs.
 
         ``inputs`` carries ``input_ids`` / ``attention_mask`` / ``pixel_values`` /
         ``image_grid_thw``; ``num_latent_tokens`` counts bridge tokens already
         appended to the tail of ``input_ids``.
+
+        ``extra_embs`` ``[B, M, H]`` (e.g. la_mem history tokens) are appended
+        after the prompt embeddings and -- unlike bridge tokens -- count toward
+        ``prompt_len``, so they enter the prefix K/V the expert attends to.
         """
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
@@ -103,6 +112,27 @@ class DualStreamFlowMatching(nn.Module):
         )
 
         prompt_len = input_ids.shape[1] - num_latent_tokens
+        if extra_embs is not None:
+            bsize, mem_len = extra_embs.shape[0], extra_embs.shape[1]
+            if bsize != embs.shape[0]:
+                raise ValueError(
+                    f"extra_embs batch {bsize} must match prefix batch {embs.shape[0]}."
+                )
+            embs = torch.cat([embs, extra_embs.to(device=embs.device, dtype=embs.dtype)], dim=1)
+            pad_masks = torch.cat(
+                [pad_masks, torch.ones(bsize, mem_len, device=embs.device, dtype=torch.bool)], dim=1
+            )
+            visual_pos_masks = torch.cat(
+                [visual_pos_masks, torch.zeros(bsize, mem_len, device=embs.device, dtype=torch.bool)],
+                dim=1,
+            )
+            # Continue mrope positions from the last prompt token (left padding
+            # guarantees the tail is a real token) on every channel.
+            mem_positions = position_ids[:, :, -1:] + torch.arange(
+                1, mem_len + 1, device=position_ids.device
+            )
+            position_ids = torch.cat([position_ids, mem_positions], dim=2)
+            prompt_len += mem_len
         # Bridge tokens must not shift the suffix RoPE positions.
         prompt_pad_masks = pad_masks[:, :prompt_len].clone()
 
@@ -116,14 +146,19 @@ class DualStreamFlowMatching(nn.Module):
             prompt_pad_masks=prompt_pad_masks,
         )
 
-    def encode_prefix_hidden(self, inputs: dict, num_latent_tokens: int = 0):
+    def encode_prefix_hidden(
+        self,
+        inputs: dict,
+        num_latent_tokens: int = 0,
+        extra_embs: Optional[Tensor] = None,
+    ):
         """Run the VLM prefix pass; returns ``(prefix, last_hidden, layer_inputs)``.
 
         Split out of :meth:`encode_prefix_context` so callers that only need the
         last hidden state skip the per-layer K/V rebuild, and so several streams
         can share one VLM pass and rebuild K/V for their own rows only.
         """
-        prefix = self.embed_prefix(inputs, num_latent_tokens)
+        prefix = self.embed_prefix(inputs, num_latent_tokens, extra_embs=extra_embs)
         last_hidden, layer_inputs = self.qwenvl_with_expert.encode_prefix_layers(
             inputs_embeds=prefix["embs"],
             attention_mask=prefix["pad_masks"],
@@ -143,9 +178,16 @@ class DualStreamFlowMatching(nn.Module):
             prefix["prompt_len"],
         )
 
-    def encode_prefix_context(self, inputs: dict, num_latent_tokens: int = 0):
+    def encode_prefix_context(
+        self,
+        inputs: dict,
+        num_latent_tokens: int = 0,
+        extra_embs: Optional[Tensor] = None,
+    ):
         """Encode the VLM prefix and build per-layer prompt K/V for the expert."""
-        prefix, last_hidden, layer_inputs = self.encode_prefix_hidden(inputs, num_latent_tokens)
+        prefix, last_hidden, layer_inputs = self.encode_prefix_hidden(
+            inputs, num_latent_tokens, extra_embs=extra_embs
+        )
         return prefix, last_hidden, self.build_prefix_kvs(prefix, layer_inputs)
 
     # -- suffix (state + noisy actions + time) ----------------------------
@@ -342,6 +384,7 @@ class DualStreamFlowMatching(nn.Module):
         state: Tensor,
         noise: Optional[Tensor] = None,
         attention_implementation: Optional[str] = None,
+        extra_embs: Optional[Tensor] = None,
     ) -> Tensor:
         bsize = state.shape[0]
         device = state.device
@@ -353,7 +396,9 @@ class DualStreamFlowMatching(nn.Module):
         else:
             noise = noise.float()
 
-        prefix, _, prefix_kvs = self.encode_prefix_context(inputs, num_latent_tokens=0)
+        prefix, _, prefix_kvs = self.encode_prefix_context(
+            inputs, num_latent_tokens=0, extra_embs=extra_embs
+        )
 
         # See the matching comment in ``forward``: force real fp32 compute for
         # the expert's autocast-eligible ops instead of silently inheriting

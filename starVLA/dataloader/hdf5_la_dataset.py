@@ -59,6 +59,17 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
                     sample["image"] = history_images + sample["image"]
 
         la_cfg = _cfg_get(self.data_cfg, "latent_action", {})
+
+        # la_mem history frames are model *inputs* (like images), not training
+        # targets: they must be packed even when latent_action packing is
+        # disabled -- the eval dataloader sets latent_action.enabled=false.
+        self._maybe_pack_la_hist_frames(
+            sample,
+            data.get("_la_trajectory_id", None),
+            data.get("_la_base_index", None),
+            sample.get("robot_type", None),
+        )
+
         if not _cfg_get(la_cfg, "enabled", False):
             return sample
 
@@ -227,6 +238,48 @@ class LatentActionHDF5SingleDataset(HDF5SingleDataset):
             )
         ]
         sample["wm_frame_offsets"] = wm_offsets
+
+    def _maybe_pack_la_hist_frames(
+        self,
+        sample: dict,
+        trajectory_id,
+        base_index,
+        robot_type: str | None,
+    ) -> None:
+        """Pack history frames for la_mem (history latent-action memory tokens).
+
+        ``latent_action.history_stride=h`` looks back h latent-action strides:
+        frames at offsets ``[-h*s, ..., -s, 0]`` form h consecutive pairs that
+        end at the current frame. ``get_video_frames_by_offsets`` clamps to the
+        episode start, so episode-leading steps reuse the first frame and the
+        history token count stays constant.
+        """
+        la_cfg = _cfg_get(self.data_cfg, "latent_action", {})
+        history_stride = int(_cfg_get(la_cfg, "history_stride", 0) or 0)
+        if history_stride < 1:
+            return
+        if trajectory_id is None or base_index is None:
+            return
+        robot_type = str(robot_type) if robot_type is not None else None
+        stride = _resolve_latent_action_stride(la_cfg, robot_type)
+        hist_offsets = [-i * stride for i in range(history_stride, 0, -1)] + [0]
+
+        video_keys_cfg = _cfg_get(la_cfg, "video_keys", None)
+        if video_keys_cfg is not None and len(video_keys_cfg) > 0:
+            video_key = str(video_keys_cfg[0])
+        else:
+            video_key = _cfg_get(la_cfg, "video_key", None) or self.modality_keys["video"][0]
+        if not str(video_key).startswith("video."):
+            video_key = f"video.{video_key}"
+
+        image_size = tuple(_cfg_get(la_cfg, "image_size", [224, 224]))
+        sample["la_hist_frames"] = [
+            frame.resize(image_size)
+            for frame in self.get_video_frames_by_offsets(
+                int(trajectory_id), str(video_key), int(base_index), hist_offsets
+            )
+        ]
+        sample["la_hist_offsets"] = hist_offsets
 
     def _load_episode_soft_kl_cache(
         self,

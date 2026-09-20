@@ -76,6 +76,7 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
         "QwenWMv3_LA",
         "QwenWMv31_LA",
         "QwenWMv32_LA",
+        "QwenWMv32_LA_Mem",
         "QwenWMv33_LA",
         "QwenWMv34_LA",
         "QwenWMv4_LA",
