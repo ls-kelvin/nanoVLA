@@ -38,7 +38,7 @@ accelerate launch \
   --main_process_port ${MASTER_PORT:-29500} \
   starVLA/training/train_starvla.py \
   --config_yaml "${config_yaml}" \
-  --framework.name QwenWMv3_LA \
+  --framework.name QwenWMv31_LA \
   --framework.qwenvl.base_vlm "${base_vlm}" \
   --framework.latent_action.loss_type soft_kl \
   --framework.latent_action.sharla.config_path "${SHARLA_CONFIG_PATH}" \

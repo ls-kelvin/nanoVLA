@@ -5,7 +5,7 @@ source .venv/bin/activate
 export NCCL_IB_DISABLE=0
 
 # 设置每个节点的进程数，默认为8（如果未设置环境变量）
-PET_NPROC_PER_NODE=${MLP_WORKER_GPU:-8}
+PET_NPROC_PER_NODE=${MLP_WORKER_GPU:-2}
 # 总节点数 (默认为2，请根据实际修改)
 PET_NNODES=${WORLD_SIZE:-1}
 # 当前节点的 Rank (0 为主节点，1 为从节点...，必须在不同节点上设置不同值)
@@ -27,10 +27,10 @@ SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
 SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
 EMBEDDING_CACHE_DIR=.cache/latent_cache/sharla_a2a_embedding
 
-bash scripts/cache_sharla_embeddings.sh "${config_yaml}" --output-dir "${EMBEDDING_CACHE_DIR}" --data-root-dir "${hdf5_root}"
+# bash scripts/cache_sharla_embeddings.sh "${config_yaml}" --output-dir "${EMBEDDING_CACHE_DIR}" --data-root-dir "${hdf5_root}"
 
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/deepseeds/deepspeed_zero0.yaml \
   --num_processes ${TOTAL_PROCESSES} \
   --num_machines ${PET_NNODES} \
   --machine_rank ${PET_NODE_RANK} \

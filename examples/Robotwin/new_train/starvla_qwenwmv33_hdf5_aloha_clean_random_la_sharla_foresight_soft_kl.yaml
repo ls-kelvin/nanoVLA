@@ -7,8 +7,8 @@ version_id: "0.21"
 
 # QwenWMv33_LA foresight + soft_kl on the 0818_align_sqrt_weights_stopgrad
 # Sharla tokenizer. Query-first two-pass: [query] (no FiLM) encoded once, its
-# detached K/V prepended to the [state | action] block-causal pass, so the
-# action loss never backpropagates into the query tokens.
+# K/V prepended to the [state | action] block-causal pass, so the action
+# loss also backpropagates into the query tokens.
 # Requires a soft_kl episode cache (scripts/cache_sharla_soft_kl_episodes.sh);
 # embedding norm_stats are not used in this mode.
 framework:

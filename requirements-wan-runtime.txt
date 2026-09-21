@@ -1,0 +1,5 @@
+# Isolated runtime override for WAN Conv3d on the tested L20D (SM 10.3).
+# Install separately: uv pip install --python .venv/bin/python \
+#   --target .cache/wan_runtime --no-deps -r requirements-wan-runtime.txt
+# Do not combine with requirements.txt: torch 2.8 pins its bundled cuDNN.
+nvidia-cudnn-cu12==9.17.1.4

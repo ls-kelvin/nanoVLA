@@ -5,13 +5,13 @@ wandb_project: starVLA_Robotwin
 is_debug: false
 version_id: "0.21"
 
-# QwenWMv3_LA foresight + soft_kl, RoboTwin EEF with rot6d model rotation.
+# QwenWMv31_LA foresight + soft_kl, RoboTwin EEF with rot6d model rotation.
 # Packed action/state are 20D (xyz3 + rot6d6 + gripper1 per arm). HDF5 and
 # the RoboTwin env stay on xyz + quaternion; conversion is in DataConfig.
 # Requires a soft_kl episode cache (scripts/cache_sharla_soft_kl_episodes.sh);
 # embedding norm_stats are not used in this mode.
 framework:
-  name: QwenWMv3_LA
+  name: QwenWMv31_LA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
@@ -51,6 +51,7 @@ framework:
     # Must equal frame_pairs * query_num (stride/horizon 8/32 => 4 pairs * 8 = 32).
     num_learnable_tokens: 32
     action_expert_attention: sdpa
+    action_denoise_attention: flash
     latent_expert_attention: flash
     action_dim_mask: null
     action_expert:

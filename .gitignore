@@ -235,6 +235,7 @@ wandb/*
 **/*.parquet
 
 */**/*.md
+!examples/Robotwin/new_train/README_qwenwmv4_performance.md
 */*.md
 !examples/**/README.md
 

@@ -56,7 +56,7 @@ framework:
     state_dim: 16
     action_horizon: 32
     num_inference_timesteps: 20
-    repeated_diffusion_steps: 8
+    repeated_diffusion_steps: 1
     loss_type: fm
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
@@ -70,7 +70,7 @@ framework:
       # expert's own (independent) residual width.
       hidden_size: 768
       intermediate_size: 2752
-      num_attention_heads: 16
+      num_attention_heads: 32
       num_key_value_heads: 8
       head_dim: 128
       num_layers: null
@@ -122,7 +122,7 @@ trainer:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 90000
+  max_train_steps: 100000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
@@ -133,8 +133,8 @@ trainer:
     base: 5e-05
     # v5 has no top-level `qwen_vl_interface`; the VLM/expert live nested under
     # `action_model.qwenvl_with_expert`.
-    action_model.qwenvl_with_expert.qwenvl: 1.0e-05
-    action_model.qwenvl_with_expert.qwen_expert: 5.0e-05
+    action_model.qwenvl_with_expert.qwenvl: 2.0e-05
+    action_model.qwenvl_with_expert.qwen_expert: 1.0e-4
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5e-6

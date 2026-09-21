@@ -13,7 +13,8 @@ PET_NODE_RANK=${RANK:-0}
 # 计算总进程数 (Total World Size)
 TOTAL_PROCESSES=$((PET_NPROC_PER_NODE * PET_NNODES))
 
-export SWANLAB_MODE=offline
+# export SWANLAB_MODE=offline
+export SWANLAB_API_KEY=r0jz2sjqk2ALFvcHjBVQF
 
 base_vlm=/mnt/netdata/Team/Personal/zzt/models/RynnBrain-2B
 config_yaml=./examples/Robotwin/new_train/starvla_qwenwmv3_hdf5_aloha_clean_random_la_sharla_foresight_soft_kl.yaml
@@ -22,10 +23,10 @@ batch_size=8
 hdf5_root=/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
 data_mix=hdf5_aloha_clean_eef
 latent_data_mix=hdf5_arx_clean_random_eef
-run_id=0807_${data_mix}_action_${latent_data_mix}_latent_qwenwmv32_la_sharla_a2a_foresight_soft_kl
-SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
-SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
-EPISODE_CACHE_DIR=.cache/latent_cache/sharla_soft_kl
+run_id=0907_${data_mix}_action_${latent_data_mix}_latent_qwenwmv32_4b_la_sharla_mr
+# SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
+# SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
+# EPISODE_CACHE_DIR=.cache/latent_cache/sharla_soft_kl
 
 # bash scripts/cache_sharla_soft_kl_episodes.sh "${config_yaml}" --output-dir "${EPISODE_CACHE_DIR}" --data-root-dir "${hdf5_root}"
 
@@ -41,12 +42,9 @@ accelerate launch \
   --framework.name QwenWMv32_LA \
   --framework.qwenvl.base_vlm "${base_vlm}" \
   --framework.latent_action.loss_type soft_kl \
-  --framework.latent_action.sharla.config_path "${SHARLA_CONFIG_PATH}" \
-  --framework.latent_action.sharla.ckpt_path "${SHARLA_CKPT_PATH}" \
   --datasets.vla_data.data_root_dir "${hdf5_root}" \
   --datasets.vla_data.data_mix "${data_mix}" \
   --datasets.vla_data.latent_data_mix "${latent_data_mix}" \
-  --datasets.vla_data.latent_action.episode_cache_dir "${EPISODE_CACHE_DIR}" \
   --datasets.vla_data.per_device_batch_size "${batch_size}" \
   --datasets.vla_data.latent_per_device_batch_size "${batch_size}" \
   --trainer.eval_batch_size "${batch_size}" \

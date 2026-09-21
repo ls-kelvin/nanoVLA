@@ -17,14 +17,14 @@ export SWANLAB_MODE=offline
 export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda-12.9/bin/ptxas}
 
 num_processes=${NUM_PROCESSES:-8}
-base_vlm=/mnt/netdata/Team/Personal/zzt/models/RynnBrain-2B
+base_vlm=/mnt/netdata/Team/Personal/zzt/models/RynnBrain-4B
 config_yaml=./examples/Robotwin/new_train/starvla_qwenpiv5_hdf5_aloha_clean_random_la_sharla.yaml
 run_root_dir=./results/Checkpoints2
 batch_size=8
 hdf5_root=/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
 data_mix=hdf5_aloha_clean_eef
 latent_data_mix=hdf5_arx_clean_random_eef
-run_id=0803_${data_mix}_action_${latent_data_mix}_latent_qwenpiv5_la_sharla
+run_id=0805_${data_mix}_action_${latent_data_mix}_latent_qwenpiv5_la_sharla
 SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
 SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
 

@@ -13,7 +13,8 @@ PET_NODE_RANK=${RANK:-0}
 # 计算总进程数 (Total World Size)
 TOTAL_PROCESSES=$((PET_NPROC_PER_NODE * PET_NNODES))
 
-export SWANLAB_MODE=offline
+# export SWANLAB_MODE=offline
+export SWANLAB_API_KEY=r0jz2sjqk2ALFvcHjBVQF
 
 base_vlm=/mnt/netdata/Team/Personal/zzt/models/RynnBrain-2B
 config_yaml=./examples/Robotwin/new_train/starvla_qwenwmv33_hdf5_aloha_clean_random_la_sharla_foresight_soft_kl.yaml
@@ -22,7 +23,7 @@ batch_size=8
 hdf5_root=/mnt/netdata/Team/Personal/jjc/data/RoboTwin2.0/dataset
 data_mix=hdf5_aloha_clean_eef
 latent_data_mix=hdf5_arx_clean_random_eef
-run_id=0819_${data_mix}_action_${latent_data_mix}_latent_qwenwmv33_la_sharla_foresight_soft_kl
+run_id=0907_${data_mix}_action_${latent_data_mix}_latent_qwenwmv33_la_sharla_a2a
 SHARLA_CONFIG_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/config.yaml
 SHARLA_CKPT_PATH=/mnt/netdata/Team/Personal/zzt/models/sharla_a2a/partial_step_30000.pt
 EPISODE_CACHE_DIR=.cache/latent_cache/sharla_soft_kl

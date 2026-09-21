@@ -70,7 +70,7 @@ datasets:
       video_keys: [cam_high]
       include_terminal_frame: true
       image_size: [224, 224]
-      episode_cache_dir: .cache/latent_cache/sharla_soft_kl
+      episode_cache_dir: .cache/latent_cache/sharla_soft_kl_perceiver_fullstride
       horizon_overrides:
         arx-x5:
           frame_stride: 6
@@ -105,7 +105,7 @@ trainer:
       - [0, null]
     action:
       - [0, null]
-  max_train_steps: 100000
+  max_train_steps: 90000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 1000
@@ -114,11 +114,11 @@ trainer:
   logging_frequency: 50
   learning_rate:
     base: 1e-5
-    qwen_vl_interface: 2.0e-05
-    action_model: 1e-4
+    qwen_vl_interface: 1.0e-05
+    action_model: 5e-5
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 5.0e-07
+    min_lr: 1e-6
   freeze_modules: ""
   loss_scale:
     vla: 1.0
@@ -135,9 +135,9 @@ trainer:
 soft_kl_cache:
   output_dir: .cache/latent_cache/sharla_soft_kl
   batch_size: 256
-  num_workers: 64
+  num_workers: 8
   num_gpus: 8
-  use_bf16: false
+  use_bf16: true
   overwrite: false
   device: null
   data_root_dir: null
