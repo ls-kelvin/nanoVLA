@@ -545,6 +545,18 @@ DATASET_NAMED_MIXTURES = {
         domains=["clean", "randomized"],
         layout="hdf5",
     ),
+    "hdf5_arx_clean_eef": _discover(
+        "robotwin32_eef",
+        embodiments=["arx-x5"],
+        domains=["clean"],
+        layout="hdf5",
+    ),
+    "hdf5_arx_random_eef": _discover(
+        "robotwin32_eef",
+        embodiments=["arx-x5"],
+        domains=["randomized"],
+        layout="hdf5",
+    ),
     "hdf5_arx_clean_random": _discover(
         "robotwin32",
         embodiments=["arx-x5"],

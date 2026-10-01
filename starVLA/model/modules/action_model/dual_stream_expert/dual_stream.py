@@ -294,6 +294,7 @@ class QwenVLWithExpert(nn.Module):
         ada_cond: Optional[torch.Tensor] = None,
         attention_implementation: Optional[str] = None,
         return_suffix_kvs: bool = False,
+        prefix_visible: Optional[torch.Tensor] = None,
     ):
         """Run the action expert over ``[prefix_kv, suffix]``. Returns suffix hidden.
 
@@ -305,6 +306,10 @@ class QwenVLWithExpert(nn.Module):
         When ``return_suffix_kvs`` is true, also returns per-layer suffix K/V
         (RoPE'd, same layout as prefix K/V) so a later action-only pass can
         concatenate them onto the prefix cache.
+
+        ``prefix_visible`` is an optional bool ``[B, Lsuffix]`` per-query-row
+        switch: rows set to ``False`` cannot attend to any prefix key (used by
+        prefix-attention dropout). ``None`` keeps all rows visible.
         """
         if len(prefix_kvs) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} prefix K/V pairs, got {len(prefix_kvs)}.")
@@ -324,11 +329,13 @@ class QwenVLWithExpert(nn.Module):
         flash_meta = None
         if attention_implementation == "flex":
             block_mask = build_expert_block_mask(
-                prefix_pad_masks, suffix_pad_masks, suffix_att_masks
+                prefix_pad_masks, suffix_pad_masks, suffix_att_masks,
+                prefix_visible=prefix_visible,
             )
         elif attention_implementation == "sdpa":
             attention_mask = build_suffix_attention_mask(
-                prefix_pad_masks, suffix_pad_masks, suffix_att_masks
+                prefix_pad_masks, suffix_pad_masks, suffix_att_masks,
+                prefix_visible=prefix_visible,
             )
         elif attention_implementation == "flash":
             if not bool(suffix_pad_masks.all()) or bool((suffix_att_masks[:, 1:] != 0).any()):

@@ -88,6 +88,7 @@ DUAL_VLA_DATALOADER_FRAMEWORKS = {
     "QwenWMv32_LA_Mem",
     "QwenWMv33_LA",
     "QwenWMv34_LA",
+    "QwenWMv35_LA",
     "QwenWMv4_LA",
 }
 

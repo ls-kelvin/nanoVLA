@@ -15,7 +15,17 @@ import torch.nn.functional as F
 from packaging.version import Version
 
 FLEX_SPARSE_BLOCK_SIZE = 128
-FLEX_KERNEL_OPTIONS = {"BLOCK_M": 32, "BLOCK_N": 64, "num_warps": 4, "num_stages": 2}
+# FORCE_USE_FLEX_ATTENTION: always use the main flex kernel. The flex-decoding
+# kernel requires q_len * gqa_shared_heads <= BLOCK_M, which never holds for the
+# expert's short suffix queries under GQA (e.g. 65 * 4 > 32) and makes inductor
+# fail at compile time with a guard_leq assertion.
+FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": 32,
+    "BLOCK_N": 64,
+    "num_warps": 4,
+    "num_stages": 2,
+    "FORCE_USE_FLEX_ATTENTION": True,
+}
 
 if Version(torch.__version__) > Version("2.5.0"):
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -76,11 +86,19 @@ def build_suffix_attention_mask(
     prefix_pad_masks: torch.Tensor,
     suffix_pad_masks: torch.Tensor,
     suffix_att_masks: torch.Tensor,
+    prefix_visible: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Bool mask ``[B, Lq, Lp+Ls]`` for suffix queries over ``[prefix, suffix]`` keys."""
+    """Bool mask ``[B, Lq, Lp+Ls]`` for suffix queries over ``[prefix, suffix]`` keys.
+
+    ``prefix_visible`` is an optional bool ``[B, Ls]`` per-query-row switch: rows
+    set to ``False`` cannot attend to any prefix key (suffix attention is
+    unchanged). ``None`` keeps the default all-visible behavior.
+    """
     batch_size, prefix_len = prefix_pad_masks.shape
     suffix_len = suffix_pad_masks.shape[1]
     prefix_pad_2d = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+    if prefix_visible is not None:
+        prefix_pad_2d = prefix_pad_2d & prefix_visible[:, :, None]
     suffix_att_2d = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
     return torch.cat([prefix_pad_2d, suffix_att_2d], dim=2)
 
@@ -91,6 +109,7 @@ def build_expert_block_mask(
     suffix_pad_masks: torch.Tensor,
     suffix_att_masks: torch.Tensor,
     block_size: int = FLEX_SPARSE_BLOCK_SIZE,
+    prefix_visible: torch.Tensor = None,
 ):
     """Build a reusable flex BlockMask for expert attention over ``[prefix, suffix]``.
 
@@ -99,6 +118,10 @@ def build_expert_block_mask(
 
     ``mask_mod`` does not read ``h``, so the mask is built with ``H=None`` and
     broadcast across heads instead of being materialized once per head.
+
+    ``prefix_visible`` is an optional bool ``[B, Ls]`` per-query-row switch: rows
+    set to ``False`` cannot attend to any prefix key. ``None`` keeps the default
+    all-visible behavior.
     """
     batch_size, prefix_len = prefix_pad_masks.shape
     suffix_len = suffix_pad_masks.shape[1]
@@ -115,6 +138,10 @@ def build_expert_block_mask(
     def mask_mod(b, h, q_idx, kv_idx):
         is_prefix = kv_idx < prefix_len
         prefix_ok = kv_idx >= pad_offset[b]
+        if prefix_visible is not None:
+            # Clamp for gather safety on any partial-block probe past the real length.
+            q_vis_clamped = torch.minimum(q_idx, torch.full_like(q_idx, suffix_len - 1))
+            prefix_ok = prefix_ok & prefix_visible[b, q_vis_clamped]
         suffix_kv_idx = kv_idx - prefix_len
         # Clamp for gather safety on any partial-block probe past the real length.
         q_clamped = torch.minimum(q_idx, torch.full_like(q_idx, suffix_len - 1))

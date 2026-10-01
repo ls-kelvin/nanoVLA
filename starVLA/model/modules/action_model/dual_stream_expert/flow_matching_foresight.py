@@ -203,14 +203,29 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         x_t: Tensor,
         timestep: Tensor,
         attention_implementation: Optional[str] = None,
+        prefix_drop_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Joint expert forward; returns full suffix hidden states."""
+        """Joint expert forward; returns full suffix hidden states.
+
+        ``prefix_drop_mask`` is an optional bool ``[B]`` per-sample switch: for
+        dropped samples the noisy-action query rows cannot attend to any prefix
+        key (state and learnable rows keep prefix access). ``None`` keeps the
+        default all-visible behavior.
+        """
         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_foresight(
             state, x_t, timestep
         )
         suffix_position_ids = self._build_suffix_position_ids(
             prefix["position_ids"], prefix["prompt_pad_masks"], suffix_pad_masks
         )
+        prefix_visible = None
+        if prefix_drop_mask is not None:
+            bsize, suffix_len = suffix_pad_masks.shape
+            action_start = 1 + self.num_learnable_tokens
+            prefix_visible = torch.ones(
+                (bsize, suffix_len), device=suffix_pad_masks.device, dtype=torch.bool
+            )
+            prefix_visible[prefix_drop_mask, action_start:] = False
         return self.qwenvl_with_expert.run_expert(
             suffix_embs=suffix_embs,
             prefix_kvs=prefix_kvs,
@@ -220,6 +235,7 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
             suffix_att_masks=suffix_att_masks,
             ada_cond=time_embs if self.adanorm_time else None,
             attention_implementation=attention_implementation,
+            prefix_visible=prefix_visible,
         )
 
     def run_expert_learnable_only(
@@ -381,6 +397,15 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
 
     # -- inference --------------------------------------------------------
     @torch.no_grad()
+    def _inference_prefix_drop_mask(self, bsize: int, device) -> Optional[Tensor]:
+        """Prefix-drop mask applied during ``sample_actions``; None disables it.
+
+        Base behavior keeps prefix visible at inference. Subclasses that train
+        with prefix-attention dropout at probability 1.0 (e.g. WMv35 with
+        ``inference_prefix_drop``) override this so inference matches training.
+        """
+        return None
+
     def sample_actions(
         self,
         inputs: dict,
@@ -403,6 +428,7 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
         prefix, _, prefix_kvs = self.encode_prefix_context(
             inputs, num_latent_tokens=0, extra_embs=extra_embs
         )
+        prefix_drop_mask = self._inference_prefix_drop_mask(bsize, device)
 
         with torch.autocast("cuda", dtype=torch.float32):
             dt = -1.0 / self.num_steps
@@ -417,6 +443,7 @@ class DualStreamFlowMatchingForesight(DualStreamFlowMatchingWM):
                     x_t,
                     expanded_time,
                     attention_implementation=attention_implementation,
+                    prefix_drop_mask=prefix_drop_mask,
                 )
                 _, action_out = self._split_foresight_outputs(
                     suffix_out, self.num_learnable_tokens, x_t.shape[1]

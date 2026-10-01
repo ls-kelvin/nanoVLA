@@ -75,6 +75,16 @@ class DualStreamFlowMatchingForesightV32(DualStreamFlowMatchingForesight):
             attention_implementation=attention_implementation or self.latent_expert_attention,
         )
 
+    # -- prefix-attention dropout hook ---------------------------------------
+    def _sample_prefix_drop_mask(self, bsize: int, device: torch.device) -> Optional[Tensor]:
+        """Per-sample prefix-drop decisions for the joint path; None disables it.
+
+        Sampled on the original batch (before ``repeated_diffusion_steps``
+        expansion) so all repeat rows of one sample share the same decision.
+        The base WMv32 behavior is no dropout; subclasses (e.g. WMv35) override.
+        """
+        return None
+
     # -- training: joint ----------------------------------------------------
     def flow_matching_loss_joint_foresight(
         self,
@@ -116,6 +126,12 @@ class DualStreamFlowMatchingForesightV32(DualStreamFlowMatchingForesight):
                 f"latent_targets batch {latent_targets.shape[0]} must match actions batch {bsize}."
             )
 
+        # Prefix-attention dropout: sampled per original sample, shared by all
+        # repeat rows (repeat below matches the tile-style expansion of actions).
+        prefix_drop_mask = self._sample_prefix_drop_mask(bsize, device)
+        if prefix_drop_mask is not None and repeats > 1:
+            prefix_drop_mask = prefix_drop_mask.repeat(repeats)
+
         with torch.autocast("cuda", dtype=torch.float32):
             if repeats > 1:
                 actions = actions.repeat(repeats, 1, 1)
@@ -149,6 +165,7 @@ class DualStreamFlowMatchingForesightV32(DualStreamFlowMatchingForesight):
                 x_t,
                 time,
                 attention_implementation=attention_implementation,
+                prefix_drop_mask=prefix_drop_mask,
             )
             learnable_out, action_out = self._split_foresight_outputs(
                 suffix_out, self.num_learnable_tokens, x_t.shape[1]

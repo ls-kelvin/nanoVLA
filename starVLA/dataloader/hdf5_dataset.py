@@ -898,6 +898,7 @@ class HDF5SingleDataset(Dataset):
             "lang": data[self.modality_keys["language"][0]][0],
             "robot_tag": self.tag,
             "robot_type": self.lerobot_info_meta.get("robot_type", None),
+            "dataset_name": self.dataset_name,
         }
 
         action_keys = self.modality_keys.get("action", [])
