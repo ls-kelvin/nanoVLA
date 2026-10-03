@@ -74,29 +74,6 @@ def _is_qwen_metaquery_la_training(cfg) -> bool:
     return str(cfg.framework.name) == "QwenMetaQuery_LA"
 
 
-DUAL_VLA_DATALOADER_FRAMEWORKS = {
-    "QwenMetaQuery_LA",
-    "QwenPI_v3_LA",
-    "QwenPI_v4_LA",
-    "QwenPI_v5_LA",
-    "QwenPI_v51_LA",
-    "QwenWM_LA",
-    "QwenWMv2_LA",
-    "QwenWMv3_LA",
-    "QwenWMv31_LA",
-    "QwenWMv32_LA",
-    "QwenWMv32_LA_Mem",
-    "QwenWMv33_LA",
-    "QwenWMv34_LA",
-    "QwenWMv35_LA",
-    "QwenWMv4_LA",
-}
-
-
-def _supports_dual_vla_dataloaders(cfg) -> bool:
-    return str(cfg.framework.name) in DUAL_VLA_DATALOADER_FRAMEWORKS
-
-
 def _dataloader_loss_modes(cfg) -> dict:
     """Per-dataloader forward loss modes; defaults preserve legacy latent/action split."""
     modes = {"latent": "latent", "action": "action"}
@@ -203,11 +180,6 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader, 
     data_cfg = cfg
     is_metaquery_la = _is_qwen_metaquery_la_training(cfg)
     use_dual_dataloaders = _use_dual_vla_dataloaders(cfg)
-    if use_dual_dataloaders and not _supports_dual_vla_dataloaders(cfg):
-        raise ValueError(
-            "trainer.use_dual_vla_dataloaders=true is only supported for "
-            f"framework.name in {sorted(DUAL_VLA_DATALOADER_FRAMEWORKS)}."
-        )
 
     latent_batch_size = _get_vla_dataloader_batch_size(cfg, "latent") if use_dual_dataloaders else None
     if use_dual_dataloaders:

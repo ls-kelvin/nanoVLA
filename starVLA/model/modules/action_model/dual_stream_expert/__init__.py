@@ -10,6 +10,7 @@ from .flow_matching_foresight_v33 import DualStreamFlowMatchingForesightV33
 from .flow_matching_foresight_v34 import DualStreamFlowMatchingForesightV34
 from .flow_matching_foresight_v35 import DualStreamFlowMatchingForesightV35
 from .flow_matching_foresight_v4 import DualStreamFlowMatchingForesightV4
+from .flow_matching_joint_la import DualStreamFlowMatchingJointLA
 from .flow_matching_wm import DualStreamFlowMatchingWM
 from .flow_matching_v51 import DualStreamFlowMatchingV51
 
@@ -22,6 +23,7 @@ __all__ = [
     "DualStreamFlowMatchingForesightV34",
     "DualStreamFlowMatchingForesightV35",
     "DualStreamFlowMatchingForesightV4",
+    "DualStreamFlowMatchingJointLA",
     "DualStreamFlowMatchingWM",
     "DualStreamFlowMatchingV51",
 ]

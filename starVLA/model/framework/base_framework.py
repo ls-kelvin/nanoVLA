@@ -73,6 +73,7 @@ def build_framework(cfg, **kwargs): # The single entry point for building differ
     constructor_kwargs = dict(kwargs)
     if framework_id not in {
         "QwenPI_v3_LA", "QwenPI_v4_LA", "QwenPI_v5_LA", "QwenPI_v51_LA", "QwenMetaQuery_LA", "QwenWM_LA", "QwenWMv2_LA",
+        "QwenWMv21_LA",
         "QwenWMv3_LA",
         "QwenWMv31_LA",
         "QwenWMv32_LA",
